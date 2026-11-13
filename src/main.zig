@@ -4,6 +4,7 @@ const model_mod = @import("model.zig");
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const sampler_mod = @import("sampler.zig");
 const pool_mod = @import("pool.zig");
+const server_mod = @import("server.zig");
 
 const usage =
     \\usage: zinfer -m MODEL.gguf [options]
@@ -29,6 +30,8 @@ const usage =
     \\speculative decoding:
     \\  --draft N             n-gram prompt lookup draft tokens, 0 = off (default 0, 3-5 recommended)
     \\
+    \\  --server              run OpenAI / llama.cpp-compatible HTTP server
+    \\  --port N              server port (default 8080; implies --server)
     \\  --no-prune            keep full lm_head matmul (for A/B comparison)
     \\  --no-repack           keep GGUF row layout (per-row kernels; for A/B comparison)
     \\  --bench PP,TG         benchmark prompt processing of PP tokens and generation of TG tokens
@@ -55,6 +58,8 @@ const Args = struct {
     n_predict: usize = 256,
     chat: bool = false,
     no_think: bool = false,
+    server: bool = false,
+    port: u16 = 8080,
     draft: usize = 0,
     threads: usize = 0,
     ctx: usize = 0,
@@ -130,6 +135,11 @@ fn parseArgs(argv: []const [:0]const u8) Args {
             a.sampling.seed = r.uint();
         } else if (r.is(&.{"--draft"})) {
             a.draft = r.uint();
+        } else if (r.is(&.{"--server"})) {
+            a.server = true;
+        } else if (r.is(&.{"--port"})) {
+            a.server = true;
+            a.port = @intCast(r.uint());
         } else if (r.is(&.{"--no-prune"})) {
             a.load.prune_vocab = false;
         } else if (r.is(&.{"--no-repack"})) {
@@ -427,6 +437,15 @@ pub fn main(init: std.process.Init) !void {
     var gen: Gen = .{ .gpa = gpa, .io = io, .st = &st, .tok = &tok, .smp = &smp, .out = .{ .w = &stdout.interface }, .draft_k = args.draft };
 
     if (args.bench) |b| return bench(gpa, io, &st, b[0], b[1]);
+    if (args.server) {
+        const model_name = std.fs.path.stem(args.model.?);
+        return server_mod.run(gpa, io, &st, &tok, &smp, .{
+            .port = args.port,
+            .model_id = model_name,
+            .draft_k = args.draft,
+            .no_think = args.no_think,
+        });
+    }
 
     var tokens: std.ArrayList(u32) = .empty;
     defer tokens.deinit(gpa);

@@ -18,6 +18,8 @@ zig build -Dcpu=baseline   # портабельний бінарник (пові
 zig-out/bin/zinfer -m model.gguf -p "The capital of France is" -n 64 --temp 0
 zig-out/bin/zinfer -m model.gguf --chat -s "You are a helpful assistant."
 zig-out/bin/zinfer -m model.gguf -p "..." --draft 3     # спекулятивне декодування через n-gram lookup
+zig-out/bin/zinfer -m model.gguf --server              # запуск HTTP сервера (порт 8080) для автовиявлення в omp (llama.cpp)
+zig-out/bin/zinfer -m model.gguf --port 8080          # вказати порт (сумісно з OpenAI /v1/chat/completions та /v1/responses)
 zig-out/bin/zinfer -m model.gguf --no-prune            # вимкнути двофазний vocab pruning на lm_head
 zig-out/bin/zinfer -m model.gguf --bench 256,64        # pp256 + tg64, як у llama-bench
 
