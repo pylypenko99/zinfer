@@ -133,12 +133,12 @@ pub const File = struct {
     data_offset: usize = 0,
     version: u32 = 0,
 
-    pub fn open(gpa: std.mem.Allocator, path: []const u8) !File {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
-        const size = (try file.stat()).size;
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !File {
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        const size: usize = @intCast(try file.length(io));
         if (size < 24) return error.InvalidGguf;
-        const map = try posix.mmap(null, size, posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
+        const map = try posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
         errdefer posix.munmap(map);
         var self: File = .{ .map = map };
         errdefer self.deinitTables(gpa);
@@ -194,7 +194,7 @@ pub const File = struct {
                 .bool => .{ .boolean = (try c.int(u8)) != 0 },
                 .string => .{ .string = try c.string() },
                 .array => blk: {
-                    const et: ValueType = @enumFromInt(try c.int(u32));
+                    const et: ValueType = @fromBackingInt(@intCast(try c.int(u32)));
                     const n: usize = @intCast(try c.int(u64));
                     const start = c.pos;
                     if (et.fixedSize()) |sz| {
@@ -220,7 +220,7 @@ pub const File = struct {
         try self.kv.ensureTotalCapacity(gpa, @intCast(n_kv));
         for (0..n_kv) |_| {
             const key = try c.string();
-            const t: ValueType = @enumFromInt(try c.int(u32));
+            const t: ValueType = @fromBackingInt(@intCast(try c.int(u32)));
             self.kv.putAssumeCapacity(key, try c.value(t));
         }
 
@@ -229,7 +229,7 @@ pub const File = struct {
             var ti: TensorInfo = .{ .name = try c.string(), .dims = .{ 1, 1, 1, 1 }, .n_dims = try c.int(u32), .typ = undefined, .offset = undefined };
             if (ti.n_dims > 4) return error.InvalidGguf;
             for (0..ti.n_dims) |d| ti.dims[d] = try c.int(u64);
-            ti.typ = @enumFromInt(try c.int(u32));
+            ti.typ = @fromBackingInt(@intCast(try c.int(u32)));
             ti.offset = try c.int(u64);
             self.tensors.putAssumeCapacity(ti.name, ti);
         }

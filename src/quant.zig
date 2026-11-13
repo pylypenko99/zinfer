@@ -521,7 +521,7 @@ fn dequantAct(kind: ActKind, act: []const u8, dst: []f32) void {
 fn checkKernel(comptime t: GgmlType) !void {
     const n = 1024;
     const l = t.layout().?;
-    var prng = std.Random.DefaultPrng.init(@intFromEnum(t) * 7919 + 1);
+    var prng = std.Random.DefaultPrng.init(@backingInt(t) * 7919 + 1);
     const r = prng.random();
 
     var wbuf: [n * 4]u8 align(64) = undefined;

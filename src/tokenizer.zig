@@ -36,7 +36,7 @@ pub const Tokenizer = struct {
     piece_buf: []u8,
     /// Special tokens sorted by descending length.
     specials: []u32,
-    special_first: std.StaticBitSet(256) = .initEmpty(),
+    special_first: std.StaticBitSet(256) = .empty,
     /// Token for each raw byte (gpt2 mapped char, or spm <0xXX>).
     byte_tok: [256]?u32 = @splat(null),
     bos: ?u32 = null,
@@ -67,7 +67,7 @@ pub const Tokenizer = struct {
         errdefer gpa.free(types);
         @memset(types, .normal);
         if (f.getArray("tokenizer.ggml.token_type")) |ta| {
-            for (types, 0..) |*t, i| t.* = @enumFromInt(@as(u8, @intCast(ta.item(i32, i))));
+            for (types, 0..) |*t, i| t.* = @fromBackingInt(@intCast(@as(u8, @intCast(ta.item(i32, i)))));
         }
 
         var self: Tokenizer = .{

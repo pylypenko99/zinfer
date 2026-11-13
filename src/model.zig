@@ -101,11 +101,11 @@ pub const Model = struct {
     /// Anonymous huge-page region holding every matmul weight.
     weights: ?[]align(std.heap.page_size_min) u8 = null,
 
-    pub fn load(gpa: Allocator, path: []const u8, pool: *Pool, opts: LoadOptions) !*Model {
+    pub fn load(gpa: Allocator, io: std.Io, path: []const u8, pool: *Pool, opts: LoadOptions) !*Model {
         const self = try gpa.create(Model);
         errdefer gpa.destroy(self);
         self.* = .{
-            .file = try gguf.File.open(gpa, path),
+            .file = try gguf.File.open(gpa, io, path),
             .cfg = undefined,
             .embd = undefined,
             .output = undefined,
@@ -167,7 +167,7 @@ pub const Model = struct {
         var total: usize = 0;
         for (ts) |t| total += t.materializedBytes(use_repack);
         const len = std.mem.alignForward(usize, total, 2 << 20);
-        const region = try posix.mmap(null, len, posix.PROT.READ | posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+        const region = try posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
         self.weights = region;
         posix.madvise(region.ptr, len, posix.MADV.HUGEPAGE) catch {};
         var off: usize = 0;
@@ -186,8 +186,6 @@ pub const Model = struct {
                 t.data = dst;
             }
         }
-        // Read-only from here on; catches stray writes.
-        posix.mprotect(region, posix.PROT.READ) catch {};
     }
 
     fn key(self: *const Model, buf: []u8, comptime suffix: []const u8) []const u8 {
@@ -242,7 +240,7 @@ pub const Model = struct {
             return error.MissingTensor;
         };
         if (!quant.isSupported(ti.typ)) {
-            std.log.err("tensor {s}: unsupported type {d} (supported: F32 F16 BF16 Q4_0 Q8_0 Q4_K Q5_K Q6_K)", .{ name, @intFromEnum(ti.typ) });
+            std.log.err("tensor {s}: unsupported type {d} (supported: F32 F16 BF16 Q4_0 Q8_0 Q4_K Q5_K Q6_K)", .{ name, @backingInt(ti.typ) });
             return error.UnsupportedTensorType;
         }
         if (ti.dims[0] != cols or (rows != null and ti.dims[1] != rows.?) or ti.n_dims > 2) {

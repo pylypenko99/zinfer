@@ -102,6 +102,11 @@ pub fn repackGroup(t: GgmlType, rows: [8][*]const u8, nb: usize, dst: [*]u8) voi
 inline fn load32(p: [*]const u8) V32u8 {
     return p[0..32].*;
 }
+/// Unaligned vector load. Bitcasting a `[N]u8` copy instead makes Zig 0.17's
+/// LLVM assemble the value byte by byte (~30 instructions per load).
+inline fn loadVec(comptime V: type, p: [*]const u8) V {
+    return @as(*align(1) const V, @ptrCast(p)).*;
+}
 
 /// Broadcast 4 bytes to all 8 lanes (vpbroadcastd from memory).
 inline fn bc4(p: [*]const i8) V32i8 {
@@ -111,7 +116,7 @@ inline fn bc4(p: [*]const i8) V32i8 {
 
 /// 8 fp16 values -> 8 floats.
 inline fn halfs(p: [*]const u8) V8f {
-    const h: @Vector(8, f16) = @bitCast(p[0..16].*);
+    const h = loadVec(@Vector(8, f16), p);
     return @floatCast(h);
 }
 
@@ -125,7 +130,7 @@ inline fn dupU8(p: [*]const u8) V16i16 {
 }
 
 inline fn dupI8(p: [*]const u8) V16i16 {
-    const v: @Vector(8, i8) = @bitCast(p[0..8].*);
+    const v = loadVec(@Vector(8, i8), p);
     return @intCast(@shuffle(i8, v, undefined, dup_mask));
 }
 
@@ -136,7 +141,7 @@ inline fn pairU8(p: [*]const u8) V16i16 {
 }
 
 inline fn pairI8(p: [*]const u8) V16i16 {
-    const v: @Vector(16, i8) = @bitCast(p[0..16].*);
+    const v = loadVec(@Vector(16, i8), p);
     return @intCast(@shuffle(i8, v, undefined, pair_mask));
 }
 
@@ -369,7 +374,7 @@ fn checkType(comptime t: GgmlType) !void {
     const cols = 512;
     const l = t.layout().?;
     const rb = cols / l.block * l.bytes;
-    var prng = std.Random.DefaultPrng.init(@intFromEnum(t) + 17);
+    var prng = std.Random.DefaultPrng.init(@backingInt(t) + 17);
     const r = prng.random();
     var src: [8 * (512 / 32) * 34]u8 align(32) = undefined; // >= 8 * rb for every type
     r.bytes(src[0 .. 8 * rb]);
@@ -409,14 +414,18 @@ fn checkType(comptime t: GgmlType) !void {
     }
     const got = gemm(t, NT, &dst, acts, cols);
     const got1 = gemm(t, 1, &dst, acts[1..2].*, cols);
-    for (0..NT) |k| for (0..8) |row| {
-        const want = quant.dot(t, rows[row], acts[k], cols);
-        const tol = 1e-3 * @max(1.0, @abs(want));
-        if (@abs(got[k][row] - want) > tol or (k == 1 and @abs(got1[0][row] - want) > tol)) {
-            std.debug.print("{s} tok {d} row {d}: got {d} want {d}\n", .{ @tagName(t), k, row, got[k][row], want });
-            return error.KernelMismatch;
+    for (0..NT) |k| {
+        const g: [8]f32 = got[k];
+        const g1: [8]f32 = got1[0];
+        for (0..8) |row| {
+            const want = quant.dot(t, rows[row], acts[k], cols);
+            const tol = 1e-3 * @max(1.0, @abs(want));
+            if (@abs(g[row] - want) > tol or (k == 1 and @abs(g1[row] - want) > tol)) {
+                std.debug.print("{s} tok {d} row {d}: got {d} want {d}\n", .{ @tagName(t), k, row, g[row], want });
+                return error.KernelMismatch;
+            }
         }
-    };
+    }
 }
 
 test "x8 kernels match per-row kernels" {

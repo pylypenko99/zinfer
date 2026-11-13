@@ -4,7 +4,6 @@
 //! no syscalls; after a short idle period they park on a futex.
 const std = @import("std");
 const Atomic = std.atomic.Value;
-const Futex = std.Thread.Futex;
 
 const spin_limit = 1 << 16;
 
@@ -14,6 +13,7 @@ const Job = struct {
 };
 
 pub const Pool = struct {
+    io: std.Io,
     threads: []std.Thread,
     nth: usize,
     job: Job = undefined,
@@ -22,10 +22,10 @@ pub const Pool = struct {
     sleepers: Atomic(u32) = .init(0),
     quit: bool = false,
 
-    pub fn create(gpa: std.mem.Allocator, nth: usize) !*Pool {
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, nth: usize) !*Pool {
         const self = try gpa.create(Pool);
         errdefer gpa.destroy(self);
-        self.* = .{ .threads = try gpa.alloc(std.Thread, nth - 1), .nth = nth };
+        self.* = .{ .io = io, .threads = try gpa.alloc(std.Thread, nth - 1), .nth = nth };
         var spawned: usize = 0;
         errdefer {
             self.shutdown(spawned);
@@ -40,7 +40,7 @@ pub const Pool = struct {
     fn shutdown(self: *Pool, n: usize) void {
         self.quit = true;
         _ = self.gen.fetchAdd(1, .seq_cst);
-        Futex.wake(&self.gen, std.math.maxInt(u32));
+        self.io.futexWake(u32, &self.gen.raw, std.math.maxInt(u32));
         for (self.threads[0..n]) |t| t.join();
     }
 
@@ -60,7 +60,7 @@ pub const Pool = struct {
                     spins += 1;
                 } else {
                     _ = self.sleepers.fetchAdd(1, .seq_cst);
-                    if (self.gen.load(.seq_cst) == seen) Futex.wait(&self.gen, seen);
+                    if (self.gen.load(.seq_cst) == seen) self.io.futexWaitUncancelable(u32, &self.gen.raw, seen);
                     _ = self.sleepers.fetchSub(1, .seq_cst);
                 }
             }
@@ -83,7 +83,7 @@ pub const Pool = struct {
         self.job = .{ .ctx = @ptrCast(ctx), .func = W.call };
         self.done.store(0, .monotonic);
         _ = self.gen.fetchAdd(1, .seq_cst);
-        if (self.sleepers.load(.seq_cst) != 0) Futex.wake(&self.gen, std.math.maxInt(u32));
+        if (self.sleepers.load(.seq_cst) != 0) self.io.futexWake(u32, &self.gen.raw, std.math.maxInt(u32));
         f(ctx, 0, self.nth);
         const want: u32 = @intCast(self.nth - 1);
         while (self.done.load(.acquire) != want) std.atomic.spinLoopHint();
@@ -108,10 +108,10 @@ pub const Chunks = struct {
 };
 
 /// Number of physical cores (Linux SMT-aware), falling back to logical count.
-pub fn defaultThreads() usize {
+pub fn defaultThreads(io: std.Io) usize {
     const logical = std.Thread.getCpuCount() catch 4;
     var buf: [8]u8 = undefined;
-    const smt = std.fs.cwd().readFile("/sys/devices/system/cpu/smt/active", &buf) catch return logical;
+    const smt = std.Io.Dir.cwd().readFile(io, "/sys/devices/system/cpu/smt/active", &buf) catch return logical;
     if (smt.len > 0 and smt[0] == '1' and logical >= 2) return logical / 2;
     return logical;
 }

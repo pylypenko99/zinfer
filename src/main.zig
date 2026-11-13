@@ -97,7 +97,29 @@ const Out = struct {
     }
 };
 
+/// Monotonic stopwatch on the Io awake clock.
+const Timer = struct {
+    io: std.Io,
+    last: std.Io.Timestamp,
+
+    fn start(io: std.Io) Timer {
+        return .{ .io = io, .last = std.Io.Clock.awake.now(io) };
+    }
+
+    fn read(t: *const Timer) u64 {
+        return @intCast(t.last.durationTo(std.Io.Clock.awake.now(t.io)).nanoseconds);
+    }
+
+    fn lap(t: *Timer) u64 {
+        const now = std.Io.Clock.awake.now(t.io);
+        const ns: u64 = @intCast(t.last.durationTo(now).nanoseconds);
+        t.last = now;
+        return ns;
+    }
+};
+
 const Gen = struct {
+    io: std.Io,
     st: *model_mod.State,
     tok: *const Tokenizer,
     smp: *sampler_mod.Sampler,
@@ -110,7 +132,7 @@ const Gen = struct {
     /// Feed `input`, then sample up to `n` tokens. Returns the end-of-generation
     /// token if one was sampled (it is not yet in the KV cache).
     fn run(g: *Gen, input: []const u32, n: usize) !?u32 {
-        var timer = try std.time.Timer.start();
+        var timer: Timer = .start(g.io);
         var logits = try g.st.forward(input);
         g.t_prompt_ns += timer.lap();
         g.n_prompt += input.len;
@@ -175,18 +197,18 @@ fn appendAssistantHeader(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), tpl: T
     });
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.smp_allocator;
-    const argv = try std.process.argsAlloc(gpa);
-    defer std.process.argsFree(gpa, argv);
+    const io = init.io;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
     var args = parseArgs(argv);
-    if (!args.seed_set) args.sp.seed = @bitCast(std.time.milliTimestamp());
+    if (!args.seed_set) args.sp.seed = @truncate(@as(u96, @bitCast(std.Io.Clock.real.now(io).nanoseconds)));
 
-    const nth = if (args.threads > 0) args.threads else pool_mod.defaultThreads();
-    const pool = try pool_mod.Pool.create(gpa, nth);
+    const nth = if (args.threads > 0) args.threads else pool_mod.defaultThreads(io);
+    const pool = try pool_mod.Pool.create(gpa, io, nth);
     defer pool.destroy(gpa);
-    var timer = try std.time.Timer.start();
-    const model = model_mod.Model.load(gpa, args.model.?, pool, args.load) catch |e| fail("failed to load model: {s}", .{@errorName(e)});
+    var timer: Timer = .start(io);
+    const model = model_mod.Model.load(gpa, io, args.model.?, pool, args.load) catch |e| fail("failed to load model: {s}", .{@errorName(e)});
     defer model.destroy(gpa);
     var tok = Tokenizer.init(gpa, &model.file) catch |e| fail("failed to load tokenizer: {s}", .{@errorName(e)});
     defer tok.deinit(gpa);
@@ -208,10 +230,10 @@ pub fn main() !void {
     }
 
     var out_buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&out_buf);
-    var gen: Gen = .{ .st = &st, .tok = &tok, .smp = &smp, .out = .{ .w = &stdout.interface } };
+    var stdout: std.Io.File.Writer = .init(.stdout(), io, &out_buf);
+    var gen: Gen = .{ .io = io, .st = &st, .tok = &tok, .smp = &smp, .out = .{ .w = &stdout.interface } };
 
-    if (args.bench) |b| return bench(gpa, &st, b[0], b[1]);
+    if (args.bench) |b| return bench(gpa, io, &st, b[0], b[1]);
 
     var tokens: std.ArrayList(u32) = .empty;
     defer tokens.deinit(gpa);
@@ -219,7 +241,7 @@ pub fn main() !void {
     if (args.chat) {
         const tpl = detectTemplate(&tok);
         var in_buf: [64 * 1024]u8 = undefined;
-        var stdin = std.fs.File.stdin().reader(&in_buf);
+        var stdin = std.Io.File.stdin().reader(io, &in_buf);
         var text: std.ArrayList(u8) = .empty;
         defer text.deinit(gpa);
         var first = true;
@@ -246,7 +268,6 @@ pub fn main() !void {
                     std.debug.print("\n[context full]\n", .{});
                     break;
                 },
-                else => return e,
             };
             gen.out.emit("\n");
         }
@@ -255,7 +276,7 @@ pub fn main() !void {
     }
 
     const prompt = if (args.prompt_file) |p|
-        try std.fs.cwd().readFileAlloc(gpa, p, 64 << 20)
+        try std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(64 << 20))
     else
         args.prompt orelse fail("no prompt: use -p, -f or --chat", .{});
     defer if (args.prompt_file != null) gpa.free(prompt);
@@ -267,7 +288,7 @@ pub fn main() !void {
     gen.report();
 }
 
-fn bench(gpa: std.mem.Allocator, st: *model_mod.State, pp: usize, tg: usize) !void {
+fn bench(gpa: std.mem.Allocator, io: std.Io, st: *model_mod.State, pp: usize, tg: usize) !void {
     if (pp + tg > st.ctx) fail("bench needs ctx >= {d}", .{pp + tg});
     const toks = try gpa.alloc(u32, @max(pp, 1));
     defer gpa.free(toks);
@@ -276,7 +297,7 @@ fn bench(gpa: std.mem.Allocator, st: *model_mod.State, pp: usize, tg: usize) !vo
     _ = try st.forward(toks[0..1]);
     st.pos = 0;
 
-    var timer = try std.time.Timer.start();
+    var timer: Timer = .start(io);
     if (pp > 0) {
         _ = try st.forward(toks[0..pp]);
         const ns = timer.lap();

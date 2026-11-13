@@ -4,7 +4,7 @@
 
 ## Збірка
 
-Потрібен Zig **0.15.2**.
+Потрібен Zig **0.17.1**.
 
 ```sh
 zig build                  # ReleaseFast, -mcpu=native (AVX2/FMA/F16C підхоплюються автоматично)
