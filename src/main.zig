@@ -305,7 +305,9 @@ pub fn main(init: std.process.Init) !void {
     var tok = Tokenizer.init(gpa, &model.file) catch |e| fail("failed to load tokenizer: {s}", .{@errorName(e)});
     defer tok.deinit(gpa);
     const c = &model.cfg;
-    const ctx = if (args.ctx > 0) args.ctx else @min(4096, c.ctx_train);
+    const bench_need = if (args.bench) |b| b[0] + b[1] else 0;
+    const default_ctx = @max(bench_need, 4096);
+    const ctx = if (args.ctx > 0) args.ctx else @min(default_ctx, c.ctx_train);
 
     var st = try model_mod.State.init(gpa, model, pool, ctx, @min(args.batch, ctx));
     defer st.deinit();
@@ -315,8 +317,9 @@ pub fn main(init: std.process.Init) !void {
     defer smp.deinit(gpa);
 
     if (args.verbose or args.bench != null) {
-        std.debug.print("arch={s} layers={d} dim={d} heads={d}/{d} head_dim={d} ffn={d} vocab={d} ctx={d} threads={d} ({d:.0} ms load)\n", .{
-            @tagName(c.arch),                            c.n_layers, c.dim, c.n_heads, c.n_kv_heads, c.head_dim, c.ffn_dim, c.vocab, ctx, nth,
+        const kv_mb = @as(f64, @floatFromInt(st.k_cache.len * 2 * 2)) / (1 << 20);
+        std.debug.print("arch={s} layers={d} dim={d} heads={d}/{d} head_dim={d} ffn={d} vocab={d} ctx={d} (KV {d:.1} MB) threads={d} ({d:.0} ms load)\n", .{
+            @tagName(c.arch),                            c.n_layers, c.dim, c.n_heads, c.n_kv_heads, c.head_dim, c.ffn_dim, c.vocab, ctx, kv_mb, nth,
             @as(f64, @floatFromInt(timer.read())) / 1e6,
         });
         const l0 = &model.layers[0];
@@ -404,7 +407,7 @@ fn bench(gpa: std.mem.Allocator, io: std.Io, st: *model_mod.State, pp: usize, tg
         std.debug.print("pp{d}: {d:.2} tok/s ({d:.1} ms)\n", .{ pp, @as(f64, @floatFromInt(pp)) * 1e9 / @as(f64, @floatFromInt(ns)), @as(f64, @floatFromInt(ns)) / 1e6 });
     }
     if (tg > 0) {
-        st.reset();
+        const depth = st.pos;
         _ = timer.lap();
         var t: u32 = 1;
         for (0..tg) |_| {
@@ -412,6 +415,10 @@ fn bench(gpa: std.mem.Allocator, io: std.Io, st: *model_mod.State, pp: usize, tg
             t = sampler_mod.argmax(l);
         }
         const ns = timer.lap();
-        std.debug.print("tg{d}: {d:.2} tok/s ({d:.2} ms/tok)\n", .{ tg, @as(f64, @floatFromInt(tg)) * 1e9 / @as(f64, @floatFromInt(ns)), @as(f64, @floatFromInt(ns)) / 1e6 / @as(f64, @floatFromInt(tg)) });
+        const depth_msg = if (depth > 0) std.fmt.allocPrint(gpa, " @ ctx {d}", .{depth}) catch "" else "";
+        defer if (depth > 0 and depth_msg.len > 0) gpa.free(depth_msg);
+        std.debug.print("tg{d}{s}: {d:.2} tok/s ({d:.2} ms/tok)\n", .{
+            tg, depth_msg, @as(f64, @floatFromInt(tg)) * 1e9 / @as(f64, @floatFromInt(ns)), @as(f64, @floatFromInt(ns)) / 1e6 / @as(f64, @floatFromInt(tg)),
+        });
     }
 }
