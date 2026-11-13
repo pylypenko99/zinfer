@@ -26,11 +26,11 @@ zig-out/bin/zinfer -m model.gguf --bench 256,64      # pp256 + tg64, як у lla
 
 | | |
 |---|---|
-| Архітектури | `llama` (Llama 2/3.x, Mistral, TinyLlama), `qwen2`, `qwen3` |
+| Архітектури | `llama` (Llama 2/3.x, Mistral, TinyLlama), `qwen2`, `qwen3`, `lfm3` (Liquid LFM-3: 13 short-conv + 11 GQA шарів, sandwich norms, sigmoid gate, SWA) |
 | Типи ваг | Q4_0, Q8_0, Q4_K, Q5_K, Q6_K: швидкі x8-кернели; F16, BF16, F32: построкові |
-| Токенізатори | byte-level BPE (`gpt2`: Llama 3, Qwen), SentencePiece BPE (`llama`) |
-| Чат-шаблони | Llama 3 і ChatML (визначаються за спецтокенами), інакше plain |
-| RoPE | normal/NeoX, `rope_freqs` (Llama 3.1+), лінійне масштабування |
+| Токенізатори | byte-level BPE (`gpt2`: Llama 3, Qwen, LFM2/3), SentencePiece BPE (`llama`) |
+| Чат-шаблони | Llama 3, ChatML, LFM (автовизначення за спецтокенами, опція `--no-think`), інакше plain |
+| RoPE | normal/NeoX, `rope_freqs` (Llama 3.1+), окремий SWA RoPE base (LFM3), лінійне масштабування |
 
 ## Швидкість
 
@@ -42,10 +42,10 @@ i7-8550U (4 ядра / 8 потоків, AVX2), DDR4 з піком читанн�
 | Qwen3-0.6B Q8_0 | 243 | 130 | 39.2 | 31.5 |
 | Qwen3-0.6B Q4_0 | 308 | 184 | 61.3 | 50.6 |
 | Qwen3-0.6B Q5_K_M | 246 | 214 | 49.8 | 42.6 |
-
+| LFM-3-Coder-1.7B Q4_K_M | 128 | 107 | 23.4 | 18.4 |
 Генерація впирається в пропускну здатність пам'яті: для Llama-1B це ~25 GB/s, тобто ~88% виміряного піку.
 
-Коректність перевірено так: жадібний (`--temp 0`) вивід збігається з llama.cpp токен у токен на Llama-3.2-1B (Q4_K_M), TinyLlama-1.1B (Q4_0, SentencePiece) і Qwen3-0.6B (Q4_0, Q5_K_M, F16). Токенізація складних рядків (кирилиця, CJK, емодзі, пробіли й переноси, код) теж збігається з llama.cpp для Llama 3, Qwen і TinyLlama. Логіти точно не збігатимуться: квантування активацій у 8 біт розривне, тож уже збурення ваг на 1e-6 зсуває їх на ~0.5.
+Коректність перевірено так: жадібний (`--temp 0`) вивід збігається з llama.cpp токен у токен на Llama-3.2-1B (Q4_K_M), TinyLlama-1.1B (Q4_0, SentencePiece), Qwen3-0.6B (Q4_0, Q5_K_M, F16) і LFM-3-Coder-1.7B (Q4_K_M, 812 токенів промпта з SWA). Токенізація складних рядків (кирилиця, CJK, емодзі, пробіли й переноси, код) теж збігається з llama.cpp для Llama 3, Qwen, TinyLlama та LFM3. Логіти точно не збігатимуться: квантування активацій у 8 біт розривне, тож уже збурення ваг на 1e-6 зсуває їх на ~0.5.
 
 ## Звідки швидкість
 

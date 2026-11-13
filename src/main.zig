@@ -1,4 +1,5 @@
 const std = @import("std");
+const gguf = @import("gguf.zig");
 const model_mod = @import("model.zig");
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const sampler_mod = @import("sampler.zig");
@@ -12,19 +13,35 @@ const usage =
     \\  -n, --predict N       max tokens to generate (default 256)
     \\  --chat                interactive chat using the model's chat template
     \\  -s, --system TEXT     system message for --chat
+    \\  --no-think            start assistant turns with an empty think block (Qwen3, LFM3)
     \\  -t, --threads N       worker threads (default: physical cores)
     \\  -c, --ctx N           context length (default: min(4096, trained))
     \\  -b, --batch N         prompt batch size (default 64)
-    \\  --temp F              temperature, 0 = greedy (default 0.8)
-    \\  --top-k N             (default 40, 0 = off)
-    \\  --top-p F             (default 0.95)
-    \\  --min-p F             (default 0.05)
-    \\  --seed N              RNG seed (default: time)
+    \\
+    \\sampling (defaults: the model's general.sampling.* metadata, else the values shown)
+    \\  --temp F              temperature, 0 = greedy (0.8)
+    \\  --top-k N             0 = off (40)
+    \\  --top-p F             (0.95)
+    \\  --min-p F             (0.05)
+    \\  --repeat-penalty F    penalize the last 64 tokens, 1 = off (1.0)
+    \\  --seed N              RNG seed (time)
+    \\
     \\  --no-repack           keep GGUF row layout (per-row kernels; for A/B comparison)
     \\  --bench PP,TG         benchmark prompt processing of PP tokens and generation of TG tokens
     \\  -v, --verbose         print model info
     \\
 ;
+
+/// Sampling options given on the command line; unset ones fall back to the
+/// model's metadata, then to sampler defaults.
+const SamplingArgs = struct {
+    temp: ?f32 = null,
+    top_k: ?usize = null,
+    top_p: ?f32 = null,
+    min_p: ?f32 = null,
+    repeat_penalty: ?f32 = null,
+    seed: ?u64 = null,
+};
 
 const Args = struct {
     model: ?[]const u8 = null,
@@ -33,11 +50,11 @@ const Args = struct {
     system: ?[]const u8 = null,
     n_predict: usize = 256,
     chat: bool = false,
+    no_think: bool = false,
     threads: usize = 0,
     ctx: usize = 0,
     batch: usize = 64,
-    sp: sampler_mod.Params = .{},
-    seed_set: bool = false,
+    sampling: SamplingArgs = .{},
     load: model_mod.LoadOptions = .{},
     bench: ?[2]usize = null,
     verbose: bool = false,
@@ -48,45 +65,105 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(1);
 }
 
+const ArgReader = struct {
+    argv: []const [:0]const u8,
+    i: usize = 1,
+
+    fn is(r: *const ArgReader, comptime names: []const []const u8) bool {
+        inline for (names) |n| if (std.mem.eql(u8, r.argv[r.i], n)) return true;
+        return false;
+    }
+
+    fn str(r: *ArgReader) []const u8 {
+        r.i += 1;
+        if (r.i >= r.argv.len) fail("missing value for {s}", .{r.argv[r.i - 1]});
+        return r.argv[r.i];
+    }
+
+    fn uint(r: *ArgReader) usize {
+        const s = r.str();
+        return std.fmt.parseInt(usize, s, 10) catch fail("bad number '{s}'", .{s});
+    }
+
+    fn float(r: *ArgReader) f32 {
+        const s = r.str();
+        return std.fmt.parseFloat(f32, s) catch fail("bad number '{s}'", .{s});
+    }
+};
+
 fn parseArgs(argv: []const [:0]const u8) Args {
     var a: Args = .{};
-    var i: usize = 1;
-    const next = struct {
-        fn f(v: []const [:0]const u8, j: *usize) []const u8 {
-            j.* += 1;
-            if (j.* >= v.len) fail("missing value for {s}", .{v[j.* - 1]});
-            return v[j.*];
-        }
-    }.f;
-    const num = struct {
-        fn u(s: []const u8) usize {
-            return std.fmt.parseInt(usize, s, 10) catch fail("bad number '{s}'", .{s});
-        }
-        fn f(s: []const u8) f32 {
-            return std.fmt.parseFloat(f32, s) catch fail("bad number '{s}'", .{s});
-        }
-    };
-    while (i < argv.len) : (i += 1) {
-        const o = argv[i];
-        const eq = std.mem.eql;
-        if (eq(u8, o, "-m") or eq(u8, o, "--model")) a.model = next(argv, &i) else if (eq(u8, o, "-p") or eq(u8, o, "--prompt")) a.prompt = next(argv, &i) else if (eq(u8, o, "-f") or eq(u8, o, "--file")) a.prompt_file = next(argv, &i) else if (eq(u8, o, "-s") or eq(u8, o, "--system")) a.system = next(argv, &i) else if (eq(u8, o, "-n") or eq(u8, o, "--predict")) a.n_predict = num.u(next(argv, &i)) else if (eq(u8, o, "-t") or eq(u8, o, "--threads")) a.threads = num.u(next(argv, &i)) else if (eq(u8, o, "-c") or eq(u8, o, "--ctx")) a.ctx = num.u(next(argv, &i)) else if (eq(u8, o, "-b") or eq(u8, o, "--batch")) a.batch = @max(1, num.u(next(argv, &i))) else if (eq(u8, o, "--temp")) a.sp.temp = num.f(next(argv, &i)) else if (eq(u8, o, "--top-k")) a.sp.top_k = num.u(next(argv, &i)) else if (eq(u8, o, "--top-p")) a.sp.top_p = num.f(next(argv, &i)) else if (eq(u8, o, "--min-p")) a.sp.min_p = num.f(next(argv, &i)) else if (eq(u8, o, "--seed")) {
-            a.sp.seed = num.u(next(argv, &i));
-            a.seed_set = true;
-        } else if (eq(u8, o, "--no-repack")) {
+    var r: ArgReader = .{ .argv = argv };
+    while (r.i < argv.len) : (r.i += 1) {
+        if (r.is(&.{ "-m", "--model" })) {
+            a.model = r.str();
+        } else if (r.is(&.{ "-p", "--prompt" })) {
+            a.prompt = r.str();
+        } else if (r.is(&.{ "-f", "--file" })) {
+            a.prompt_file = r.str();
+        } else if (r.is(&.{ "-s", "--system" })) {
+            a.system = r.str();
+        } else if (r.is(&.{ "-n", "--predict" })) {
+            a.n_predict = r.uint();
+        } else if (r.is(&.{ "-t", "--threads" })) {
+            a.threads = r.uint();
+        } else if (r.is(&.{ "-c", "--ctx" })) {
+            a.ctx = r.uint();
+        } else if (r.is(&.{ "-b", "--batch" })) {
+            a.batch = @max(1, r.uint());
+        } else if (r.is(&.{"--temp"})) {
+            a.sampling.temp = r.float();
+        } else if (r.is(&.{"--top-k"})) {
+            a.sampling.top_k = r.uint();
+        } else if (r.is(&.{"--top-p"})) {
+            a.sampling.top_p = r.float();
+        } else if (r.is(&.{"--min-p"})) {
+            a.sampling.min_p = r.float();
+        } else if (r.is(&.{"--repeat-penalty"})) {
+            a.sampling.repeat_penalty = r.float();
+        } else if (r.is(&.{"--seed"})) {
+            a.sampling.seed = r.uint();
+        } else if (r.is(&.{"--no-repack"})) {
             a.load.repack = false;
-        } else if (eq(u8, o, "--bench")) {
-            const v = next(argv, &i);
-            var it = std.mem.splitScalar(u8, v, ',');
-            const pp = num.u(it.next().?);
-            const tg = num.u(it.next() orelse fail("--bench expects PP,TG", .{}));
+        } else if (r.is(&.{"--bench"})) {
+            var it = std.mem.splitScalar(u8, r.str(), ',');
+            const pp = std.fmt.parseInt(usize, it.next().?, 10) catch fail("--bench expects PP,TG", .{});
+            const tg = std.fmt.parseInt(usize, it.next() orelse "", 10) catch fail("--bench expects PP,TG", .{});
             a.bench = .{ pp, tg };
-        } else if (eq(u8, o, "--chat")) a.chat = true else if (eq(u8, o, "-v") or eq(u8, o, "--verbose")) a.verbose = true else if (eq(u8, o, "-h") or eq(u8, o, "--help")) {
+        } else if (r.is(&.{"--chat"})) {
+            a.chat = true;
+        } else if (r.is(&.{"--no-think"})) {
+            a.no_think = true;
+        } else if (r.is(&.{ "-v", "--verbose" })) {
+            a.verbose = true;
+        } else if (r.is(&.{ "-h", "--help" })) {
             std.debug.print("{s}", .{usage});
             std.process.exit(0);
-        } else fail("unknown option {s}\n\n{s}", .{ o, usage });
+        } else fail("unknown option {s}\n\n{s}", .{ argv[r.i], usage });
     }
     if (a.model == null) fail("{s}", .{usage});
     return a;
+}
+
+/// Command line, then the model's general.sampling.* metadata, then defaults.
+fn samplingParams(cli: SamplingArgs, f: *const gguf.File, default_seed: u64) sampler_mod.Params {
+    const meta = struct {
+        fn float(file: *const gguf.File, k: []const u8) ?f32 {
+            return if (file.getFloat(k)) |v| @floatCast(v) else null;
+        }
+        fn uint(file: *const gguf.File, k: []const u8) ?usize {
+            return if (file.getUint(k)) |v| @intCast(v) else null;
+        }
+    };
+    const d: sampler_mod.Params = .{};
+    return .{
+        .temp = cli.temp orelse meta.float(f, "general.sampling.temp") orelse d.temp,
+        .top_k = cli.top_k orelse meta.uint(f, "general.sampling.top_k") orelse d.top_k,
+        .top_p = cli.top_p orelse meta.float(f, "general.sampling.top_p") orelse d.top_p,
+        .min_p = cli.min_p orelse meta.float(f, "general.sampling.min_p") orelse d.min_p,
+        .repeat_penalty = cli.repeat_penalty orelse meta.float(f, "general.sampling.penalty_repeat") orelse d.repeat_penalty,
+        .seed = cli.seed orelse default_seed,
+    };
 }
 
 const Out = struct {
@@ -136,6 +213,7 @@ const Gen = struct {
         var logits = try g.st.forward(input);
         g.t_prompt_ns += timer.lap();
         g.n_prompt += input.len;
+        for (input) |t| g.smp.accept(t);
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const tok = g.smp.sample(logits);
@@ -143,6 +221,7 @@ const Gen = struct {
                 g.t_gen_ns += timer.lap();
                 return tok;
             }
+            g.smp.accept(tok);
             g.out.emit(g.tok.piece(tok));
             if (g.st.pos >= g.st.ctx) {
                 g.out.emit("\n[context full]\n");
@@ -173,36 +252,49 @@ const Gen = struct {
     }
 };
 
-const Template = enum { llama3, chatml, plain };
+const Template = enum {
+    llama3,
+    chatml,
+    /// ChatML preceded by <|startoftext|> (Liquid LFM).
+    lfm,
+    plain,
+};
 
 fn detectTemplate(tok: *const Tokenizer) Template {
     if (tok.tokenId("<|start_header_id|>") != null and tok.tokenId("<|eot_id|>") != null) return .llama3;
-    if (tok.tokenId("<|im_start|>") != null and tok.tokenId("<|im_end|>") != null) return .chatml;
+    if (tok.tokenId("<|im_start|>") != null and tok.tokenId("<|im_end|>") != null)
+        return if (tok.tokenId("<|startoftext|>") != null) .lfm else .chatml;
     return .plain;
 }
 
 fn appendTurn(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), tpl: Template, role: []const u8, msg: []const u8) !void {
     switch (tpl) {
         .llama3 => try buf.print(gpa, "<|start_header_id|>{s}<|end_header_id|>\n\n{s}<|eot_id|>", .{ role, msg }),
-        .chatml => try buf.print(gpa, "<|im_start|>{s}\n{s}<|im_end|>\n", .{ role, msg }),
+        .chatml, .lfm => try buf.print(gpa, "<|im_start|>{s}\n{s}<|im_end|>\n", .{ role, msg }),
         .plain => try buf.print(gpa, "{s}: {s}\n", .{ role, msg }),
     }
 }
 
-fn appendAssistantHeader(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), tpl: Template) !void {
+fn appendAssistantHeader(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), tpl: Template, has_think: bool, no_think: bool) !void {
     try buf.appendSlice(gpa, switch (tpl) {
         .llama3 => "<|start_header_id|>assistant<|end_header_id|>\n\n",
-        .chatml => "<|im_start|>assistant\n",
+        .chatml, .lfm => "<|im_start|>assistant\n",
         .plain => "assistant:",
     });
+    if (!has_think) return;
+    // Mirrors each template's enable_thinking switch.
+    switch (tpl) {
+        .chatml => if (no_think) try buf.appendSlice(gpa, "<think>\n\n</think>\n\n"),
+        .lfm => try buf.appendSlice(gpa, if (no_think) "<think></think>" else "<think>"),
+        else => {},
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.smp_allocator;
     const io = init.io;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    var args = parseArgs(argv);
-    if (!args.seed_set) args.sp.seed = @truncate(@as(u96, @bitCast(std.Io.Clock.real.now(io).nanoseconds)));
+    const args = parseArgs(argv);
 
     const nth = if (args.threads > 0) args.threads else pool_mod.defaultThreads(io);
     const pool = try pool_mod.Pool.create(gpa, io, nth);
@@ -217,7 +309,9 @@ pub fn main(init: std.process.Init) !void {
 
     var st = try model_mod.State.init(gpa, model, pool, ctx, @min(args.batch, ctx));
     defer st.deinit();
-    var smp = try sampler_mod.Sampler.init(gpa, c.vocab, args.sp);
+    const time_seed: u64 = @truncate(@as(u96, @bitCast(std.Io.Clock.real.now(io).nanoseconds)));
+    const sp = samplingParams(args.sampling, &model.file, time_seed);
+    var smp = try sampler_mod.Sampler.init(gpa, c.vocab, sp);
     defer smp.deinit(gpa);
 
     if (args.verbose or args.bench != null) {
@@ -226,7 +320,11 @@ pub fn main(init: std.process.Init) !void {
             @as(f64, @floatFromInt(timer.read())) / 1e6,
         });
         const l0 = &model.layers[0];
-        std.debug.print("weights: wq={s} ffn_down={s} output={s} layout={s}\n", .{ @tagName(l0.wq.typ), @tagName(l0.w_down.typ), @tagName(model.output.typ), if (l0.wq.x8) "x8" else "rows" });
+        std.debug.print("layers: {d} attention + {d} short-conv | weights: ffn_up={s} ffn_down={s} output={s} layout={s}\n", .{
+            model.n_attn_layers,              model.n_conv_layers, @tagName(l0.w_up.typ), @tagName(l0.w_down.typ), @tagName(model.output.typ),
+            if (l0.w_up.x8) "x8" else "rows",
+        });
+        std.debug.print("sampling: temp={d} top_k={d} top_p={d} min_p={d} repeat_penalty={d}\n", .{ sp.temp, sp.top_k, sp.top_p, sp.min_p, sp.repeat_penalty });
     }
 
     var out_buf: [4096]u8 = undefined;
@@ -240,6 +338,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.chat) {
         const tpl = detectTemplate(&tok);
+        const has_think = tok.tokenId("<think>") != null;
         var in_buf: [64 * 1024]u8 = undefined;
         var stdin = std.Io.File.stdin().reader(io, &in_buf);
         var text: std.ArrayList(u8) = .empty;
@@ -256,11 +355,12 @@ pub fn main(init: std.process.Init) !void {
             tokens.clearRetainingCapacity();
             if (pending) |p| {
                 try tokens.append(gpa, p);
-                if (tpl == .chatml) try text.append(gpa, '\n');
+                if (tpl == .chatml or tpl == .lfm) try text.append(gpa, '\n');
             }
+            if (first and tpl == .lfm) try text.appendSlice(gpa, "<|startoftext|>");
             if (first) if (args.system) |sys| try appendTurn(gpa, &text, tpl, "system", sys);
             try appendTurn(gpa, &text, tpl, "user", msg);
-            try appendAssistantHeader(gpa, &text, tpl);
+            try appendAssistantHeader(gpa, &text, tpl, has_think, args.no_think);
             try tok.encode(gpa, text.items, first, true, &tokens);
             first = false;
             pending = gen.run(tokens.items, args.n_predict) catch |e| switch (e) {
@@ -295,7 +395,7 @@ fn bench(gpa: std.mem.Allocator, io: std.Io, st: *model_mod.State, pp: usize, tg
     for (toks, 0..) |*t, i| t.* = @intCast((i * 7919 + 13) % st.model.cfg.vocab);
     // Warm-up pass touches every weight page.
     _ = try st.forward(toks[0..1]);
-    st.pos = 0;
+    st.reset();
 
     var timer: Timer = .start(io);
     if (pp > 0) {
@@ -304,7 +404,7 @@ fn bench(gpa: std.mem.Allocator, io: std.Io, st: *model_mod.State, pp: usize, tg
         std.debug.print("pp{d}: {d:.2} tok/s ({d:.1} ms)\n", .{ pp, @as(f64, @floatFromInt(pp)) * 1e9 / @as(f64, @floatFromInt(ns)), @as(f64, @floatFromInt(ns)) / 1e6 });
     }
     if (tg > 0) {
-        st.pos = 0;
+        st.reset();
         _ = timer.lap();
         var t: u32 = 1;
         for (0..tg) |_| {

@@ -102,9 +102,13 @@ pub const Tokenizer = struct {
         } else {
             const pre = f.getString("tokenizer.ggml.pre") orelse "default";
             self.pre = if (std.mem.eql(u8, pre, "qwen2")) .qwen2 else if (std.mem.eql(u8, pre, "gpt-2") or std.mem.eql(u8, pre, "gpt2")) .gpt2 else .llama3;
-            if (!std.mem.eql(u8, pre, "llama-bpe") and !std.mem.eql(u8, pre, "llama3") and self.pre == .llama3)
+            // These use the Llama 3 split regex and skip merges for whole-word hits.
+            const llama3_like = for ([_][]const u8{ "llama-bpe", "llama3", "lfm2" }) |name| {
+                if (std.mem.eql(u8, pre, name)) break true;
+            } else false;
+            if (!llama3_like and self.pre == .llama3)
                 std.log.warn("pre-tokenizer '{s}' not implemented exactly, using llama3 rules", .{pre});
-            self.ignore_merges = std.mem.eql(u8, pre, "llama-bpe") or std.mem.eql(u8, pre, "llama3");
+            self.ignore_merges = llama3_like;
             for (0..256) |b| {
                 var buf: [4]u8 = undefined;
                 const len = std.unicode.utf8Encode(byte_to_cp[b], &buf) catch unreachable;

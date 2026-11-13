@@ -17,13 +17,14 @@ const Chunks = pool_mod.Chunks;
 const GgmlType = gguf.GgmlType;
 const Allocator = std.mem.Allocator;
 
-pub const Arch = enum { llama, qwen2, qwen3 };
+pub const Arch = enum { llama, qwen2, qwen3, lfm3 };
 
 pub const Config = struct {
     arch: Arch,
     dim: usize,
     n_layers: usize,
     n_heads: usize,
+    /// Largest KV head count of any attention layer.
     n_kv_heads: usize,
     head_dim: usize,
     q_dim: usize,
@@ -36,6 +37,11 @@ pub const Config = struct {
     n_rot: usize,
     rope_neox: bool,
     ctx_train: usize,
+    /// Sliding-window attention layers (0 = none): window size and RoPE base.
+    swa_window: usize = 0,
+    rope_base_swa: f32 = 10000,
+    /// Short-convolution layers (LFM): kernel length, 0 = none.
+    conv_kernel: usize = 0,
 };
 
 pub const Tensor = struct {
@@ -66,21 +72,45 @@ pub const Tensor = struct {
     }
 };
 
-const Layer = struct {
-    attn_norm: []const f32,
-    ffn_norm: []const f32,
+const Attention = struct {
     wq: Tensor,
     wk: Tensor,
     wv: Tensor,
     wo: Tensor,
-    w_gate: Tensor,
-    w_up: Tensor,
-    w_down: Tensor,
+    /// Per-head sigmoid output gate (LFM3).
+    gate: ?Tensor = null,
     bq: ?[]const f32 = null,
     bk: ?[]const f32 = null,
     bv: ?[]const f32 = null,
     q_norm: ?[]const f32 = null,
     k_norm: ?[]const f32 = null,
+    n_kv_heads: usize,
+    /// Sliding-window layer: local RoPE base and a `swa_window` mask.
+    swa: bool = false,
+    /// Index of this layer's KV cache region.
+    kv_slot: usize,
+};
+
+/// LFM gated short convolution: y = C * conv(B * x), all from one in_proj.
+const ShortConv = struct {
+    in_proj: Tensor,
+    out_proj: Tensor,
+    /// Depthwise causal kernel, transposed to [tap][channel].
+    kernel: []const f32,
+    /// Index of this layer's convolution state.
+    slot: usize,
+};
+
+const Layer = struct {
+    attn_norm: []const f32,
+    ffn_norm: []const f32,
+    /// Sandwich norms applied to the mixer / FFN output before the residual add.
+    post_mix_norm: ?[]const f32 = null,
+    post_ffn_norm: ?[]const f32 = null,
+    mixer: union(enum) { attention: Attention, shortconv: ShortConv },
+    w_gate: Tensor,
+    w_up: Tensor,
+    w_down: Tensor,
 };
 
 pub const LoadOptions = struct {
@@ -97,6 +127,10 @@ pub const Model = struct {
     out_norm: []const f32,
     layers: []Layer,
     inv_freq: []f32,
+    /// RoPE frequencies of sliding-window layers (empty when there are none).
+    inv_freq_swa: []f32 = &.{},
+    n_attn_layers: usize = 0,
+    n_conv_layers: usize = 0,
     owned: std.ArrayList([]f32) = .empty,
     /// Anonymous huge-page region holding every matmul weight.
     weights: ?[]align(std.heap.page_size_min) u8 = null,
@@ -117,7 +151,7 @@ pub const Model = struct {
         try self.readConfig();
         try self.bindTensors(gpa);
         try self.buildRope(gpa);
-        try self.materialize(pool, opts.repack);
+        try self.materialize(gpa, pool, opts.repack);
         return self;
     }
 
@@ -126,6 +160,7 @@ pub const Model = struct {
         self.owned.deinit(gpa);
         gpa.free(self.layers);
         gpa.free(self.inv_freq);
+        gpa.free(self.inv_freq_swa);
         if (self.weights) |w| posix.munmap(w);
         self.file.deinit(gpa);
     }
@@ -135,16 +170,21 @@ pub const Model = struct {
         gpa.destroy(self);
     }
 
-    fn matmulTensors(self: *Model, buf: []*Tensor) []*Tensor {
-        var n: usize = 0;
+    fn matmulTensors(self: *Model, gpa: Allocator) ![]*Tensor {
+        var list: std.ArrayList(*Tensor) = .empty;
+        errdefer list.deinit(gpa);
         for (self.layers) |*L| {
-            for ([_]*Tensor{ &L.wq, &L.wk, &L.wv, &L.wo, &L.w_gate, &L.w_up, &L.w_down }) |t| {
-                buf[n] = t;
-                n += 1;
+            switch (L.mixer) {
+                .attention => |*A| {
+                    try list.appendSlice(gpa, &.{ &A.wq, &A.wk, &A.wv, &A.wo });
+                    if (A.gate) |*g| try list.append(gpa, g);
+                },
+                .shortconv => |*C| try list.appendSlice(gpa, &.{ &C.in_proj, &C.out_proj }),
             }
+            try list.appendSlice(gpa, &.{ &L.w_gate, &L.w_up, &L.w_down });
         }
-        buf[n] = &self.output;
-        return buf[0 .. n + 1];
+        try list.append(gpa, &self.output);
+        return list.toOwnedSlice(gpa);
     }
 
     const RepackJob = struct { src: *const Tensor, dst: [*]u8, gbytes: usize, chunks: Chunks };
@@ -160,10 +200,9 @@ pub const Model = struct {
     }
 
     /// Move every matmul weight into one huge-page region, repacking when possible.
-    fn materialize(self: *Model, pool: *Pool, use_repack: bool) !void {
-        var buf: [7 * 512 + 1]*Tensor = undefined;
-        if (self.layers.len > 512) return error.TooManyLayers;
-        const ts = self.matmulTensors(&buf);
+    fn materialize(self: *Model, gpa: Allocator, pool: *Pool, use_repack: bool) !void {
+        const ts = try self.matmulTensors(gpa);
+        defer gpa.free(ts);
         var total: usize = 0;
         for (ts) |t| total += t.materializedBytes(use_repack);
         const len = std.mem.alignForward(usize, total, 2 << 20);
@@ -196,7 +235,7 @@ pub const Model = struct {
         const f = &self.file;
         const arch_s = f.getString("general.architecture") orelse return error.MissingArchitecture;
         const arch = std.meta.stringToEnum(Arch, arch_s) orelse {
-            std.log.err("unsupported architecture '{s}' (supported: llama, qwen2, qwen3)", .{arch_s});
+            std.log.err("unsupported architecture '{s}' (supported: llama, qwen2, qwen3, lfm3)", .{arch_s});
             return error.UnsupportedArchitecture;
         };
         self.cfg.arch = arch;
@@ -213,7 +252,9 @@ pub const Model = struct {
         c.dim = try req(f, self.key(&kb, "embedding_length"));
         c.n_layers = try req(f, self.key(&kb, "block_count"));
         c.n_heads = try req(f, self.key(&kb, "attention.head_count"));
-        c.n_kv_heads = @intCast(f.getUint(self.key(&kb, "attention.head_count_kv")) orelse c.n_heads);
+        c.n_kv_heads = 0;
+        for (0..c.n_layers) |i| c.n_kv_heads = @max(c.n_kv_heads, self.layerKvHeads(i));
+        if (c.n_kv_heads == 0) return error.InvalidConfig;
         c.ffn_dim = try req(f, self.key(&kb, "feed_forward_length"));
         c.head_dim = @intCast(f.getUint(self.key(&kb, "attention.key_length")) orelse c.dim / c.n_heads);
         c.q_dim = c.n_heads * c.head_dim;
@@ -231,7 +272,40 @@ pub const Model = struct {
                 std.log.warn("rope scaling '{s}' not implemented; long contexts may degrade", .{t});
             }
         }
-        if (c.n_heads % c.n_kv_heads != 0 or c.n_rot > c.head_dim or c.n_rot % 2 != 0) return error.InvalidConfig;
+        c.swa_window = @intCast(f.getUint(self.key(&kb, "attention.sliding_window")) orelse 0);
+        c.rope_base_swa = @floatCast(f.getFloat(self.key(&kb, "rope.freq_base_swa")) orelse c.rope_base);
+        c.conv_kernel = @intCast(f.getUint(self.key(&kb, "shortconv.l_cache")) orelse 0);
+        for (0..c.n_layers) |i| {
+            const kv = self.layerKvHeads(i);
+            if (kv == 0 and c.conv_kernel < 2) return error.InvalidConfig;
+            if (kv != 0 and c.n_heads % kv != 0) return error.InvalidConfig;
+        }
+        if (c.n_rot > c.head_dim or c.n_rot % 2 != 0) return error.InvalidConfig;
+    }
+
+    /// KV heads of layer `i`; 0 marks a short-convolution layer. The GGUF
+    /// value is either one integer or a per-layer array.
+    fn layerKvHeads(self: *const Model, i: usize) usize {
+        var kb: [128]u8 = undefined;
+        const k = self.key(&kb, "attention.head_count_kv");
+        if (self.file.getArray(k)) |a| {
+            if (i >= a.len) return 0;
+            return switch (a.elem) {
+                .i32 => @intCast(@max(0, a.item(i32, i))),
+                .u32 => a.item(u32, i),
+                .u16 => a.item(u16, i),
+                .u8 => a.item(u8, i),
+                else => 0,
+            };
+        }
+        return @intCast(self.file.getUint(k) orelse (self.file.getUint(self.key(&kb, "attention.head_count")) orelse 0));
+    }
+
+    fn layerIsSwa(self: *const Model, i: usize) bool {
+        if (self.cfg.swa_window == 0) return false;
+        var kb: [128]u8 = undefined;
+        const a = self.file.getArray(self.key(&kb, "attention.sliding_window_pattern")) orelse return false;
+        return a.elem == .bool and i < a.len and a.item(u8, i) != 0;
     }
 
     fn tensor(self: *Model, name: []const u8, cols: usize, rows: ?usize) !Tensor {
@@ -292,19 +366,66 @@ pub const Model = struct {
             L.* = .{
                 .attn_norm = try self.vector(gpa, n(&nb, i, "attn_norm.weight"), c.dim),
                 .ffn_norm = try self.vector(gpa, n(&nb, i, "ffn_norm.weight"), c.dim),
-                .wq = try self.tensor(n(&nb, i, "attn_q.weight"), c.dim, c.q_dim),
-                .wk = try self.tensor(n(&nb, i, "attn_k.weight"), c.dim, c.kv_dim),
-                .wv = try self.tensor(n(&nb, i, "attn_v.weight"), c.dim, c.kv_dim),
-                .wo = try self.tensor(n(&nb, i, "attn_output.weight"), c.q_dim, c.dim),
+                .post_mix_norm = try self.optVector(gpa, n(&nb, i, "post_attention_norm.weight"), c.dim),
+                .post_ffn_norm = try self.optVector(gpa, n(&nb, i, "post_ffw_norm.weight"), c.dim),
+                .mixer = undefined,
                 .w_gate = try self.tensor(n(&nb, i, "ffn_gate.weight"), c.dim, c.ffn_dim),
                 .w_up = try self.tensor(n(&nb, i, "ffn_up.weight"), c.dim, c.ffn_dim),
                 .w_down = try self.tensor(n(&nb, i, "ffn_down.weight"), c.ffn_dim, c.dim),
-                .bq = try self.optVector(gpa, n(&nb, i, "attn_q.bias"), c.q_dim),
-                .bk = try self.optVector(gpa, n(&nb, i, "attn_k.bias"), c.kv_dim),
-                .bv = try self.optVector(gpa, n(&nb, i, "attn_v.bias"), c.kv_dim),
-                .q_norm = try self.optVector(gpa, n(&nb, i, "attn_q_norm.weight"), c.head_dim),
-                .k_norm = try self.optVector(gpa, n(&nb, i, "attn_k_norm.weight"), c.head_dim),
             };
+            const kv = self.layerKvHeads(i);
+            if (kv == 0) {
+                L.mixer = .{ .shortconv = .{
+                    .in_proj = try self.tensor(n(&nb, i, "shortconv.in_proj.weight"), c.dim, 3 * c.dim),
+                    .out_proj = try self.tensor(n(&nb, i, "shortconv.out_proj.weight"), c.dim, c.dim),
+                    .kernel = try self.convKernel(gpa, n(&nb, i, "shortconv.conv.weight")),
+                    .slot = self.n_conv_layers,
+                } };
+                self.n_conv_layers += 1;
+            } else {
+                const kv_dim = kv * c.head_dim;
+                L.mixer = .{ .attention = .{
+                    .wq = try self.tensor(n(&nb, i, "attn_q.weight"), c.dim, c.q_dim),
+                    .wk = try self.tensor(n(&nb, i, "attn_k.weight"), c.dim, kv_dim),
+                    .wv = try self.tensor(n(&nb, i, "attn_v.weight"), c.dim, kv_dim),
+                    .wo = try self.tensor(n(&nb, i, "attn_output.weight"), c.q_dim, c.dim),
+                    .gate = if (self.file.tensors.contains(n(&nb, i, "attn_gate.weight"))) try self.tensor(n(&nb, i, "attn_gate.weight"), c.dim, c.n_heads) else null,
+                    .bq = try self.optVector(gpa, n(&nb, i, "attn_q.bias"), c.q_dim),
+                    .bk = try self.optVector(gpa, n(&nb, i, "attn_k.bias"), kv_dim),
+                    .bv = try self.optVector(gpa, n(&nb, i, "attn_v.bias"), kv_dim),
+                    .q_norm = try self.optVector(gpa, n(&nb, i, "attn_q_norm.weight"), c.head_dim),
+                    .k_norm = try self.optVector(gpa, n(&nb, i, "attn_k_norm.weight"), c.head_dim),
+                    .n_kv_heads = kv,
+                    .swa = self.layerIsSwa(i),
+                    .kv_slot = self.n_attn_layers,
+                } };
+                self.n_attn_layers += 1;
+            }
+        }
+    }
+
+    /// Short-conv taps, stored [channel][tap] in GGUF, transposed to [tap][channel].
+    fn convKernel(self: *Model, gpa: Allocator, name: []const u8) ![]const f32 {
+        const c = &self.cfg;
+        var row: [64]f32 = undefined;
+        if (c.conv_kernel > row.len) return error.InvalidConfig;
+        const t = try self.tensor(name, c.conv_kernel, c.dim);
+        const out = try gpa.alloc(f32, c.conv_kernel * c.dim);
+        errdefer gpa.free(out);
+        try self.owned.append(gpa, out);
+        for (0..c.dim) |ch| {
+            quant.dequantRow(t.typ, t.row(ch), row[0..c.conv_kernel]);
+            for (0..c.conv_kernel) |k| out[k * c.dim + ch] = row[k];
+        }
+        return out;
+    }
+
+    fn ropeFreqs(c: *const Config, base: f32, factors: ?[]const f32, out: []f32) void {
+        for (out, 0..) |*v, i| {
+            const e = -2.0 * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(c.n_rot));
+            var w = std.math.pow(f64, base, e) * c.rope_scale;
+            if (factors) |fr| w /= fr[i];
+            v.* = @floatCast(w);
         }
     }
 
@@ -312,12 +433,11 @@ pub const Model = struct {
         const c = &self.cfg;
         const half = c.n_rot / 2;
         self.inv_freq = try gpa.alloc(f32, half);
-        const ff = try self.optVector(gpa, "rope_freqs.weight", half);
-        for (self.inv_freq, 0..) |*v, i| {
-            const e = -2.0 * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(c.n_rot));
-            var w = std.math.pow(f64, c.rope_base, e) * c.rope_scale;
-            if (ff) |fr| w /= fr[i];
-            v.* = @floatCast(w);
+        // rope_freqs factors belong to the full-attention layers only.
+        ropeFreqs(c, c.rope_base, try self.optVector(gpa, "rope_freqs.weight", half), self.inv_freq);
+        if (c.swa_window > 0) {
+            self.inv_freq_swa = try gpa.alloc(f32, half);
+            ropeFreqs(c, c.rope_base_swa, null, self.inv_freq_swa);
         }
     }
 };
@@ -485,13 +605,15 @@ fn rowsDispatch(acc: bool, w: *const Tensor, r0: usize, r1: usize, act: *const A
     }
 }
 
+const max_outs = 4;
+
 const MatJob = struct {
     outs: []const MatOut,
     act: *const Act,
     ntok: usize,
     rows_chunk: usize,
     /// First chunk index of each output (prefix sums), len = outs.len + 1.
-    first: [4]usize,
+    first: [max_outs + 1]usize,
     chunks: Chunks,
 };
 
@@ -598,17 +720,21 @@ const max_head_dim = 256;
 const V16f = @Vector(16, f32);
 
 /// Online-softmax attention of NQ queries against one KV head; query i sees
-/// positions [0, np[i]). Writes the normalized outputs to `out`.
-fn attendBlock(comptime NQ: usize, hd: usize, kt: [*]const f16, vr: [*]const f16, q: [NQ][*]const f32, np: [NQ]usize, out: [NQ][*]f32, scale: f32) void {
+/// positions [lo[i], np[i]). Writes the normalized outputs to `out`.
+fn attendBlock(comptime NQ: usize, hd: usize, kt: [*]const f16, vr: [*]const f16, q: [NQ][*]const f32, lo: [NQ]usize, np: [NQ]usize, out: [NQ][*]f32, scale: f32) void {
     var o: [NQ][max_head_dim]f32 align(32) = undefined;
     var m: [NQ]f32 = @splat(-std.math.inf(f32));
     var l: [NQ]f32 = @splat(0);
     inline for (0..NQ) |i| @memset(o[i][0..hd], 0);
     var maxnp: usize = 0;
-    inline for (0..NQ) |i| maxnp = @max(maxnp, np[i]);
+    var minlo: usize = std.math.maxInt(usize);
+    inline for (0..NQ) |i| {
+        maxnp = @max(maxnp, np[i]);
+        minlo = @min(minlo, lo[i]);
+    }
     const ntiles = (maxnp + kv_tile - 1) / kv_tile;
 
-    for (0..ntiles) |j| {
+    for (minlo / kv_tile..ntiles) |j| {
         const tile = kt + j * hd * kv_tile;
         var s: [NQ]V16f = @splat(@splat(0));
         for (0..hd) |d| {
@@ -620,9 +746,10 @@ fn attendBlock(comptime NQ: usize, hd: usize, kt: [*]const f16, vr: [*]const f16
         const base = j * kv_tile;
         inline for (0..NQ) |i| {
             var sv = s[i] * @as(V16f, @splat(scale));
-            if (base + kv_tile > np[i]) {
+            if (base < lo[i] or base + kv_tile > np[i]) {
                 const lane = std.simd.iota(u32, kv_tile) + @as(@Vector(kv_tile, u32), @splat(@intCast(base)));
-                sv = @select(f32, lane < @as(@Vector(kv_tile, u32), @splat(@intCast(np[i]))), sv, @as(V16f, @splat(-std.math.inf(f32))));
+                const visible = (lane < @as(@Vector(kv_tile, u32), @splat(@intCast(np[i])))) & (lane >= @as(@Vector(kv_tile, u32), @splat(@intCast(lo[i]))));
+                sv = @select(f32, visible, sv, @as(V16f, @splat(-std.math.inf(f32))));
             }
             const tmax = @reduce(.Max, sv);
             if (tmax == -std.math.inf(f32)) {
@@ -667,7 +794,10 @@ fn attendBlock(comptime NQ: usize, hd: usize, kt: [*]const f16, vr: [*]const f16
 
 const AttnJob = struct {
     st: *State,
-    layer: usize,
+    slot: usize,
+    n_kv: usize,
+    /// Sliding window length, 0 = full causal attention.
+    window: usize,
     pos0: usize,
     ntok: usize,
     /// Query blocks per KV head.
@@ -679,7 +809,7 @@ fn attnWorker(job: *AttnJob, _: usize, _: usize) void {
     const st = job.st;
     const c = &st.model.cfg;
     const hd = c.head_dim;
-    const g = c.n_heads / c.n_kv_heads;
+    const g = c.n_heads / job.n_kv;
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     const nq_total = job.ntok * g;
     while (job.chunks.grab()) |range| for (range[0]..range[1]) |item| {
@@ -687,11 +817,12 @@ fn attnWorker(job: *AttnJob, _: usize, _: usize) void {
         const qb = item % job.qblocks;
         const first = qb * max_q;
         const nq = @min(max_q, nq_total - first);
-        const kt = st.k_cache.ptr + st.cacheIndex(job.layer, kh);
-        const vr = st.v_cache.ptr + st.cacheIndex(job.layer, kh);
+        const kt = st.k_cache.ptr + st.cacheIndex(job.slot, kh);
+        const vr = st.v_cache.ptr + st.cacheIndex(job.slot, kh);
         switch (nq) {
             inline 1...max_q => |n| {
                 var qp: [n][*]const f32 = undefined;
+                var lo: [n]usize = undefined;
                 var np: [n]usize = undefined;
                 var op: [n][*]f32 = undefined;
                 inline for (0..n) |i| {
@@ -700,9 +831,10 @@ fn attnWorker(job: *AttnJob, _: usize, _: usize) void {
                     const h = kh * g + (first + i) % g;
                     qp[i] = st.q.ptr + t * c.q_dim + h * hd;
                     np[i] = job.pos0 + t + 1;
+                    lo[i] = if (job.window > 0 and np[i] > job.window) np[i] - job.window else 0;
                     op[i] = st.att.f.ptr + t * c.q_dim + h * hd;
                 }
-                attendBlock(n, hd, kt, vr, qp, np, op, scale);
+                attendBlock(n, hd, kt, vr, qp, lo, np, op, scale);
             },
             else => unreachable,
         }
@@ -727,14 +859,25 @@ pub const State = struct {
     v: []f32,
     logits: []f32,
     rope_cs: []f32,
-    /// Per (layer, kv head): K as [ctx/16 tiles][head_dim][16], V as [ctx][head_dim].
+    rope_cs_swa: []f32,
+    /// Per (attention layer, kv head): K as [ctx/16 tiles][head_dim][16], V as [ctx][head_dim].
     k_cache: []f16,
     v_cache: []f16,
     /// ctx rounded up to whole K tiles.
     ctx_pad: usize,
+    /// Mixer / FFN output awaiting its post-norm (sandwich-norm models).
+    tmp: []f32,
+    /// Per-head attention gate logits [bmax][n_heads].
+    gate: []f32,
+    /// Short conv: in_proj output [bmax][3*dim], input history
+    /// [(kernel-1) + bmax][dim], and the last kernel-1 inputs of every conv layer.
+    conv_in: []f32,
+    conv_hist: []f32,
+    conv_state: []f32,
 
     pub fn init(gpa: Allocator, model: *const Model, pool: *Pool, ctx: usize, bmax: usize) !State {
         const c = &model.cfg;
+        if (c.head_dim % 8 != 0 or c.head_dim > max_head_dim) return error.UnsupportedHeadDim;
         var s: State = undefined;
         s.gpa = gpa;
         s.model = model;
@@ -742,27 +885,40 @@ pub const State = struct {
         s.ctx = ctx;
         s.bmax = bmax;
         s.pos = 0;
-        s.x = try gpa.alloc(f32, bmax * c.dim);
-        errdefer gpa.free(s.x);
+        s.ctx_pad = std.mem.alignForward(usize, ctx, kv_tile);
+        const hist = if (c.conv_kernel > 0) c.conv_kernel - 1 else 0;
+        const has_conv = model.n_conv_layers > 0;
         s.xn = try Act.init(gpa, c.dim, bmax);
         errdefer s.xn.deinit(gpa);
         s.att = try Act.init(gpa, c.q_dim, bmax);
         errdefer s.att.deinit(gpa);
         s.hb = try Act.init(gpa, c.ffn_dim, bmax);
         errdefer s.hb.deinit(gpa);
-        s.q = try gpa.alloc(f32, bmax * c.q_dim);
-        errdefer gpa.free(s.q);
-        s.k = try gpa.alloc(f32, bmax * c.kv_dim);
-        errdefer gpa.free(s.k);
-        s.v = try gpa.alloc(f32, bmax * c.kv_dim);
-        errdefer gpa.free(s.v);
-        s.logits = try gpa.alloc(f32, c.vocab);
-        errdefer gpa.free(s.logits);
-        s.rope_cs = try gpa.alloc(f32, bmax * c.n_rot);
-        errdefer gpa.free(s.rope_cs);
-        if (c.head_dim % 8 != 0 or c.head_dim > max_head_dim) return error.UnsupportedHeadDim;
-        s.ctx_pad = std.mem.alignForward(usize, ctx, kv_tile);
-        const cache_len = c.n_layers * c.n_kv_heads * s.ctx_pad * c.head_dim;
+        // Plain f32 buffers: one allocation each, freed together on failure.
+        const bufs = .{
+            .{ "x", bmax * c.dim },
+            .{ "q", bmax * c.q_dim },
+            .{ "k", bmax * c.kv_dim },
+            .{ "v", bmax * c.kv_dim },
+            .{ "logits", c.vocab },
+            .{ "rope_cs", bmax * c.n_rot },
+            .{ "rope_cs_swa", if (model.inv_freq_swa.len > 0) bmax * c.n_rot else 0 },
+            .{ "tmp", bmax * c.dim },
+            .{ "gate", bmax * c.n_heads },
+            .{ "conv_in", if (has_conv) bmax * 3 * c.dim else 0 },
+            .{ "conv_hist", if (has_conv) (hist + bmax) * c.dim else 0 },
+            .{ "conv_state", model.n_conv_layers * hist * c.dim },
+        };
+        var done: usize = 0;
+        errdefer inline for (bufs, 0..) |b, i| {
+            if (i < done) gpa.free(@field(s, b[0]));
+        };
+        inline for (bufs) |b| {
+            @field(s, b[0]) = try gpa.alloc(f32, b[1]);
+            done += 1;
+        }
+        @memset(s.conv_state, 0);
+        const cache_len = model.n_attn_layers * c.n_kv_heads * s.ctx_pad * c.head_dim;
         s.k_cache = try gpa.alloc(f16, cache_len);
         errdefer gpa.free(s.k_cache);
         s.v_cache = try gpa.alloc(f16, cache_len);
@@ -771,26 +927,28 @@ pub const State = struct {
 
     pub fn deinit(s: *State) void {
         const gpa = s.gpa;
-        gpa.free(s.x);
         s.xn.deinit(gpa);
         s.att.deinit(gpa);
         s.hb.deinit(gpa);
-        gpa.free(s.q);
-        gpa.free(s.k);
-        gpa.free(s.v);
-        gpa.free(s.logits);
-        gpa.free(s.rope_cs);
+        inline for (.{ "x", "q", "k", "v", "logits", "rope_cs", "rope_cs_swa", "tmp", "gate", "conv_in", "conv_hist", "conv_state" }) |name| gpa.free(@field(s, name));
         gpa.free(s.k_cache);
         gpa.free(s.v_cache);
     }
 
-    /// Start of one (layer, kv head) region in k_cache / v_cache.
-    inline fn cacheIndex(s: *const State, layer: usize, kh: usize) usize {
+    /// Forget the context (KV cache positions and convolution state).
+    pub fn reset(s: *State) void {
+        s.pos = 0;
+        @memset(s.conv_state, 0);
+    }
+
+    /// Start of one (attention layer, kv head) region in k_cache / v_cache.
+    inline fn cacheIndex(s: *const State, slot: usize, kh: usize) usize {
         const c = &s.model.cfg;
-        return (layer * c.n_kv_heads + kh) * s.ctx_pad * c.head_dim;
+        return (slot * c.n_kv_heads + kh) * s.ctx_pad * c.head_dim;
     }
 
     fn matmul(s: *State, outs: []const MatOut, act: *Act) void {
+        std.debug.assert(outs.len <= max_outs);
         var rows: usize = 0;
         for (outs) |o| {
             act.prepare(quant.actKind(o.w.typ), s.pool);
@@ -811,22 +969,26 @@ pub const State = struct {
 
     fn ropeTables(s: *State, pos0: usize, ntok: usize) void {
         const m = s.model;
-        const half = m.cfg.n_rot / 2;
+        const n_rot = m.cfg.n_rot;
+        const half = n_rot / 2;
         for (0..ntok) |t| {
             const p: f32 = @floatFromInt(pos0 + t);
-            const cs = s.rope_cs[t * m.cfg.n_rot ..];
-            for (m.inv_freq, 0..) |f, i| {
-                const a = p * f;
-                cs[i] = @cos(a);
-                cs[half + i] = @sin(a);
+            for ([_][]const f32{ m.inv_freq, m.inv_freq_swa }, [_][]f32{ s.rope_cs, s.rope_cs_swa }) |freqs, table| {
+                if (freqs.len == 0) continue;
+                const cs = table[t * n_rot ..];
+                for (freqs, 0..) |f, i| {
+                    const a = p * f;
+                    cs[i] = @cos(a);
+                    cs[half + i] = @sin(a);
+                }
             }
         }
     }
 
-    fn rope(s: *const State, v: []f32, t: usize) void {
+    fn rope(s: *const State, v: []f32, t: usize, swa: bool) void {
         const c = &s.model.cfg;
         const half = c.n_rot / 2;
-        const cs = s.rope_cs[t * c.n_rot ..];
+        const cs = (if (swa) s.rope_cs_swa else s.rope_cs)[t * c.n_rot ..];
         var h: usize = 0;
         while (h < v.len) : (h += c.head_dim) {
             const x = v[h..][0..c.head_dim];
@@ -841,6 +1003,126 @@ pub const State = struct {
         }
     }
 
+    /// Attention mixer for `nt` tokens of normalized input in `xn`; the
+    /// projected output is written to (or accumulated into) `dst`.
+    fn attention(s: *State, A: *const Attention, nt: usize, pos0: usize, dst: [*]f32, accumulate: bool) void {
+        const c = &s.model.cfg;
+        const hd = c.head_dim;
+        const kv_dim = A.n_kv_heads * hd;
+        var outs: [max_outs]MatOut = .{
+            .{ .w = &A.wq, .out = s.q.ptr, .stride = c.q_dim },
+            .{ .w = &A.wk, .out = s.k.ptr, .stride = kv_dim },
+            .{ .w = &A.wv, .out = s.v.ptr, .stride = kv_dim },
+            undefined,
+        };
+        var n_outs: usize = 3;
+        if (A.gate) |*g| {
+            outs[3] = .{ .w = g, .out = s.gate.ptr, .stride = c.n_heads };
+            n_outs = 4;
+        }
+        s.matmul(outs[0..n_outs], &s.xn);
+
+        for (0..nt) |t| {
+            const q = s.q[t * c.q_dim ..][0..c.q_dim];
+            const k = s.k[t * kv_dim ..][0..kv_dim];
+            const v = s.v[t * kv_dim ..][0..kv_dim];
+            if (A.bq) |b| for (q, b) |*a, bb| {
+                a.* += bb;
+            };
+            if (A.bk) |b| for (k, b) |*a, bb| {
+                a.* += bb;
+            };
+            if (A.bv) |b| for (v, b) |*a, bb| {
+                a.* += bb;
+            };
+            if (A.q_norm) |w| {
+                var h: usize = 0;
+                while (h < q.len) : (h += hd) rmsnorm(q[h..][0..hd], q[h..][0..hd], w, c.eps);
+            }
+            if (A.k_norm) |w| {
+                var h: usize = 0;
+                while (h < k.len) : (h += hd) rmsnorm(k[h..][0..hd], k[h..][0..hd], w, c.eps);
+            }
+            s.rope(q, t, A.swa);
+            s.rope(k, t, A.swa);
+            const p = pos0 + t;
+            for (0..A.n_kv_heads) |kh| {
+                const base = s.cacheIndex(A.kv_slot, kh);
+                const kt = s.k_cache[base + (p / kv_tile) * hd * kv_tile + p % kv_tile ..];
+                const vr = s.v_cache[base + p * hd ..][0..hd];
+                for (0..hd) |d| {
+                    kt[d * kv_tile] = @floatCast(k[kh * hd + d]);
+                    vr[d] = @floatCast(v[kh * hd + d]);
+                }
+            }
+        }
+
+        const g = c.n_heads / A.n_kv_heads;
+        const qblocks = (nt * g + max_q - 1) / max_q;
+        var aj: AttnJob = .{
+            .st = s,
+            .slot = A.kv_slot,
+            .n_kv = A.n_kv_heads,
+            .window = if (A.swa) c.swa_window else 0,
+            .pos0 = pos0,
+            .ntok = nt,
+            .qblocks = qblocks,
+            .chunks = .init(A.n_kv_heads * qblocks, 1),
+        };
+        s.pool.run(&aj, attnWorker);
+
+        if (A.gate != null) {
+            for (0..nt) |t| for (0..c.n_heads) |h| {
+                const gv = 1.0 / (1.0 + @exp(-s.gate[t * c.n_heads + h]));
+                for (s.att.f[t * c.q_dim + h * hd ..][0..hd]) |*a| a.* *= gv;
+            };
+        }
+        s.att.reset(nt);
+        s.matmul(&.{.{ .w = &A.wo, .out = dst, .stride = c.dim, .accumulate = accumulate }}, &s.att);
+    }
+
+    /// LFM gated short convolution over `nt` tokens of normalized input in `xn`.
+    fn shortConv(s: *State, C: *const ShortConv, nt: usize, dst: [*]f32, accumulate: bool) void {
+        const c = &s.model.cfg;
+        const d = c.dim;
+        const taps = c.conv_kernel;
+        const hist = taps - 1;
+        s.matmul(&.{.{ .w = &C.in_proj, .out = s.conv_in.ptr, .stride = 3 * d }}, &s.xn);
+
+        // History rows: the previous `hist` conv inputs, then B*x of each new token.
+        const state = s.conv_state[C.slot * hist * d ..][0 .. hist * d];
+        @memcpy(s.conv_hist[0 .. hist * d], state);
+        for (0..nt) |t| {
+            const bcx = s.conv_in[t * 3 * d ..];
+            const row = s.conv_hist[(hist + t) * d ..][0..d];
+            for (row, bcx[0..d], bcx[2 * d ..][0..d]) |*r, b, x| r.* = b * x;
+        }
+        // y = C * sum_k w[k] * hist[t + k], written straight into xn for out_proj.
+        for (0..nt) |t| {
+            const cg = s.conv_in[t * 3 * d + d ..][0..d];
+            const y = s.xn.f[t * d ..][0..d];
+            var ch: usize = 0;
+            while (ch < d) : (ch += 8) {
+                var acc: V8f = @splat(0);
+                for (0..taps) |k| acc = @mulAdd(V8f, C.kernel[k * d + ch ..][0..8].*, s.conv_hist[(t + k) * d + ch ..][0..8].*, acc);
+                y[ch..][0..8].* = acc * @as(V8f, cg[ch..][0..8].*);
+            }
+        }
+        @memcpy(state, s.conv_hist[nt * d ..][0 .. hist * d]);
+        s.xn.reset(nt);
+        s.matmul(&.{.{ .w = &C.out_proj, .out = dst, .stride = d, .accumulate = accumulate }}, &s.xn);
+    }
+
+    /// x += rmsnorm(tmp) * w for every token (sandwich norm residual).
+    fn addNormed(s: *State, w: []const f32, nt: usize) void {
+        const c = &s.model.cfg;
+        for (0..nt) |t| {
+            const y = s.tmp[t * c.dim ..][0..c.dim];
+            rmsnorm(y, y, w, c.eps);
+            for (s.x[t * c.dim ..][0..c.dim], y) |*a, b| a.* += b;
+        }
+    }
+
     fn forwardBatch(s: *State, tokens: []const u32, want_logits: bool) void {
         const m = s.model;
         const c = &m.cfg;
@@ -849,57 +1131,17 @@ pub const State = struct {
         for (tokens, 0..) |tok, t| quant.dequantRow(m.embd.typ, m.embd.row(tok), s.x[t * c.dim ..][0..c.dim]);
         s.ropeTables(pos0, nt);
 
-        for (m.layers, 0..) |*L, l| {
+        for (m.layers) |*L| {
             for (0..nt) |t| rmsnorm(s.xn.f[t * c.dim ..][0..c.dim], s.x[t * c.dim ..][0..c.dim], L.attn_norm, c.eps);
             s.xn.reset(nt);
-            s.matmul(&.{
-                .{ .w = &L.wq, .out = s.q.ptr, .stride = c.q_dim },
-                .{ .w = &L.wk, .out = s.k.ptr, .stride = c.kv_dim },
-                .{ .w = &L.wv, .out = s.v.ptr, .stride = c.kv_dim },
-            }, &s.xn);
-
-            for (0..nt) |t| {
-                const q = s.q[t * c.q_dim ..][0..c.q_dim];
-                const k = s.k[t * c.kv_dim ..][0..c.kv_dim];
-                const v = s.v[t * c.kv_dim ..][0..c.kv_dim];
-                if (L.bq) |b| for (q, b) |*a, bb| {
-                    a.* += bb;
-                };
-                if (L.bk) |b| for (k, b) |*a, bb| {
-                    a.* += bb;
-                };
-                if (L.bv) |b| for (v, b) |*a, bb| {
-                    a.* += bb;
-                };
-                if (L.q_norm) |w| {
-                    var h: usize = 0;
-                    while (h < q.len) : (h += c.head_dim) rmsnorm(q[h..][0..c.head_dim], q[h..][0..c.head_dim], w, c.eps);
-                }
-                if (L.k_norm) |w| {
-                    var h: usize = 0;
-                    while (h < k.len) : (h += c.head_dim) rmsnorm(k[h..][0..c.head_dim], k[h..][0..c.head_dim], w, c.eps);
-                }
-                s.rope(q, t);
-                s.rope(k, t);
-                const p = pos0 + t;
-                const hd = c.head_dim;
-                for (0..c.n_kv_heads) |kh| {
-                    const base = s.cacheIndex(l, kh);
-                    const kt = s.k_cache[base + (p / kv_tile) * hd * kv_tile + p % kv_tile ..];
-                    const vr = s.v_cache[base + p * hd ..][0..hd];
-                    for (0..hd) |d| {
-                        kt[d * kv_tile] = @floatCast(k[kh * hd + d]);
-                        vr[d] = @floatCast(v[kh * hd + d]);
-                    }
-                }
+            // Without a post-norm the mixer output accumulates straight into x.
+            const mix_direct = L.post_mix_norm == null;
+            const mix_dst = if (mix_direct) s.x.ptr else s.tmp.ptr;
+            switch (L.mixer) {
+                .attention => |*A| s.attention(A, nt, pos0, mix_dst, mix_direct),
+                .shortconv => |*C| s.shortConv(C, nt, mix_dst, mix_direct),
             }
-
-            const g = c.n_heads / c.n_kv_heads;
-            const qblocks = (nt * g + max_q - 1) / max_q;
-            var aj: AttnJob = .{ .st = s, .layer = l, .pos0 = pos0, .ntok = nt, .qblocks = qblocks, .chunks = .init(c.n_kv_heads * qblocks, 1) };
-            s.pool.run(&aj, attnWorker);
-            s.att.reset(nt);
-            s.matmul(&.{.{ .w = &L.wo, .out = s.x.ptr, .stride = c.dim, .accumulate = true }}, &s.att);
+            if (L.post_mix_norm) |w| s.addNormed(w, nt);
 
             for (0..nt) |t| rmsnorm(s.xn.f[t * c.dim ..][0..c.dim], s.x[t * c.dim ..][0..c.dim], L.ffn_norm, c.eps);
             s.xn.reset(nt);
@@ -909,7 +1151,9 @@ pub const State = struct {
             var fj: FfnJob = .{ .gate = &L.w_gate, .up = &L.w_up, .act = &s.xn, .out = s.hb.f, .ntok = nt, .rows_chunk = rc, .chunks = .init((c.ffn_dim + rc - 1) / rc, 1) };
             s.pool.run(&fj, ffnWorker);
             s.hb.reset(nt);
-            s.matmul(&.{.{ .w = &L.w_down, .out = s.x.ptr, .stride = c.dim, .accumulate = true }}, &s.hb);
+            const ffn_direct = L.post_ffn_norm == null;
+            s.matmul(&.{.{ .w = &L.w_down, .out = if (ffn_direct) s.x.ptr else s.tmp.ptr, .stride = c.dim, .accumulate = ffn_direct }}, &s.hb);
+            if (L.post_ffn_norm) |w| s.addNormed(w, nt);
         }
         s.pos += nt;
 
@@ -956,27 +1200,29 @@ test "tiled online-softmax attention matches naive reference" {
         for (&q) |*qq| for (qq) |*x| {
             x.* = r.floatNorm(f32) * 2;
         };
+        // Query 0 uses a sliding window starting mid-tile.
+        const lo = [3]usize{ 21, 0, 0 };
         const np = [3]usize{ npos, 17, 1 };
         var out: [3][hd]f32 = undefined;
         const scale: f32 = 0.125;
-        attendBlock(3, hd, &kt, &vr, .{ &q[0], &q[1], &q[2] }, np, .{ &out[0], &out[1], &out[2] }, scale);
+        attendBlock(3, hd, &kt, &vr, .{ &q[0], &q[1], &q[2] }, lo, np, .{ &out[0], &out[1], &out[2] }, scale);
         for (0..3) |i| {
             var s: [npos]f64 = undefined;
             var mx: f64 = -std.math.inf(f64);
-            for (0..np[i]) |p| {
+            for (lo[i]..np[i]) |p| {
                 var dot: f64 = 0;
                 for (0..hd) |d| dot += @as(f64, q[i][d]) * kf[p][d];
                 s[p] = dot * scale;
                 mx = @max(mx, s[p]);
             }
             var sum: f64 = 0;
-            for (0..np[i]) |p| {
+            for (lo[i]..np[i]) |p| {
                 s[p] = @exp(s[p] - mx);
                 sum += s[p];
             }
             for (0..hd) |d| {
                 var want: f64 = 0;
-                for (0..np[i]) |p| want += s[p] / sum * vf[p][d];
+                for (lo[i]..np[i]) |p| want += s[p] / sum * vf[p][d];
                 try std.testing.expectApproxEqAbs(want, out[i][d], 1e-4);
             }
         }
