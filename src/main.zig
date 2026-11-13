@@ -29,6 +29,7 @@ const usage =
     \\speculative decoding:
     \\  --draft N             n-gram prompt lookup draft tokens, 0 = off (default 0, 3-5 recommended)
     \\
+    \\  --no-prune            keep full lm_head matmul (for A/B comparison)
     \\  --no-repack           keep GGUF row layout (per-row kernels; for A/B comparison)
     \\  --bench PP,TG         benchmark prompt processing of PP tokens and generation of TG tokens
     \\  -v, --verbose         print model info
@@ -129,6 +130,8 @@ fn parseArgs(argv: []const [:0]const u8) Args {
             a.sampling.seed = r.uint();
         } else if (r.is(&.{"--draft"})) {
             a.draft = r.uint();
+        } else if (r.is(&.{"--no-prune"})) {
+            a.load.prune_vocab = false;
         } else if (r.is(&.{"--no-repack"})) {
             a.load.repack = false;
         } else if (r.is(&.{"--bench"})) {
@@ -239,12 +242,14 @@ const Gen = struct {
         try history.append(g.gpa, cur_tok);
         g.n_gen += 1;
 
-        var draft_buf: [model_mod.max_spec]u32 = undefined;
-        var cand_buf: [model_mod.max_spec + 1]u32 = undefined;
+        const max_spec_draft = model_mod.max_spec - 1;
+        var draft_buf: [max_spec_draft]u32 = undefined;
+        var cand_buf: [model_mod.max_spec]u32 = undefined;
 
         while (g.n_gen < n and g.st.pos < g.st.ctx) {
-            const k = if (g.draft_k > 0 and g.st.pos + g.draft_k + 2 <= g.st.ctx)
-                sampler_mod.PromptLookup.find(history.items, @min(g.draft_k, model_mod.max_spec), &draft_buf)
+            const max_draft = @min(g.draft_k, max_spec_draft);
+            const k = if (max_draft > 0 and g.st.pos + max_draft + 2 <= g.st.ctx)
+                sampler_mod.PromptLookup.find(history.items, max_draft, &draft_buf)
             else
                 0;
 
@@ -295,6 +300,7 @@ const Gen = struct {
                 const kept_in_cache = 1 + accepted_count;
                 g.st.rewind(kept_in_cache, total_cand);
 
+                if (g.n_gen >= n) break;
                 const next_tok = next_cur.?;
                 if (g.tok.isEog(next_tok)) {
                     g.t_gen_ns += timer.lap();
@@ -410,8 +416,8 @@ pub fn main(init: std.process.Init) !void {
         });
         const l0 = &model.layers[0];
         std.debug.print("layers: {d} attention + {d} short-conv | weights: ffn_up={s} ffn_down={s} output={s} layout={s}\n", .{
-            model.n_attn_layers,              model.n_conv_layers, @tagName(l0.w_up.typ), @tagName(l0.w_down.typ), @tagName(model.output.typ),
-            if (l0.w_up.x8) "x8" else "rows",
+            model.n_attn_layers,                                                                    model.n_conv_layers, @tagName(l0.w_up.typ), @tagName(l0.w_down.typ), @tagName(model.output.typ),
+            if (l0.w_up.x8) (if (model.output_coarse != null) "x8 (pruned)" else "x8") else "rows",
         });
         std.debug.print("sampling: temp={d} top_k={d} top_p={d} min_p={d} repeat_penalty={d}\n", .{ sp.temp, sp.top_k, sp.top_p, sp.min_p, sp.repeat_penalty });
     }

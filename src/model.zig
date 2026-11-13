@@ -116,6 +116,8 @@ const Layer = struct {
 pub const LoadOptions = struct {
     /// Interleave weights for the x8 kernels (otherwise plain per-row kernels).
     repack: bool = true,
+    /// Fast two-stage coarse-to-fine output projection on lm_head.
+    prune_vocab: bool = true,
 };
 
 pub const Model = struct {
@@ -134,6 +136,10 @@ pub const Model = struct {
     owned: std.ArrayList([]f32) = .empty,
     /// Anonymous huge-page region holding every matmul weight.
     weights: ?[]align(std.heap.page_size_min) u8 = null,
+    /// Contiguous coarse slice of output weights for two-stage dynamic vocab pruning.
+    output_coarse: ?[]align(64) u8 = null,
+    output_coarse_cols: usize = 0,
+    output_coarse_bytes: usize = 0,
 
     pub fn load(gpa: Allocator, io: std.Io, path: []const u8, pool: *Pool, opts: LoadOptions) !*Model {
         const self = try gpa.create(Model);
@@ -151,7 +157,7 @@ pub const Model = struct {
         try self.readConfig();
         try self.bindTensors(gpa);
         try self.buildRope(gpa);
-        try self.materialize(gpa, pool, opts.repack);
+        try self.materialize(gpa, pool, opts.repack, opts.prune_vocab);
         return self;
     }
 
@@ -162,6 +168,7 @@ pub const Model = struct {
         gpa.free(self.inv_freq);
         gpa.free(self.inv_freq_swa);
         if (self.weights) |w| posix.munmap(w);
+        if (self.output_coarse) |c| gpa.free(c);
         self.file.deinit(gpa);
     }
 
@@ -200,7 +207,7 @@ pub const Model = struct {
     }
 
     /// Move every matmul weight into one huge-page region, repacking when possible.
-    fn materialize(self: *Model, gpa: Allocator, pool: *Pool, use_repack: bool) !void {
+    fn materialize(self: *Model, gpa: Allocator, pool: *Pool, use_repack: bool, prune_vocab: bool) !void {
         const ts = try self.matmulTensors(gpa);
         defer gpa.free(ts);
         var total: usize = 0;
@@ -223,6 +230,31 @@ pub const Model = struct {
             } else {
                 @memcpy(dst[0 .. t.rows * t.row_bytes], t.data[0 .. t.rows * t.row_bytes]);
                 t.data = dst;
+            }
+        }
+        if (prune_vocab and use_repack and self.output.x8) {
+            const t = &self.output;
+            const total_nb = switch (t.typ) {
+                .q4_k, .q5_k, .q6_k => t.cols / 256,
+                .q4_0, .q8_0 => t.cols / 32,
+                else => 0,
+            };
+            if (total_nb >= 4) {
+                const coarse_nb = if (total_nb == 8) 2 else total_nb / 4;
+                const block_bytes = repack.blockBytes(t.typ);
+                const block_size: usize = if (t.typ.layout().?.block == 256) 256 else 32;
+                const coarse_bytes = coarse_nb * block_bytes;
+                const coarse_cols = coarse_nb * block_size;
+                const n_groups = t.rows / 8;
+                const contig = try gpa.alignedAlloc(u8, .@"64", n_groups * coarse_bytes);
+                for (0..n_groups) |g| {
+                    const src = t.data + g * t.row_bytes;
+                    const dst = contig.ptr + g * coarse_bytes;
+                    @memcpy(dst[0..coarse_bytes], src[0..coarse_bytes]);
+                }
+                self.output_coarse = contig;
+                self.output_coarse_cols = coarse_cols;
+                self.output_coarse_bytes = coarse_bytes;
             }
         }
     }
@@ -662,6 +694,68 @@ fn ffnWorker(job: *FfnJob, _: usize, _: usize) void {
     }
 }
 
+const CoarseJob = struct {
+    coarse_data: [*]const u8,
+    coarse_bytes: usize,
+    act_ptr: [*]const u8,
+    coarse_scores: []f32,
+    coarse_cols: usize,
+    typ: GgmlType,
+    chunks: Chunks,
+};
+
+fn coarseWorker(job: *CoarseJob, _: usize, _: usize) void {
+    const acts = [_][*]const u8{job.act_ptr};
+    const typ = job.typ;
+    const cb = job.coarse_bytes;
+    while (job.chunks.grab()) |range| {
+        for (range[0]..range[1]) |g| {
+            const ptr = job.coarse_data + g * cb;
+            const v8 = switch (typ) {
+                .q6_k => repack.gemm(.q6_k, 1, ptr, acts, job.coarse_cols)[0],
+                .q4_k => repack.gemm(.q4_k, 1, ptr, acts, job.coarse_cols)[0],
+                .q8_0 => repack.gemm(.q8_0, 1, ptr, acts, job.coarse_cols)[0],
+                .q4_0 => repack.gemm(.q4_0, 1, ptr, acts, job.coarse_cols)[0],
+                else => unreachable,
+            };
+            var mx: f32 = v8[0];
+            inline for (1..8) |k| if (v8[k] > mx) {
+                mx = v8[k];
+            };
+            job.coarse_scores[g] = mx;
+        }
+    }
+}
+
+const PrunedFineJob = struct {
+    w: *const Tensor,
+    act_ptr: [*]const u8,
+    cands: []const u32,
+    logits: [*]f32,
+    chunks: Chunks,
+};
+
+fn prunedFineWorker(job: *PrunedFineJob, _: usize, _: usize) void {
+    const w = job.w;
+    const typ = w.typ;
+    const acts = [_][*]const u8{job.act_ptr};
+    while (job.chunks.grab()) |range| {
+        for (range[0]..range[1]) |i| {
+            const g = job.cands[i];
+            const group_ptr = w.data + @as(usize, g) * w.row_bytes;
+            const v8 = switch (typ) {
+                .q6_k => repack.gemm(.q6_k, 1, group_ptr, acts, w.cols)[0],
+                .q4_k => repack.gemm(.q4_k, 1, group_ptr, acts, w.cols)[0],
+                .q8_0 => repack.gemm(.q8_0, 1, group_ptr, acts, w.cols)[0],
+                .q4_0 => repack.gemm(.q4_0, 1, group_ptr, acts, w.cols)[0],
+                else => unreachable,
+            };
+            const out: *[8]f32 = job.logits[g * 8 ..][0..8];
+            out.* = v8;
+        }
+    }
+}
+
 const V8f = @Vector(8, f32);
 
 /// Cephes-style expf on 8 lanes (rel. error ~1e-7).
@@ -876,6 +970,8 @@ pub const State = struct {
     conv_hist: []f32,
     conv_state: []f32,
     conv_checkpoint: []f32,
+    coarse_scores: []f32 = &.{},
+    cands: []u32 = &.{},
 
     pub fn init(gpa: Allocator, model: *const Model, pool: *Pool, ctx: usize, bmax: usize) !State {
         const c = &model.cfg;
@@ -885,30 +981,31 @@ pub const State = struct {
         s.model = model;
         s.pool = pool;
         s.ctx = ctx;
-        s.bmax = bmax;
+        const batch_cap = @max(bmax, max_spec + 1);
+        s.bmax = batch_cap;
         s.pos = 0;
         s.ctx_pad = std.mem.alignForward(usize, ctx, kv_tile);
         const hist = if (c.conv_kernel > 0) c.conv_kernel - 1 else 0;
         const has_conv = model.n_conv_layers > 0;
-        s.xn = try Act.init(gpa, c.dim, bmax);
+        s.xn = try Act.init(gpa, c.dim, batch_cap);
         errdefer s.xn.deinit(gpa);
-        s.att = try Act.init(gpa, c.q_dim, bmax);
+        s.att = try Act.init(gpa, c.q_dim, batch_cap);
         errdefer s.att.deinit(gpa);
-        s.hb = try Act.init(gpa, c.ffn_dim, bmax);
+        s.hb = try Act.init(gpa, c.ffn_dim, batch_cap);
         errdefer s.hb.deinit(gpa);
         // Plain f32 buffers: one allocation each, freed together on failure.
         const bufs = .{
-            .{ "x", bmax * c.dim },
-            .{ "q", bmax * c.q_dim },
-            .{ "k", bmax * c.kv_dim },
-            .{ "v", bmax * c.kv_dim },
+            .{ "x", batch_cap * c.dim },
+            .{ "q", batch_cap * c.q_dim },
+            .{ "k", batch_cap * c.kv_dim },
+            .{ "v", batch_cap * c.kv_dim },
             .{ "logits", (max_spec + 1) * c.vocab },
-            .{ "rope_cs", bmax * c.n_rot },
-            .{ "rope_cs_swa", if (model.inv_freq_swa.len > 0) bmax * c.n_rot else 0 },
-            .{ "tmp", bmax * c.dim },
-            .{ "gate", bmax * c.n_heads },
-            .{ "conv_in", if (has_conv) bmax * 3 * c.dim else 0 },
-            .{ "conv_hist", if (has_conv) (hist + bmax) * c.dim else 0 },
+            .{ "rope_cs", batch_cap * c.n_rot },
+            .{ "rope_cs_swa", if (model.inv_freq_swa.len > 0) batch_cap * c.n_rot else 0 },
+            .{ "tmp", batch_cap * c.dim },
+            .{ "gate", batch_cap * c.n_heads },
+            .{ "conv_in", if (has_conv) batch_cap * 3 * c.dim else 0 },
+            .{ "conv_hist", if (has_conv) (hist + batch_cap) * c.dim else 0 },
             .{ "conv_state", model.n_conv_layers * hist * c.dim },
             .{ "conv_checkpoint", if (has_conv) (max_spec + 1) * model.n_conv_layers * hist * c.dim else 0 },
         };
@@ -925,6 +1022,16 @@ pub const State = struct {
         s.k_cache = try gpa.alloc(f16, cache_len);
         errdefer gpa.free(s.k_cache);
         s.v_cache = try gpa.alloc(f16, cache_len);
+        if (model.output_coarse != null) {
+            const n_groups = c.vocab / 8;
+            s.coarse_scores = try gpa.alloc(f32, n_groups);
+            errdefer gpa.free(s.coarse_scores);
+            s.cands = try gpa.alloc(u32, 512 + 64);
+            errdefer gpa.free(s.cands);
+        } else {
+            s.coarse_scores = &.{};
+            s.cands = &.{};
+        }
         return s;
     }
 
@@ -936,8 +1043,9 @@ pub const State = struct {
         inline for (.{ "x", "q", "k", "v", "logits", "rope_cs", "rope_cs_swa", "tmp", "gate", "conv_in", "conv_hist", "conv_state", "conv_checkpoint" }) |name| gpa.free(@field(s, name));
         gpa.free(s.k_cache);
         gpa.free(s.v_cache);
+        if (s.coarse_scores.len > 0) gpa.free(s.coarse_scores);
+        if (s.cands.len > 0) gpa.free(s.cands);
     }
-
     /// Forget the context (KV cache positions and convolution state).
     pub fn reset(s: *State) void {
         s.pos = 0;
@@ -1152,6 +1260,104 @@ pub const State = struct {
             for (s.x[t * c.dim ..][0..c.dim], y) |*a, b| a.* += b;
         }
     }
+    fn outputCoarseToFine(s: *State) void {
+        const m = s.model;
+        const w = &m.output;
+        const typ = w.typ;
+        const n_groups = m.cfg.vocab / 8;
+        const coarse_bytes = m.output_coarse_bytes;
+        const coarse_cols = m.output_coarse_cols;
+        const coarse_data = m.output_coarse.?.ptr;
+
+        const kind = quant.actKind(typ);
+        s.xn.prepare(kind, s.pool);
+        const act_ptr: [*]const u8 = switch (kind) {
+            .q8k => @ptrCast(s.xn.q8k.ptr),
+            .q8b => @ptrCast(s.xn.q8b.ptr),
+            .f32 => @ptrCast(s.xn.f.ptr),
+        };
+
+        // 1. Parallel coarse pass over all groups
+        var c_job: CoarseJob = .{
+            .coarse_data = coarse_data,
+            .coarse_bytes = coarse_bytes,
+            .act_ptr = act_ptr,
+            .coarse_scores = s.coarse_scores,
+            .coarse_cols = coarse_cols,
+            .typ = typ,
+            .chunks = .init(n_groups, 64),
+        };
+        s.pool.run(&c_job, coarseWorker);
+
+        // 2. Select top candidate groups with min-heap
+        const cand_count = 512;
+        const fixed_count = 64;
+        var heap_scores: [cand_count]f32 = undefined;
+        var heap_indices: [cand_count]u32 = undefined;
+        var heap_size: usize = 0;
+
+        for (s.coarse_scores, 0..) |score, i| {
+            if (heap_size < cand_count) {
+                heap_scores[heap_size] = score;
+                heap_indices[heap_size] = @intCast(i);
+                heap_size += 1;
+                var curr = heap_size - 1;
+                while (curr > 0) {
+                    const parent = (curr - 1) / 2;
+                    if (heap_scores[curr] < heap_scores[parent]) {
+                        const tmp_s = heap_scores[curr];
+                        heap_scores[curr] = heap_scores[parent];
+                        heap_scores[parent] = tmp_s;
+                        const tmp_i = heap_indices[curr];
+                        heap_indices[curr] = heap_indices[parent];
+                        heap_indices[parent] = tmp_i;
+                        curr = parent;
+                    } else break;
+                }
+            } else if (score > heap_scores[0]) {
+                heap_scores[0] = score;
+                heap_indices[0] = @intCast(i);
+                var curr: usize = 0;
+                while (true) {
+                    const left = 2 * curr + 1;
+                    const right = 2 * curr + 2;
+                    var smallest = curr;
+                    if (left < cand_count and heap_scores[left] < heap_scores[smallest]) smallest = left;
+                    if (right < cand_count and heap_scores[right] < heap_scores[smallest]) smallest = right;
+                    if (smallest != curr) {
+                        const tmp_s = heap_scores[curr];
+                        heap_scores[curr] = heap_scores[smallest];
+                        heap_scores[smallest] = tmp_s;
+                        const tmp_i = heap_indices[curr];
+                        heap_indices[curr] = heap_indices[smallest];
+                        heap_indices[smallest] = tmp_i;
+                        curr = smallest;
+                    } else break;
+                }
+            }
+        }
+
+        for (0..fixed_count) |i| s.cands[i] = @intCast(i);
+        var actual_cands: usize = fixed_count;
+        for (heap_indices) |g| {
+            if (g >= fixed_count) {
+                s.cands[actual_cands] = g;
+                actual_cands += 1;
+            }
+        }
+
+        @memset(s.logits[0..m.cfg.vocab], -std.math.inf(f32));
+
+        // 3. Parallel fine pass only on candidate groups
+        var f_job: PrunedFineJob = .{
+            .w = w,
+            .act_ptr = act_ptr,
+            .cands = s.cands[0..actual_cands],
+            .logits = s.logits.ptr,
+            .chunks = .init(actual_cands, 32),
+        };
+        s.pool.run(&f_job, prunedFineWorker);
+    }
 
     fn forwardBatch(s: *State, tokens: []const u32, n_logits: usize) void {
         const m = s.model;
@@ -1192,21 +1398,31 @@ pub const State = struct {
             const start = tokens.len - n_logits;
             for (0..n_logits) |t| rmsnorm(s.xn.f[t * c.dim ..][0..c.dim], s.x[(start + t) * c.dim ..][0..c.dim], m.out_norm, c.eps);
             s.xn.reset(n_logits);
-            s.matmul(&.{.{ .w = &m.output, .out = s.logits.ptr, .stride = c.vocab }}, &s.xn);
+            if (n_logits == 1 and m.output_coarse != null) {
+                s.outputCoarseToFine();
+            } else {
+                s.matmul(&.{.{ .w = &m.output, .out = s.logits.ptr, .stride = c.vocab }}, &s.xn);
+            }
         }
     }
 
     /// Append tokens to the context and return logits for the last `n_logits` tokens.
     pub fn forwardN(s: *State, tokens: []const u32, n_logits: usize) ![]f32 {
         if (s.pos + tokens.len > s.ctx) return error.ContextFull;
-        if (n_logits > max_spec + 1) return error.TooManyLogits;
+        if (n_logits > max_spec + 1 or n_logits > tokens.len) return error.TooManyLogits;
+        if (tokens.len <= s.bmax) {
+            s.forwardBatch(tokens, n_logits);
+            return s.logits[0 .. n_logits * s.model.cfg.vocab];
+        }
+        const no_logits_len = tokens.len - n_logits;
         var i: usize = 0;
-        while (i < tokens.len) {
-            const n = @min(s.bmax, tokens.len - i);
-            const is_last = i + n == tokens.len;
-            const batch_logits = if (is_last) n_logits else 0;
-            s.forwardBatch(tokens[i..][0..n], batch_logits);
+        while (i < no_logits_len) {
+            const n = @min(s.bmax, no_logits_len - i);
+            s.forwardBatch(tokens[i..][0..n], 0);
             i += n;
+        }
+        if (n_logits > 0) {
+            s.forwardBatch(tokens[no_logits_len..], n_logits);
         }
         return s.logits[0 .. n_logits * s.model.cfg.vocab];
     }
