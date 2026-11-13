@@ -114,6 +114,66 @@ pub const Sampler = struct {
     }
 };
 
+/// Speculative Prompt Lookup Decoding (n-gram candidate draft).
+/// Searches the context history for matching n-grams and proposes following tokens.
+pub const PromptLookup = struct {
+    pub fn find(history: []const u32, max_k: usize, out: []u32) usize {
+        if (history.len < 4 or max_k == 0) return 0;
+        const k = @min(max_k, out.len);
+
+        // 1. Try 3-gram match first
+        if (history.len >= 6) {
+            const target = history[history.len - 3 ..][0..3];
+            const search_len = history.len - 3;
+            var idx: usize = search_len - 3 + 1;
+            while (idx > 0) {
+                idx -= 1;
+                if (std.mem.eql(u32, history[idx .. idx + 3], target)) {
+                    const start = idx + 3;
+                    const avail = @min(k, search_len - start);
+                    if (avail > 0) {
+                        @memcpy(out[0..avail], history[start .. start + avail]);
+                        return avail;
+                    }
+                }
+            }
+        }
+
+        // 2. Try 2-gram match
+        if (history.len >= 4) {
+            const target = history[history.len - 2 ..][0..2];
+            const search_len = history.len - 2;
+            var idx: usize = search_len - 2 + 1;
+            while (idx > 0) {
+                idx -= 1;
+                if (std.mem.eql(u32, history[idx .. idx + 2], target)) {
+                    const start = idx + 2;
+                    const avail = @min(k, search_len - start);
+                    if (avail > 0) {
+                        @memcpy(out[0..avail], history[start .. start + avail]);
+                        return avail;
+                    }
+                }
+            }
+        }
+
+        return 0;
+    }
+};
+
+test "PromptLookup finds continuation of matching 3-gram and 2-gram" {
+    const hist = [_]u32{ 10, 20, 30, 40, 50, 60, 99, 10, 20, 30 };
+    var draft: [4]u32 = undefined;
+    const n3 = PromptLookup.find(&hist, 3, &draft);
+    try std.testing.expectEqual(3, n3);
+    try std.testing.expectEqualSlices(u32, &.{ 40, 50, 60 }, draft[0..3]);
+
+    const hist2 = [_]u32{ 1, 2, 88, 99, 5, 6, 1, 2 };
+    const n2 = PromptLookup.find(&hist2, 2, &draft);
+    try std.testing.expectEqual(2, n2);
+    try std.testing.expectEqualSlices(u32, &.{ 88, 99 }, draft[0..2]);
+}
+
 pub fn argmax(x: []const f32) u32 {
     var best: usize = 0;
     for (x, 0..) |v, i| if (v > x[best]) {

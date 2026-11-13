@@ -26,6 +26,9 @@ const usage =
     \\  --repeat-penalty F    penalize the last 64 tokens, 1 = off (1.0)
     \\  --seed N              RNG seed (time)
     \\
+    \\speculative decoding:
+    \\  --draft N             n-gram prompt lookup draft tokens, 0 = off (default 0, 3-5 recommended)
+    \\
     \\  --no-repack           keep GGUF row layout (per-row kernels; for A/B comparison)
     \\  --bench PP,TG         benchmark prompt processing of PP tokens and generation of TG tokens
     \\  -v, --verbose         print model info
@@ -51,6 +54,7 @@ const Args = struct {
     n_predict: usize = 256,
     chat: bool = false,
     no_think: bool = false,
+    draft: usize = 0,
     threads: usize = 0,
     ctx: usize = 0,
     batch: usize = 64,
@@ -123,6 +127,8 @@ fn parseArgs(argv: []const [:0]const u8) Args {
             a.sampling.repeat_penalty = r.float();
         } else if (r.is(&.{"--seed"})) {
             a.sampling.seed = r.uint();
+        } else if (r.is(&.{"--draft"})) {
+            a.draft = r.uint();
         } else if (r.is(&.{"--no-repack"})) {
             a.load.repack = false;
         } else if (r.is(&.{"--bench"})) {
@@ -196,13 +202,17 @@ const Timer = struct {
 };
 
 const Gen = struct {
+    gpa: std.mem.Allocator,
     io: std.Io,
     st: *model_mod.State,
     tok: *const Tokenizer,
     smp: *sampler_mod.Sampler,
     out: Out,
+    draft_k: usize = 0,
     n_prompt: usize = 0,
     n_gen: usize = 0,
+    n_drafted: usize = 0,
+    n_accepted: usize = 0,
     t_prompt_ns: u64 = 0,
     t_gen_ns: u64 = 0,
 
@@ -210,25 +220,92 @@ const Gen = struct {
     /// token if one was sampled (it is not yet in the KV cache).
     fn run(g: *Gen, input: []const u32, n: usize) !?u32 {
         var timer: Timer = .start(g.io);
-        var logits = try g.st.forward(input);
+        const logits = try g.st.forward(input);
         g.t_prompt_ns += timer.lap();
         g.n_prompt += input.len;
         for (input) |t| g.smp.accept(t);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const tok = g.smp.sample(logits);
-            if (g.tok.isEog(tok)) {
-                g.t_gen_ns += timer.lap();
-                return tok;
+
+        var history: std.ArrayList(u32) = .empty;
+        defer history.deinit(g.gpa);
+        try history.appendSlice(g.gpa, input);
+
+        var cur_tok = g.smp.sample(logits);
+        if (g.tok.isEog(cur_tok)) {
+            g.t_gen_ns += timer.lap();
+            return cur_tok;
+        }
+        g.out.emit(g.tok.piece(cur_tok));
+        g.smp.accept(cur_tok);
+        try history.append(g.gpa, cur_tok);
+        g.n_gen += 1;
+
+        var draft_buf: [model_mod.max_spec]u32 = undefined;
+        var cand_buf: [model_mod.max_spec + 1]u32 = undefined;
+
+        while (g.n_gen < n and g.st.pos < g.st.ctx) {
+            const k = if (g.draft_k > 0 and g.st.pos + g.draft_k + 2 <= g.st.ctx)
+                sampler_mod.PromptLookup.find(history.items, @min(g.draft_k, model_mod.max_spec), &draft_buf)
+            else
+                0;
+
+            if (k == 0) {
+                const l = try g.st.forward(&.{cur_tok});
+                const next_tok = g.smp.sample(l);
+                if (g.tok.isEog(next_tok)) {
+                    g.t_gen_ns += timer.lap();
+                    return next_tok;
+                }
+                g.out.emit(g.tok.piece(next_tok));
+                g.smp.accept(next_tok);
+                try history.append(g.gpa, next_tok);
+                cur_tok = next_tok;
+                g.n_gen += 1;
+            } else {
+                g.n_drafted += k;
+                cand_buf[0] = cur_tok;
+                @memcpy(cand_buf[1 .. 1 + k], draft_buf[0..k]);
+                const total_cand = 1 + k;
+
+                const all_logits = try g.st.forwardN(cand_buf[0..total_cand], total_cand);
+                const vocab = g.st.model.cfg.vocab;
+
+                var accepted_count: usize = 0;
+                var next_cur: ?u32 = null;
+
+                while (accepted_count < k) : (accepted_count += 1) {
+                    const l = all_logits[accepted_count * vocab ..][0..vocab];
+                    const pred = g.smp.sample(l);
+                    if (pred == draft_buf[accepted_count] and !g.tok.isEog(pred) and g.n_gen < n) {
+                        g.out.emit(g.tok.piece(pred));
+                        g.smp.accept(pred);
+                        try history.append(g.gpa, pred);
+                        g.n_gen += 1;
+                        g.n_accepted += 1;
+                    } else {
+                        next_cur = pred;
+                        break;
+                    }
+                }
+
+                if (next_cur == null) {
+                    const l = all_logits[k * vocab ..][0..vocab];
+                    next_cur = g.smp.sample(l);
+                }
+
+                const kept_in_cache = 1 + accepted_count;
+                g.st.rewind(kept_in_cache, total_cand);
+
+                const next_tok = next_cur.?;
+                if (g.tok.isEog(next_tok)) {
+                    g.t_gen_ns += timer.lap();
+                    return next_tok;
+                }
+                g.out.emit(g.tok.piece(next_tok));
+                g.smp.accept(next_tok);
+                try history.append(g.gpa, next_tok);
+                cur_tok = next_tok;
+                g.n_gen += 1;
             }
-            g.smp.accept(tok);
-            g.out.emit(g.tok.piece(tok));
-            if (g.st.pos >= g.st.ctx) {
-                g.out.emit("\n[context full]\n");
-                break;
-            }
-            logits = try g.st.forward(&.{tok});
-            g.n_gen += 1;
         }
         g.t_gen_ns += timer.lap();
         return null;
@@ -245,10 +322,19 @@ const Gen = struct {
                 return if (ns == 0) 0 else @as(f64, @floatFromInt(n)) * 1e9 / @as(f64, @floatFromInt(ns));
             }
         }.f;
-        std.debug.print("\n\nprompt: {d} tok in {d:.1} ms ({d:.2} tok/s) | gen: {d} tok in {d:.1} ms ({d:.2} tok/s)\n", .{
+        std.debug.print("\n\nprompt: {d} tok in {d:.1} ms ({d:.2} tok/s) | gen: {d} tok in {d:.1} ms ({d:.2} tok/s)", .{
             g.n_prompt, ms(g.t_prompt_ns), rate(g.n_prompt, g.t_prompt_ns),
             g.n_gen,    ms(g.t_gen_ns),    rate(g.n_gen, g.t_gen_ns),
         });
+        if (g.n_drafted > 0) {
+            std.debug.print(" | spec: {d}/{d} accepted ({d:.1}%)\n", .{
+                g.n_accepted,
+                g.n_drafted,
+                @as(f64, @floatFromInt(g.n_accepted)) * 100.0 / @as(f64, @floatFromInt(g.n_drafted)),
+            });
+        } else {
+            std.debug.print("\n", .{});
+        }
     }
 };
 
@@ -332,7 +418,7 @@ pub fn main(init: std.process.Init) !void {
 
     var out_buf: [4096]u8 = undefined;
     var stdout: std.Io.File.Writer = .init(.stdout(), io, &out_buf);
-    var gen: Gen = .{ .io = io, .st = &st, .tok = &tok, .smp = &smp, .out = .{ .w = &stdout.interface } };
+    var gen: Gen = .{ .gpa = gpa, .io = io, .st = &st, .tok = &tok, .smp = &smp, .out = .{ .w = &stdout.interface }, .draft_k = args.draft };
 
     if (args.bench) |b| return bench(gpa, io, &st, b[0], b[1]);
 
@@ -371,6 +457,7 @@ pub fn main(init: std.process.Init) !void {
                     std.debug.print("\n[context full]\n", .{});
                     break;
                 },
+                else => return e,
             };
             gen.out.emit("\n");
         }

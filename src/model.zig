@@ -716,6 +716,7 @@ fn rmsnorm(out: []f32, x: []const f32, w: []const f32, eps: f32) void {
 pub const kv_tile = 16;
 const max_q = 4;
 const max_head_dim = 256;
+pub const max_spec = 8;
 
 const V16f = @Vector(16, f32);
 
@@ -874,6 +875,7 @@ pub const State = struct {
     conv_in: []f32,
     conv_hist: []f32,
     conv_state: []f32,
+    conv_checkpoint: []f32,
 
     pub fn init(gpa: Allocator, model: *const Model, pool: *Pool, ctx: usize, bmax: usize) !State {
         const c = &model.cfg;
@@ -900,7 +902,7 @@ pub const State = struct {
             .{ "q", bmax * c.q_dim },
             .{ "k", bmax * c.kv_dim },
             .{ "v", bmax * c.kv_dim },
-            .{ "logits", c.vocab },
+            .{ "logits", (max_spec + 1) * c.vocab },
             .{ "rope_cs", bmax * c.n_rot },
             .{ "rope_cs_swa", if (model.inv_freq_swa.len > 0) bmax * c.n_rot else 0 },
             .{ "tmp", bmax * c.dim },
@@ -908,6 +910,7 @@ pub const State = struct {
             .{ "conv_in", if (has_conv) bmax * 3 * c.dim else 0 },
             .{ "conv_hist", if (has_conv) (hist + bmax) * c.dim else 0 },
             .{ "conv_state", model.n_conv_layers * hist * c.dim },
+            .{ "conv_checkpoint", if (has_conv) (max_spec + 1) * model.n_conv_layers * hist * c.dim else 0 },
         };
         var done: usize = 0;
         errdefer inline for (bufs, 0..) |b, i| {
@@ -930,7 +933,7 @@ pub const State = struct {
         s.xn.deinit(gpa);
         s.att.deinit(gpa);
         s.hb.deinit(gpa);
-        inline for (.{ "x", "q", "k", "v", "logits", "rope_cs", "rope_cs_swa", "tmp", "gate", "conv_in", "conv_hist", "conv_state" }) |name| gpa.free(@field(s, name));
+        inline for (.{ "x", "q", "k", "v", "logits", "rope_cs", "rope_cs_swa", "tmp", "gate", "conv_in", "conv_hist", "conv_state", "conv_checkpoint" }) |name| gpa.free(@field(s, name));
         gpa.free(s.k_cache);
         gpa.free(s.v_cache);
     }
@@ -939,6 +942,28 @@ pub const State = struct {
     pub fn reset(s: *State) void {
         s.pos = 0;
         @memset(s.conv_state, 0);
+        @memset(s.conv_checkpoint, 0);
+    }
+
+    inline fn convCheckpoint(s: *State, t: usize, slot: usize) []f32 {
+        const hist = s.model.cfg.conv_kernel - 1;
+        const d = s.model.cfg.dim;
+        const layer_sz = hist * d;
+        const step_sz = s.model.n_conv_layers * layer_sz;
+        return s.conv_checkpoint[t * step_sz + slot * layer_sz ..][0..layer_sz];
+    }
+
+    /// Rewind KV cache position and convolution state after speculative rejection.
+    pub fn rewind(s: *State, kept: usize, batch_len: usize) void {
+        std.debug.assert(kept <= batch_len);
+        s.pos -= (batch_len - kept);
+        if (s.model.n_conv_layers > 0 and s.conv_checkpoint.len > 0 and batch_len <= max_spec) {
+            const hist = s.model.cfg.conv_kernel - 1;
+            const d = s.model.cfg.dim;
+            const step_sz = s.model.n_conv_layers * hist * d;
+            const src = s.conv_checkpoint[kept * step_sz ..][0..s.conv_state.len];
+            @memcpy(s.conv_state, src);
+        }
     }
 
     /// Start of one (attention layer, kv head) region in k_cache / v_cache.
@@ -1109,6 +1134,11 @@ pub const State = struct {
             }
         }
         @memcpy(state, s.conv_hist[nt * d ..][0 .. hist * d]);
+        if (s.conv_checkpoint.len > 0 and nt <= max_spec) {
+            for (0..nt + 1) |t| {
+                @memcpy(s.convCheckpoint(t, C.slot), s.conv_hist[t * d ..][0 .. hist * d]);
+            }
+        }
         s.xn.reset(nt);
         s.matmul(&.{.{ .w = &C.out_proj, .out = dst, .stride = d, .accumulate = accumulate }}, &s.xn);
     }
@@ -1123,7 +1153,7 @@ pub const State = struct {
         }
     }
 
-    fn forwardBatch(s: *State, tokens: []const u32, want_logits: bool) void {
+    fn forwardBatch(s: *State, tokens: []const u32, n_logits: usize) void {
         const m = s.model;
         const c = &m.cfg;
         const nt = tokens.len;
@@ -1157,23 +1187,33 @@ pub const State = struct {
         }
         s.pos += nt;
 
-        if (want_logits) {
-            rmsnorm(s.xn.f[0..c.dim], s.x[(nt - 1) * c.dim ..][0..c.dim], m.out_norm, c.eps);
-            s.xn.reset(1);
+        if (n_logits > 0) {
+            std.debug.assert(n_logits <= tokens.len and n_logits <= max_spec + 1);
+            const start = tokens.len - n_logits;
+            for (0..n_logits) |t| rmsnorm(s.xn.f[t * c.dim ..][0..c.dim], s.x[(start + t) * c.dim ..][0..c.dim], m.out_norm, c.eps);
+            s.xn.reset(n_logits);
             s.matmul(&.{.{ .w = &m.output, .out = s.logits.ptr, .stride = c.vocab }}, &s.xn);
         }
     }
 
-    /// Append tokens to the context and return logits of the last one.
-    pub fn forward(s: *State, tokens: []const u32) ![]f32 {
+    /// Append tokens to the context and return logits for the last `n_logits` tokens.
+    pub fn forwardN(s: *State, tokens: []const u32, n_logits: usize) ![]f32 {
         if (s.pos + tokens.len > s.ctx) return error.ContextFull;
+        if (n_logits > max_spec + 1) return error.TooManyLogits;
         var i: usize = 0;
         while (i < tokens.len) {
             const n = @min(s.bmax, tokens.len - i);
-            s.forwardBatch(tokens[i..][0..n], i + n == tokens.len);
+            const is_last = i + n == tokens.len;
+            const batch_logits = if (is_last) n_logits else 0;
+            s.forwardBatch(tokens[i..][0..n], batch_logits);
             i += n;
         }
-        return s.logits;
+        return s.logits[0 .. n_logits * s.model.cfg.vocab];
+    }
+
+    /// Append tokens to the context and return logits of the last one.
+    pub fn forward(s: *State, tokens: []const u32) ![]f32 {
+        return s.forwardN(tokens, 1);
     }
 };
 
