@@ -29,6 +29,8 @@ const usage =
     \\
     \\speculative decoding:
     \\  --draft N             n-gram prompt lookup draft tokens, 0 = off (default 0, 3-5 recommended)
+    \\  --draft-model PATH    small model as draft; --draft sets lookahead (default 3)
+    \\                        (draft must share the target's tokenizer)
     \\
     \\  --server              run OpenAI / llama.cpp-compatible HTTP server
     \\  --port N              server port (default 8080; implies --server)
@@ -63,6 +65,7 @@ const Args = struct {
     server: bool = false,
     port: u16 = 8080,
     draft: usize = 0,
+    draft_model: ?[]const u8 = null,
     threads: usize = 0,
     ctx: usize = 0,
     batch: usize = 64,
@@ -138,6 +141,8 @@ fn parseArgs(argv: []const [:0]const u8) Args {
             a.sampling.seed = r.uint();
         } else if (r.is(&.{"--draft"})) {
             a.draft = r.uint();
+        } else if (r.is(&.{"--draft-model"})) {
+            a.draft_model = r.str();
         } else if (r.is(&.{"--server"})) {
             a.server = true;
         } else if (r.is(&.{"--port"})) {
@@ -230,6 +235,8 @@ const Gen = struct {
     smp: *sampler_mod.Sampler,
     out: Out,
     draft_k: usize = 0,
+    draft_st: ?*model_mod.State = null,
+    draft_smp: ?*sampler_mod.Sampler = null,
     n_prompt: usize = 0,
     n_gen: usize = 0,
     n_drafted: usize = 0,
@@ -242,6 +249,8 @@ const Gen = struct {
     fn run(g: *Gen, input: []const u32, n: usize) !?u32 {
         var timer: Timer = .start(g.io);
         const logits = try g.st.forward(input);
+        // The draft mirrors the target cache; it needs no logits for the input.
+        if (g.draft_st) |dst| _ = try dst.forwardN(input, 0);
         g.t_prompt_ns += timer.lap();
         g.n_prompt += input.len;
         for (input) |t| g.smp.accept(t);
@@ -266,13 +275,37 @@ const Gen = struct {
 
         while (g.n_gen < n and g.st.pos < g.st.ctx) {
             const max_draft = @min(g.draft_k, max_spec_draft);
-            const k = if (max_draft > 0 and g.st.pos + max_draft + 2 <= g.st.ctx)
-                sampler_mod.PromptLookup.find(history.items, max_draft, &draft_buf)
-            else
-                0;
+            const d = g.draft_st;
+            // Invariant at round start: the draft cache ends just before
+            // cur_tok, mirroring the target cache.
+            const k = blk: {
+                if (d) |dst| {
+                    if (max_draft == 0 or g.st.pos + max_draft + 1 > g.st.ctx or dst.pos + max_draft + 1 > dst.ctx)
+                        break :blk 0;
+                    // Autoregressive draft: feed cur_tok, then each sampled
+                    // token. Stop early on EOG (the target rejects it anyway).
+                    var l = try dst.forward(&.{cur_tok});
+                    var produced: usize = 0;
+                    while (produced < max_draft) : (produced += 1) {
+                        const t = g.draft_smp.?.sample(l);
+                        if (g.tok.isEog(t)) break;
+                        draft_buf[produced] = t;
+                        if (produced + 1 < max_draft) l = try dst.forward(&.{t});
+                    }
+                    break :blk produced;
+                }
+                if (max_draft > 0 and g.st.pos + max_draft + 2 <= g.st.ctx)
+                    break :blk sampler_mod.PromptLookup.find(history.items, max_draft, &draft_buf);
+                break :blk 0;
+            };
 
             if (k == 0) {
                 const l = try g.st.forward(&.{cur_tok});
+                // Keep the draft level with the target unless its round above
+                // already consumed cur_tok (first draft sample was EOG).
+                if (d) |dst| {
+                    if (dst.pos < g.st.pos) _ = try dst.forwardN(&.{cur_tok}, 0);
+                }
                 const next_tok = g.smp.sample(l);
                 if (g.tok.isEog(next_tok)) {
                     g.t_gen_ns += timer.lap();
@@ -317,6 +350,15 @@ const Gen = struct {
 
                 const kept_in_cache = 1 + accepted_count;
                 g.st.rewind(kept_in_cache, total_cand);
+                // The draft cache holds cur_tok plus every drafted token it was
+                // fed: all but the last one, or all of them when it stopped at
+                // EOG. Accepted tokens equal drafted ones, so keep the target's
+                // prefix, feeding the single missing token if all were accepted.
+                if (d) |dst| {
+                    if (dst.pos < g.st.pos) {
+                        _ = try dst.forwardN(draft_buf[k - 1 .. k], 0);
+                    } else dst.pos = g.st.pos;
+                }
 
                 if (g.n_gen >= n) break;
                 const next_tok = next_cur.?;
@@ -404,7 +446,7 @@ pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.smp_allocator;
     const io = init.io;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    const args = parseArgs(argv);
+    var args = parseArgs(argv);
 
     const nth = if (args.threads > 0) args.threads else pool_mod.defaultThreads(io);
     const pool = try pool_mod.Pool.create(gpa, io, nth);
@@ -426,6 +468,29 @@ pub fn main(init: std.process.Init) !void {
     var smp = try sampler_mod.Sampler.init(gpa, c.vocab, sp);
     defer smp.deinit(gpa);
 
+    // Draft model for speculative decoding: same tokenizer, own state/sampler.
+    // The model must outlive its State, so it lives at main scope.
+    var draft_m: ?*model_mod.Model = null;
+    defer if (draft_m) |m| m.destroy(gpa);
+    var draft_st: ?model_mod.State = null;
+    defer if (draft_st) |*d| d.deinit();
+    var draft_smp: ?sampler_mod.Sampler = null;
+    defer if (draft_smp) |*d| d.deinit(gpa);
+    if (args.draft_model) |dpath| {
+        if (args.server) fail("--draft-model is not supported with --server yet", .{});
+        if (args.draft == 0) args.draft = 3;
+        const dm = model_mod.Model.load(gpa, io, dpath, pool, args.load) catch |e| fail("failed to load draft model: {s}", .{@errorName(e)});
+        draft_m = dm;
+        if (dm.cfg.vocab != c.vocab) fail("draft model vocab {d} != target vocab {d} (tokenizers must match)", .{ dm.cfg.vocab, c.vocab });
+        if (dm.cfg.ctx_train < ctx) fail("draft model ctx_train {d} < target ctx {d}", .{ dm.cfg.ctx_train, ctx });
+        // Draft tokens are fed one at a time; short-conv state can only be
+        // rewound within one batch, so conv drafts are not supported.
+        if (dm.n_conv_layers > 0) fail("draft model must not have short-conv layers", .{});
+        draft_st = model_mod.State.init(gpa, dm, pool, ctx, @min(args.batch, ctx), args.cache_q8) catch |e| fail("failed to init draft state: {s}", .{@errorName(e)});
+        draft_smp = try sampler_mod.Sampler.init(gpa, dm.cfg.vocab, sp);
+        if (args.verbose) std.debug.print("draft: {s} (arch={s} layers={d} dim={d} vocab={d})\n", .{ std.fs.path.stem(dpath), @tagName(dm.cfg.arch), dm.cfg.n_layers, dm.cfg.dim, dm.cfg.vocab });
+    }
+
     if (args.verbose or args.bench != null) {
         const kv_mb = @as(f64, @floatFromInt(st.k_cache.len + st.v_cache.len)) / (1 << 20);
         std.debug.print("arch={s} layers={d} dim={d} heads={d}/{d} head_dim={d} ffn={d} vocab={d} ctx={d} (KV {d:.1} MB {s}) threads={d} ({d:.0} ms load)\n", .{
@@ -443,7 +508,17 @@ pub fn main(init: std.process.Init) !void {
 
     var out_buf: [4096]u8 = undefined;
     var stdout: std.Io.File.Writer = .init(.stdout(), io, &out_buf);
-    var gen: Gen = .{ .gpa = gpa, .io = io, .st = &st, .tok = &tok, .smp = &smp, .out = .{ .w = &stdout.interface }, .draft_k = args.draft };
+    var gen: Gen = .{
+        .gpa = gpa,
+        .io = io,
+        .st = &st,
+        .tok = &tok,
+        .smp = &smp,
+        .out = .{ .w = &stdout.interface },
+        .draft_k = args.draft,
+        .draft_st = if (draft_st) |*d| d else null,
+        .draft_smp = if (draft_smp) |*d| d else null,
+    };
 
     if (args.bench) |b| return bench(gpa, io, &st, b[0], b[1]);
     if (args.server) {
