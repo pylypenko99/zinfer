@@ -9,9 +9,17 @@ const builtin = @import("builtin");
 const GgmlType = @import("gguf.zig").GgmlType;
 
 pub const has_avx2 = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
+pub const has_vnni = has_avx2 and std.Target.x86.featureSetHas(builtin.cpu.features, .avxvnni);
 
 extern fn @"llvm.x86.avx2.pmadd.ub.sw"(@Vector(32, u8), @Vector(32, i8)) @Vector(16, i16);
 extern fn @"llvm.x86.avx2.pmadd.wd"(@Vector(16, i16), @Vector(16, i16)) @Vector(8, i32);
+extern fn @"llvm.x86.avx512.vpdpbusd.256"(V8i32, V32i8, V32i8) V8i32;
+
+/// VNNI dot-product step: acc += unsigned bytes of `u` x signed bytes of `s`,
+/// four bytes per i32 lane (vpdpbusd). Bit-exact versus maddubs+maddwd(ones16).
+inline fn dpbusd(acc: V8i32, u: V32u8, s: V32i8) V8i32 {
+    return @"llvm.x86.avx512.vpdpbusd.256"(acc, @bitCast(u), s);
+}
 
 pub const BlockQ4_0 = extern struct { d: f16, qs: [16]u8 };
 pub const BlockQ8_0 = extern struct { d: f16, qs: [32]i8 };
@@ -56,6 +64,7 @@ pub fn isSupported(t: GgmlType) bool {
 pub const V32u8 = @Vector(32, u8);
 pub const V32i8 = @Vector(32, i8);
 pub const V16i16 = @Vector(16, i16);
+pub const V8i16 = @Vector(8, i16);
 pub const V8i32 = @Vector(8, i32);
 pub const V8f = @Vector(8, f32);
 pub const V16f = @Vector(16, f32);
@@ -199,6 +208,18 @@ const Unpacked = struct {
 
     /// Integer dot of the unpacked block with one activation block.
     inline fn dot(u: *const Unpacked, y: *const Q8K) V8i32 {
+        if (has_vnni) {
+            // vpdpbusd covers bytes 4i..4i+3 per lane; u.s[j] holds the chunk
+            // scale in lanes 0..7 (K45 splat) or 0/8 (Q6_K pair), so lanes
+            // 0..3 and 4..7 both pick the right scale.
+            var a: V8i32 = @splat(0);
+            inline for (0..8) |j| {
+                const sv: V8i16 = @shuffle(i16, u.s[j], undefined, [8]i32{ 0, 0, 0, 0, 8, 8, 8, 8 });
+                const s: V8i32 = @intCast(sv);
+                a += dpbusd(@splat(0), u.q[j], y.qs[j * 32 ..][0..32].*) * s;
+            }
+            return a;
+        }
         var a: V8i32 = maddwd(maddubs(u.q[0], y.qs[0..32].*), u.s[0]);
         inline for (1..8) |j| a += maddwd(maddubs(u.q[j], y.qs[j * 32 ..][0..32].*), u.s[j]);
         return a;
@@ -313,7 +334,11 @@ fn dotQ4_0(comptime NT: usize, row: [*]const u8, acts: [NT][*]const Q8B, nb: usi
         const d = f16f(x.d);
         inline for (0..NT) |t| {
             const y = &acts[t][i];
-            accf[t] += @as(V8f, @splat(d * y.d)) * toF(maddwd(maddubs(q, y.qs), ones16));
+            if (has_vnni) {
+                accf[t] += @as(V8f, @splat(d * y.d)) * toF(dpbusd(@splat(0), q, y.qs));
+            } else {
+                accf[t] += @as(V8f, @splat(d * y.d)) * toF(maddwd(maddubs(q, y.qs), ones16));
+            }
             off[t] += d * y.s;
         }
     }
@@ -335,7 +360,11 @@ fn dotQ8_0(comptime NT: usize, row: [*]const u8, acts: [NT][*]const Q8B, nb: usi
             const y = &acts[t][i];
             const yq: V32i8 = y.qs;
             const sy = @select(i8, neg, @as(V32i8, @splat(0)) -% yq, yq);
-            accf[t] += @as(V8f, @splat(d * y.d)) * toF(maddwd(maddubs(ax, sy), ones16));
+            if (has_vnni) {
+                accf[t] += @as(V8f, @splat(d * y.d)) * toF(dpbusd(@splat(0), ax, sy));
+            } else {
+                accf[t] += @as(V8f, @splat(d * y.d)) * toF(maddwd(maddubs(ax, sy), ones16));
+            }
         }
     }
     var r: [NT]f32 = undefined;
