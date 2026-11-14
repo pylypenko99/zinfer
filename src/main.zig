@@ -5,6 +5,8 @@ const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const sampler_mod = @import("sampler.zig");
 const pool_mod = @import("pool.zig");
 const server_mod = @import("server.zig");
+const gen_mod = @import("gen.zig");
+const Timer = gen_mod.Timer;
 
 const usage =
     \\usage: zinfer -m MODEL.gguf [options]
@@ -198,209 +200,12 @@ fn samplingParams(cli: SamplingArgs, f: *const gguf.File, default_seed: u64) sam
     };
 }
 
+/// Best-effort stdout sink for Gen.run: a closed stdout must not abort generation.
 const Out = struct {
     w: *std.Io.Writer,
-    fn emit(o: Out, bytes: []const u8) void {
+    pub fn emit(o: Out, bytes: []const u8) !void {
         o.w.writeAll(bytes) catch {};
         o.w.flush() catch {};
-    }
-};
-
-/// Monotonic stopwatch on the Io awake clock.
-const Timer = struct {
-    io: std.Io,
-    last: std.Io.Timestamp,
-
-    fn start(io: std.Io) Timer {
-        return .{ .io = io, .last = std.Io.Clock.awake.now(io) };
-    }
-
-    fn read(t: *const Timer) u64 {
-        return @intCast(t.last.durationTo(std.Io.Clock.awake.now(t.io)).nanoseconds);
-    }
-
-    fn lap(t: *Timer) u64 {
-        const now = std.Io.Clock.awake.now(t.io);
-        const ns: u64 = @intCast(t.last.durationTo(now).nanoseconds);
-        t.last = now;
-        return ns;
-    }
-};
-
-const Gen = struct {
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    st: *model_mod.State,
-    tok: *const Tokenizer,
-    smp: *sampler_mod.Sampler,
-    out: Out,
-    draft_k: usize = 0,
-    draft_st: ?*model_mod.State = null,
-    draft_smp: ?*sampler_mod.Sampler = null,
-    n_prompt: usize = 0,
-    n_gen: usize = 0,
-    n_drafted: usize = 0,
-    n_accepted: usize = 0,
-    t_prompt_ns: u64 = 0,
-    t_gen_ns: u64 = 0,
-
-    /// Feed `input`, then sample up to `n` tokens. Returns the end-of-generation
-    /// token if one was sampled (it is not yet in the KV cache).
-    fn run(g: *Gen, input: []const u32, n: usize) !?u32 {
-        var timer: Timer = .start(g.io);
-        const logits = try g.st.forward(input);
-        // The draft mirrors the target cache; it needs no logits for the input.
-        if (g.draft_st) |dst| _ = try dst.forwardN(input, 0);
-        g.t_prompt_ns += timer.lap();
-        g.n_prompt += input.len;
-        for (input) |t| g.smp.accept(t);
-
-        var history: std.ArrayList(u32) = .empty;
-        defer history.deinit(g.gpa);
-        try history.appendSlice(g.gpa, input);
-
-        var cur_tok = g.smp.sample(logits);
-        if (g.tok.isEog(cur_tok)) {
-            g.t_gen_ns += timer.lap();
-            return cur_tok;
-        }
-        g.out.emit(g.tok.piece(cur_tok));
-        g.smp.accept(cur_tok);
-        try history.append(g.gpa, cur_tok);
-        g.n_gen += 1;
-
-        const max_spec_draft = model_mod.max_spec - 1;
-        var draft_buf: [max_spec_draft]u32 = undefined;
-        var cand_buf: [model_mod.max_spec]u32 = undefined;
-
-        while (g.n_gen < n and g.st.pos < g.st.ctx) {
-            const max_draft = @min(g.draft_k, max_spec_draft);
-            const d = g.draft_st;
-            // Invariant at round start: the draft cache ends just before
-            // cur_tok, mirroring the target cache.
-            const k = blk: {
-                if (d) |dst| {
-                    if (max_draft == 0 or g.st.pos + max_draft + 1 > g.st.ctx or dst.pos + max_draft + 1 > dst.ctx)
-                        break :blk 0;
-                    // Autoregressive draft: feed cur_tok, then each sampled
-                    // token. Stop early on EOG (the target rejects it anyway).
-                    var l = try dst.forward(&.{cur_tok});
-                    var produced: usize = 0;
-                    while (produced < max_draft) : (produced += 1) {
-                        const t = g.draft_smp.?.sample(l);
-                        if (g.tok.isEog(t)) break;
-                        draft_buf[produced] = t;
-                        if (produced + 1 < max_draft) l = try dst.forward(&.{t});
-                    }
-                    break :blk produced;
-                }
-                if (max_draft > 0 and g.st.pos + max_draft + 2 <= g.st.ctx)
-                    break :blk sampler_mod.PromptLookup.find(history.items, max_draft, &draft_buf);
-                break :blk 0;
-            };
-
-            if (k == 0) {
-                const l = try g.st.forward(&.{cur_tok});
-                // Keep the draft level with the target unless its round above
-                // already consumed cur_tok (first draft sample was EOG).
-                if (d) |dst| {
-                    if (dst.pos < g.st.pos) _ = try dst.forwardN(&.{cur_tok}, 0);
-                }
-                const next_tok = g.smp.sample(l);
-                if (g.tok.isEog(next_tok)) {
-                    g.t_gen_ns += timer.lap();
-                    return next_tok;
-                }
-                g.out.emit(g.tok.piece(next_tok));
-                g.smp.accept(next_tok);
-                try history.append(g.gpa, next_tok);
-                cur_tok = next_tok;
-                g.n_gen += 1;
-            } else {
-                g.n_drafted += k;
-                cand_buf[0] = cur_tok;
-                @memcpy(cand_buf[1 .. 1 + k], draft_buf[0..k]);
-                const total_cand = 1 + k;
-
-                const all_logits = try g.st.forwardN(cand_buf[0..total_cand], total_cand);
-                const vocab = g.st.model.cfg.vocab;
-
-                var accepted_count: usize = 0;
-                var next_cur: ?u32 = null;
-
-                while (accepted_count < k) : (accepted_count += 1) {
-                    const l = all_logits[accepted_count * vocab ..][0..vocab];
-                    const pred = g.smp.sample(l);
-                    if (pred == draft_buf[accepted_count] and !g.tok.isEog(pred) and g.n_gen < n) {
-                        g.out.emit(g.tok.piece(pred));
-                        g.smp.accept(pred);
-                        try history.append(g.gpa, pred);
-                        g.n_gen += 1;
-                        g.n_accepted += 1;
-                    } else {
-                        next_cur = pred;
-                        break;
-                    }
-                }
-
-                if (next_cur == null) {
-                    const l = all_logits[k * vocab ..][0..vocab];
-                    next_cur = g.smp.sample(l);
-                }
-
-                const kept_in_cache = 1 + accepted_count;
-                g.st.rewind(kept_in_cache, total_cand);
-                // The draft cache holds cur_tok plus every drafted token it was
-                // fed: all but the last one, or all of them when it stopped at
-                // EOG. Accepted tokens equal drafted ones, so keep the target's
-                // prefix, feeding the single missing token if all were accepted.
-                if (d) |dst| {
-                    if (dst.pos < g.st.pos) {
-                        _ = try dst.forwardN(draft_buf[k - 1 .. k], 0);
-                    } else dst.pos = g.st.pos;
-                }
-
-                if (g.n_gen >= n) break;
-                const next_tok = next_cur.?;
-                if (g.tok.isEog(next_tok)) {
-                    g.t_gen_ns += timer.lap();
-                    return next_tok;
-                }
-                g.out.emit(g.tok.piece(next_tok));
-                g.smp.accept(next_tok);
-                try history.append(g.gpa, next_tok);
-                cur_tok = next_tok;
-                g.n_gen += 1;
-            }
-        }
-        g.t_gen_ns += timer.lap();
-        return null;
-    }
-
-    fn report(g: *const Gen) void {
-        const ms = struct {
-            fn f(ns: u64) f64 {
-                return @as(f64, @floatFromInt(ns)) / 1e6;
-            }
-        }.f;
-        const rate = struct {
-            fn f(n: usize, ns: u64) f64 {
-                return if (ns == 0) 0 else @as(f64, @floatFromInt(n)) * 1e9 / @as(f64, @floatFromInt(ns));
-            }
-        }.f;
-        std.debug.print("\n\nprompt: {d} tok in {d:.1} ms ({d:.2} tok/s) | gen: {d} tok in {d:.1} ms ({d:.2} tok/s)", .{
-            g.n_prompt, ms(g.t_prompt_ns), rate(g.n_prompt, g.t_prompt_ns),
-            g.n_gen,    ms(g.t_gen_ns),    rate(g.n_gen, g.t_gen_ns),
-        });
-        if (g.n_drafted > 0) {
-            std.debug.print(" | spec: {d}/{d} accepted ({d:.1}%)\n", .{
-                g.n_accepted,
-                g.n_drafted,
-                @as(f64, @floatFromInt(g.n_accepted)) * 100.0 / @as(f64, @floatFromInt(g.n_drafted)),
-            });
-        } else {
-            std.debug.print("\n", .{});
-        }
     }
 };
 
@@ -477,7 +282,6 @@ pub fn main(init: std.process.Init) !void {
     var draft_smp: ?sampler_mod.Sampler = null;
     defer if (draft_smp) |*d| d.deinit(gpa);
     if (args.draft_model) |dpath| {
-        if (args.server) fail("--draft-model is not supported with --server yet", .{});
         if (args.draft == 0) args.draft = 3;
         const dm = model_mod.Model.load(gpa, io, dpath, pool, args.load) catch |e| fail("failed to load draft model: {s}", .{@errorName(e)});
         draft_m = dm;
@@ -508,13 +312,13 @@ pub fn main(init: std.process.Init) !void {
 
     var out_buf: [4096]u8 = undefined;
     var stdout: std.Io.File.Writer = .init(.stdout(), io, &out_buf);
-    var gen: Gen = .{
+    const out: Out = .{ .w = &stdout.interface };
+    var gen: gen_mod.Gen = .{
         .gpa = gpa,
         .io = io,
         .st = &st,
         .tok = &tok,
         .smp = &smp,
-        .out = .{ .w = &stdout.interface },
         .draft_k = args.draft,
         .draft_st = if (draft_st) |*d| d else null,
         .draft_smp = if (draft_smp) |*d| d else null,
@@ -523,10 +327,9 @@ pub fn main(init: std.process.Init) !void {
     if (args.bench) |b| return bench(gpa, io, &st, b[0], b[1]);
     if (args.server) {
         const model_name = std.fs.path.stem(args.model.?);
-        return server_mod.run(gpa, io, &st, &tok, &smp, .{
+        return server_mod.run(gpa, io, &gen, .{
             .port = args.port,
             .model_id = model_name,
-            .draft_k = args.draft,
             .no_think = args.no_think,
         });
     }
@@ -561,15 +364,16 @@ pub fn main(init: std.process.Init) !void {
             try appendAssistantHeader(gpa, &text, tpl, has_think, args.no_think);
             try tok.encode(gpa, text.items, first, true, &tokens);
             first = false;
-            pending = gen.run(tokens.items, args.n_predict) catch |e| switch (e) {
+            pending = gen.run(tokens.items, args.n_predict, out) catch |e| switch (e) {
                 error.ContextFull => {
                     std.debug.print("\n[context full]\n", .{});
                     break;
                 },
                 else => return e,
             };
-            gen.out.emit("\n");
+            try out.emit("\n");
         }
+        std.debug.print("\n\n", .{});
         gen.report();
         return;
     }
@@ -582,8 +386,9 @@ pub fn main(init: std.process.Init) !void {
     try tok.encode(gpa, prompt, true, true, &tokens);
     if (args.verbose) std.debug.print("prompt tokens: {any}\n", .{tokens.items});
     if (tokens.items.len == 0) fail("empty prompt", .{});
-    gen.out.emit(prompt);
-    _ = try gen.run(tokens.items, args.n_predict);
+    try out.emit(prompt);
+    _ = try gen.run(tokens.items, args.n_predict, out);
+    std.debug.print("\n\n", .{});
     gen.report();
 }
 

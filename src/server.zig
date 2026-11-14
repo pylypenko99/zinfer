@@ -1,30 +1,26 @@
 const std = @import("std");
 const Io = std.Io;
-const model_mod = @import("model.zig");
+const gen_mod = @import("gen.zig");
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
-const sampler_mod = @import("sampler.zig");
 
 pub const ServerConfig = struct {
     port: u16 = 8080,
     model_id: []const u8,
-    draft_k: usize = 0,
     no_think: bool = false,
 };
 
-pub fn run(
-    gpa: std.mem.Allocator,
-    io: Io,
-    st: *model_mod.State,
-    tok: *const Tokenizer,
-    smp: *sampler_mod.Sampler,
-    cfg: ServerConfig,
-) !void {
+pub fn run(gpa: std.mem.Allocator, io: Io, g: *gen_mod.Gen, cfg: ServerConfig) !void {
     const addr = try Io.net.IpAddress.parseIp4("127.0.0.1", cfg.port);
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
     std.debug.print("zinfer server listening on http://127.0.0.1:{d}\n", .{cfg.port});
-    std.debug.print("Model ID: {s} (ctx={d})\n", .{ cfg.model_id, st.ctx });
+    std.debug.print("Model ID: {s} (ctx={d})\n", .{ cfg.model_id, g.st.ctx });
+    if (g.draft_st != null) {
+        std.debug.print("speculative decoding: draft model, {d} tokens per round\n", .{g.draft_k});
+    } else if (g.draft_k > 0) {
+        std.debug.print("speculative decoding: n-gram lookup, up to {d} tokens\n", .{g.draft_k});
+    }
 
     while (true) {
         var stream = server.accept(io) catch |err| {
@@ -33,7 +29,7 @@ pub fn run(
         };
         defer stream.close(io);
 
-        handleConnection(gpa, io, &stream, st, tok, smp, cfg) catch |err| {
+        handleConnection(gpa, io, &stream, g, cfg) catch |err| {
             if (err != error.EndOfStream and err != error.ConnectionAborted and err != error.WriteFailed) {
                 std.debug.print("connection error: {s}\n", .{@errorName(err)});
             }
@@ -45,9 +41,7 @@ fn handleConnection(
     gpa: std.mem.Allocator,
     io: Io,
     stream: *Io.net.Stream,
-    st: *model_mod.State,
-    tok: *const Tokenizer,
-    smp: *sampler_mod.Sampler,
+    g: *gen_mod.Gen,
     cfg: ServerConfig,
 ) !void {
     // Read request: read until headers end, parse Content-Length, read full body
@@ -119,7 +113,7 @@ fn handleConnection(
             \\{{"object":"list","data":[{{"id":"{s}","object":"model","created":1700000000,"owned_by":"zinfer","meta":{{"n_ctx":{d},"n_ctx_train":{d}}}}}]}}
         ;
         var body_buf: [1024]u8 = undefined;
-        const body = try std.fmt.bufPrint(&body_buf, json_fmt, .{ cfg.model_id, st.ctx, st.model.cfg.ctx_train });
+        const body = try std.fmt.bufPrint(&body_buf, json_fmt, .{ cfg.model_id, g.st.ctx, g.st.model.cfg.ctx_train });
 
         try writer.interface.print(
             "HTTP/1.1 200 OK\r\n" ++
@@ -139,7 +133,7 @@ fn handleConnection(
             \\{{"default_generation_settings":{{"n_ctx":{d},"params":{{"n_predict":-1}}}},"total_slots":1}}
         ;
         var body_buf: [512]u8 = undefined;
-        const body = try std.fmt.bufPrint(&body_buf, json_fmt, .{st.ctx});
+        const body = try std.fmt.bufPrint(&body_buf, json_fmt, .{g.st.ctx});
 
         try writer.interface.print(
             "HTTP/1.1 200 OK\r\n" ++
@@ -163,7 +157,7 @@ fn handleConnection(
         const body = req[bs..];
         const is_responses_api = std.mem.indexOf(u8, path, "responses") != null;
 
-        try handleChatCompletion(gpa, &writer.interface, body, st, tok, smp, cfg, is_responses_api);
+        try handleChatCompletion(gpa, &writer.interface, body, g, cfg, is_responses_api);
         return;
     }
 
@@ -219,6 +213,33 @@ fn writeJsonEscaped(w: *Io.Writer, str: []const u8) !void {
     }
 }
 
+/// Gen.run sink streaming each token as one SSE delta event.
+const SseSink = struct {
+    w: *Io.Writer,
+    /// Responses API events instead of chat.completion chunks.
+    responses: bool,
+
+    pub fn emit(s: SseSink, bytes: []const u8) !void {
+        try s.w.writeAll(if (s.responses)
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\""
+        else
+            "data: {\"id\":\"chatcmpl-zinfer\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"");
+        try writeJsonEscaped(s.w, bytes);
+        try s.w.writeAll(if (s.responses) "\"}\n\n" else "\"},\"finish_reason\":null}]}\n\n");
+        try s.w.flush();
+    }
+};
+
+/// Gen.run sink collecting the whole completion for a non-streaming reply.
+const BufSink = struct {
+    gpa: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+
+    pub fn emit(s: BufSink, bytes: []const u8) !void {
+        try s.buf.appendSlice(s.gpa, bytes);
+    }
+};
+
 fn extractTextContent(gpa: std.mem.Allocator, content_val: std.json.Value, out: *std.ArrayList(u8)) !void {
     switch (content_val) {
         .string => |s| try out.appendSlice(gpa, s),
@@ -239,12 +260,11 @@ fn handleChatCompletion(
     gpa: std.mem.Allocator,
     w: *Io.Writer,
     body: []const u8,
-    st: *model_mod.State,
-    tok: *const Tokenizer,
-    smp: *sampler_mod.Sampler,
+    g: *gen_mod.Gen,
     cfg: ServerConfig,
     is_responses_api: bool,
 ) !void {
+    const tok = g.tok;
     var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch |err| {
         std.debug.print("JSON parse error: {s}\n", .{@errorName(err)});
         try w.writeAll("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
@@ -301,13 +321,11 @@ fn handleChatCompletion(
 
     if (tokens.items.len == 0) return;
 
-    st.reset();
-
-    const prefill_logits = try st.forward(tokens.items);
-    var cur_tok = smp.sample(prefill_logits);
+    // Every request starts from an empty context.
+    g.reset();
+    g.stats = .{};
 
     if (stream_mode) {
-        // SSE Header
         try w.writeAll(
             "HTTP/1.1 200 OK\r\n" ++
                 "Content-Type: text/event-stream; charset=utf-8\r\n" ++
@@ -315,73 +333,27 @@ fn handleChatCompletion(
                 "Connection: close\r\n" ++
                 "Access-Control-Allow-Origin: *\r\n\r\n",
         );
-        try w.flush();
-
         if (is_responses_api) {
-            // Responses API streaming events
             try w.writeAll("data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n");
             try w.writeAll("data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
-            try w.flush();
-
-            var n_gen: usize = 0;
-            while (n_gen < max_tokens and st.pos < st.ctx) {
-                if (tok.isEog(cur_tok)) break;
-
-                const piece = tok.piece(cur_tok);
-                try w.writeAll("data: {\"type\":\"response.output_text.delta\",\"delta\":\"");
-                try writeJsonEscaped(w, piece);
-                try w.writeAll("\"}\n\n");
-                try w.flush();
-
-                smp.accept(cur_tok);
-                n_gen += 1;
-
-                const logits = try st.forward(&.{cur_tok});
-                cur_tok = smp.sample(logits);
-            }
-
-            try w.writeAll("data: {\"type\":\"response.completed\"}\n\n");
-            try w.writeAll("data: [DONE]\n\n");
-            try w.flush();
         } else {
-            // Chat completions API streaming chunks
             try w.writeAll("data: {\"id\":\"chatcmpl-zinfer\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n");
-            try w.flush();
-
-            var n_gen: usize = 0;
-            while (n_gen < max_tokens and st.pos < st.ctx) {
-                if (tok.isEog(cur_tok)) break;
-
-                const piece = tok.piece(cur_tok);
-                try w.writeAll("data: {\"id\":\"chatcmpl-zinfer\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"");
-                try writeJsonEscaped(w, piece);
-                try w.writeAll("\"},\"finish_reason\":null}]}\n\n");
-                try w.flush();
-
-                smp.accept(cur_tok);
-                n_gen += 1;
-
-                const logits = try st.forward(&.{cur_tok});
-                cur_tok = smp.sample(logits);
-            }
-
-            try w.writeAll("data: {\"id\":\"chatcmpl-zinfer\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
-            try w.writeAll("data: [DONE]\n\n");
-            try w.flush();
         }
+        try w.flush();
+
+        _ = try g.run(tokens.items, max_tokens, SseSink{ .w = w, .responses = is_responses_api });
+
+        if (is_responses_api) {
+            try w.writeAll("data: {\"type\":\"response.completed\"}\n\n");
+        } else {
+            try w.writeAll("data: {\"id\":\"chatcmpl-zinfer\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+        }
+        try w.writeAll("data: [DONE]\n\n");
+        try w.flush();
     } else {
         var resp_text: std.ArrayList(u8) = .empty;
         defer resp_text.deinit(gpa);
-
-        var n_gen: usize = 0;
-        while (n_gen < max_tokens and st.pos < st.ctx) {
-            if (tok.isEog(cur_tok)) break;
-            try resp_text.appendSlice(gpa, tok.piece(cur_tok));
-            smp.accept(cur_tok);
-            n_gen += 1;
-            const logits = try st.forward(&.{cur_tok});
-            cur_tok = smp.sample(logits);
-        }
+        _ = try g.run(tokens.items, max_tokens, BufSink{ .gpa = gpa, .buf = &resp_text });
 
         try w.print(
             "HTTP/1.1 200 OK\r\n" ++
@@ -394,8 +366,9 @@ fn handleChatCompletion(
         try writeJsonEscaped(w, resp_text.items);
         try w.print(
             "\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
-            .{ tokens.items.len, n_gen, tokens.items.len + n_gen },
+            .{ tokens.items.len, g.stats.n_gen, tokens.items.len + g.stats.n_gen },
         );
         try w.flush();
     }
+    g.report();
 }
