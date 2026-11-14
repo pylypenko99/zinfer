@@ -10,6 +10,8 @@ const GgmlType = @import("gguf.zig").GgmlType;
 
 pub const has_avx2 = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
 pub const has_vnni = has_avx2 and std.Target.x86.featureSetHas(builtin.cpu.features, .avxvnni);
+/// 32 vector registers (EVEX ymm16-31): room for wider token groups.
+pub const has_avx512vl = has_avx2 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vl);
 
 extern fn @"llvm.x86.avx2.pmadd.ub.sw"(@Vector(32, u8), @Vector(32, i8)) @Vector(16, i16);
 extern fn @"llvm.x86.avx2.pmadd.wd"(@Vector(16, i16), @Vector(16, i16)) @Vector(8, i32);

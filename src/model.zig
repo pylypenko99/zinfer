@@ -559,7 +559,9 @@ const MatOut = struct {
 const tok_tile = 8;
 const max_rows_chunk = 64;
 /// Tokens per kernel call: each weight block is unpacked once per group.
-const tok_group = 4;
+/// 8 tokens keep 16 accumulators live: +6% pp with the 32 registers of
+/// AVX-512VL (Zen 5), but they spill on plain AVX2's 16 (-13% on Skylake).
+const tok_group = if (quant.has_avx512vl) 8 else 4;
 
 inline fn storeOut(comptime acc: bool, o: *f32, v: f32) void {
     if (acc) o.* += v else o.* = v;
