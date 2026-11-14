@@ -34,6 +34,8 @@ const usage =
     \\  --port N              server port (default 8080; implies --server)
     \\  --no-prune            keep full lm_head matmul (for A/B comparison)
     \\  --no-repack           keep GGUF row layout (per-row kernels; for A/B comparison)
+    \\  --cache f16|q8_0      K/V cache format; q8_0 halves cache RAM and
+    \\                        attention bandwidth (f16)
     \\  --bench PP,TG         benchmark prompt processing of PP tokens and generation of TG tokens
     \\  -v, --verbose         print model info
     \\
@@ -66,6 +68,7 @@ const Args = struct {
     batch: usize = 64,
     sampling: SamplingArgs = .{},
     load: model_mod.LoadOptions = .{},
+    cache_q8: bool = false,
     bench: ?[2]usize = null,
     verbose: bool = false,
 };
@@ -144,6 +147,11 @@ fn parseArgs(argv: []const [:0]const u8) Args {
             a.load.prune_vocab = false;
         } else if (r.is(&.{"--no-repack"})) {
             a.load.repack = false;
+        } else if (r.is(&.{"--cache"})) {
+            const v = r.str();
+            if (std.mem.eql(u8, v, "q8_0")) {
+                a.cache_q8 = true;
+            } else if (!std.mem.eql(u8, v, "f16")) fail("--cache expects f16 or q8_0, got '{s}'", .{v});
         } else if (r.is(&.{"--bench"})) {
             var it = std.mem.splitScalar(u8, r.str(), ',');
             const pp = std.fmt.parseInt(usize, it.next().?, 10) catch fail("--bench expects PP,TG", .{});
@@ -411,7 +419,7 @@ pub fn main(init: std.process.Init) !void {
     const default_ctx = @max(bench_need, 4096);
     const ctx = if (args.ctx > 0) args.ctx else @min(default_ctx, c.ctx_train);
 
-    var st = try model_mod.State.init(gpa, model, pool, ctx, @min(args.batch, ctx));
+    var st = model_mod.State.init(gpa, model, pool, ctx, @min(args.batch, ctx), args.cache_q8) catch |e| fail("failed to init state: {s}", .{@errorName(e)});
     defer st.deinit();
     const time_seed: u64 = @truncate(@as(u96, @bitCast(std.Io.Clock.real.now(io).nanoseconds)));
     const sp = samplingParams(args.sampling, &model.file, time_seed);
@@ -419,9 +427,10 @@ pub fn main(init: std.process.Init) !void {
     defer smp.deinit(gpa);
 
     if (args.verbose or args.bench != null) {
-        const kv_mb = @as(f64, @floatFromInt(st.k_cache.len * 2 * 2)) / (1 << 20);
-        std.debug.print("arch={s} layers={d} dim={d} heads={d}/{d} head_dim={d} ffn={d} vocab={d} ctx={d} (KV {d:.1} MB) threads={d} ({d:.0} ms load)\n", .{
-            @tagName(c.arch),                            c.n_layers, c.dim, c.n_heads, c.n_kv_heads, c.head_dim, c.ffn_dim, c.vocab, ctx, kv_mb, nth,
+        const kv_mb = @as(f64, @floatFromInt(st.k_cache.len + st.v_cache.len)) / (1 << 20);
+        std.debug.print("arch={s} layers={d} dim={d} heads={d}/{d} head_dim={d} ffn={d} vocab={d} ctx={d} (KV {d:.1} MB {s}) threads={d} ({d:.0} ms load)\n", .{
+            @tagName(c.arch),                            c.n_layers, c.dim, c.n_heads, c.n_kv_heads, c.head_dim, c.ffn_dim, c.vocab, ctx, kv_mb,
+            if (st.kv_q8) "q8_0" else "f16", nth,
             @as(f64, @floatFromInt(timer.read())) / 1e6,
         });
         const l0 = &model.layers[0];
