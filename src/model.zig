@@ -136,9 +136,9 @@ pub const Model = struct {
     owned: std.ArrayList([]f32) = .empty,
     /// Anonymous huge-page region holding every matmul weight.
     weights: ?[]align(std.heap.page_size_min) u8 = null,
-    /// Contiguous coarse slice of output weights for two-stage dynamic vocab pruning.
+    /// 2-bit copy of the output weights (repack.packCoarse layout) for the
+    /// coarse pass of two-stage vocab pruning; `output_coarse_bytes` per group.
     output_coarse: ?[]align(64) u8 = null,
-    output_coarse_cols: usize = 0,
     output_coarse_bytes: usize = 0,
 
     pub fn load(gpa: Allocator, io: std.Io, path: []const u8, pool: *Pool, opts: LoadOptions) !*Model {
@@ -206,6 +206,22 @@ pub const Model = struct {
         };
     }
 
+    const CoarseBuildJob = struct { src: *const Tensor, dst: [*]u8, gbytes: usize, scratch: []f32, chunks: Chunks };
+
+    fn coarseBuildWorker(j: *CoarseBuildJob, tid: usize, _: usize) void {
+        const t = j.src;
+        const buf = j.scratch[tid * 8 * t.cols ..][0 .. 8 * t.cols];
+        while (j.chunks.grab()) |range| for (range[0]..range[1]) |g| {
+            var rows: [8][]const f32 = undefined;
+            for (&rows, 0..) |*r, i| {
+                const row = buf[i * t.cols ..][0..t.cols];
+                quant.dequantRow(t.typ, t.row(g * 8 + i), row);
+                r.* = row;
+            }
+            repack.packCoarse(rows, j.dst + g * j.gbytes);
+        };
+    }
+
     /// Move every matmul weight into one huge-page region, repacking when possible.
     fn materialize(self: *Model, gpa: Allocator, pool: *Pool, use_repack: bool, prune_vocab: bool) !void {
         const ts = try self.matmulTensors(gpa);
@@ -216,6 +232,19 @@ pub const Model = struct {
         const region = try posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
         self.weights = region;
         posix.madvise(region.ptr, len, posix.MADV.HUGEPAGE) catch {};
+        // The 2-bit coarse copy of lm_head is quantized from the GGUF rows,
+        // before the loop below repacks the output weights.
+        if (prune_vocab and use_repack and self.output.canRepack() and self.output.cols % 32 == 0) {
+            const t = &self.output;
+            const gbytes = repack.coarseGroupBytes(t.cols);
+            const coarse = try gpa.alignedAlloc(u8, .@"64", t.rows / 8 * gbytes);
+            self.output_coarse = coarse;
+            self.output_coarse_bytes = gbytes;
+            const scratch = try gpa.alloc(f32, pool.nth * 8 * t.cols);
+            defer gpa.free(scratch);
+            var job: CoarseBuildJob = .{ .src = t, .dst = coarse.ptr, .gbytes = gbytes, .scratch = scratch, .chunks = .init(t.rows / 8, 16) };
+            pool.run(&job, coarseBuildWorker);
+        }
         var off: usize = 0;
         for (ts) |t| {
             const dst = region.ptr + off;
@@ -230,31 +259,6 @@ pub const Model = struct {
             } else {
                 @memcpy(dst[0 .. t.rows * t.row_bytes], t.data[0 .. t.rows * t.row_bytes]);
                 t.data = dst;
-            }
-        }
-        if (prune_vocab and use_repack and self.output.x8) {
-            const t = &self.output;
-            const total_nb = switch (t.typ) {
-                .q4_k, .q5_k, .q6_k => t.cols / 256,
-                .q4_0, .q8_0 => t.cols / 32,
-                else => 0,
-            };
-            if (total_nb >= 4) {
-                const coarse_nb = if (total_nb == 8) 2 else total_nb / 4;
-                const block_bytes = repack.blockBytes(t.typ);
-                const block_size: usize = if (t.typ.layout().?.block == 256) 256 else 32;
-                const coarse_bytes = coarse_nb * block_bytes;
-                const coarse_cols = coarse_nb * block_size;
-                const n_groups = t.rows / 8;
-                const contig = try gpa.alignedAlloc(u8, .@"64", n_groups * coarse_bytes);
-                for (0..n_groups) |g| {
-                    const src = t.data + g * t.row_bytes;
-                    const dst = contig.ptr + g * coarse_bytes;
-                    @memcpy(dst[0..coarse_bytes], src[0..coarse_bytes]);
-                }
-                self.output_coarse = contig;
-                self.output_coarse_cols = coarse_cols;
-                self.output_coarse_bytes = coarse_bytes;
             }
         }
     }
@@ -697,36 +701,20 @@ fn ffnWorker(job: *FfnJob, _: usize, _: usize) void {
 }
 
 const CoarseJob = struct {
-    coarse_data: [*]const u8,
-    coarse_bytes: usize,
-    act_ptr: [*]const u8,
-    coarse_scores: []f32,
-    coarse_cols: usize,
-    typ: GgmlType,
+    coarse: [*]const u8,
+    group_bytes: usize,
+    act: [*]const quant.Q8B,
+    nb: usize,
+    sum_s: f32,
+    scores: []f32,
     chunks: Chunks,
 };
 
+/// Score every 8-row group by the best of its rows' 2-bit coarse logits.
 fn coarseWorker(job: *CoarseJob, _: usize, _: usize) void {
-    const acts = [_][*]const u8{job.act_ptr};
-    const typ = job.typ;
-    const cb = job.coarse_bytes;
-    while (job.chunks.grab()) |range| {
-        for (range[0]..range[1]) |g| {
-            const ptr = job.coarse_data + g * cb;
-            const v8 = switch (typ) {
-                .q6_k => repack.gemm(.q6_k, 1, ptr, acts, job.coarse_cols)[0],
-                .q4_k => repack.gemm(.q4_k, 1, ptr, acts, job.coarse_cols)[0],
-                .q8_0 => repack.gemm(.q8_0, 1, ptr, acts, job.coarse_cols)[0],
-                .q4_0 => repack.gemm(.q4_0, 1, ptr, acts, job.coarse_cols)[0],
-                else => unreachable,
-            };
-            var mx: f32 = v8[0];
-            inline for (1..8) |k| if (v8[k] > mx) {
-                mx = v8[k];
-            };
-            job.coarse_scores[g] = mx;
-        }
-    }
+    while (job.chunks.grab()) |range| for (range[0]..range[1]) |g| {
+        job.scores[g] = @reduce(.Max, repack.coarseScores(job.coarse + g * job.group_bytes, job.act, job.nb, job.sum_s));
+    };
 }
 
 const PrunedFineJob = struct {
@@ -1370,9 +1358,6 @@ pub const State = struct {
         const w = &m.output;
         const typ = w.typ;
         const n_groups = m.cfg.vocab / 8;
-        const coarse_bytes = m.output_coarse_bytes;
-        const coarse_cols = m.output_coarse_cols;
-        const coarse_data = m.output_coarse.?.ptr;
 
         const kind = quant.actKind(typ);
         s.xn.prepare(kind, s.pool);
@@ -1382,14 +1367,19 @@ pub const State = struct {
             .f32 => @ptrCast(s.xn.f.ptr),
         };
 
-        // 1. Parallel coarse pass over all groups
+        // 1. Parallel coarse pass over all groups: 2-bit weights x Q8B activations.
+        s.xn.prepare(.q8b, s.pool);
+        const nb = w.cols / 32;
+        const q8b = s.xn.q8b[0..nb];
+        var sum_s: f32 = 0;
+        for (q8b) |b| sum_s += b.s;
         var c_job: CoarseJob = .{
-            .coarse_data = coarse_data,
-            .coarse_bytes = coarse_bytes,
-            .act_ptr = act_ptr,
-            .coarse_scores = s.coarse_scores,
-            .coarse_cols = coarse_cols,
-            .typ = typ,
+            .coarse = m.output_coarse.?.ptr,
+            .group_bytes = m.output_coarse_bytes,
+            .act = q8b.ptr,
+            .nb = nb,
+            .sum_s = sum_s,
+            .scores = s.coarse_scores,
             .chunks = .init(n_groups, 64),
         };
         s.pool.run(&c_job, coarseWorker);

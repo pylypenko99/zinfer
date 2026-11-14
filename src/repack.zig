@@ -369,6 +369,78 @@ pub inline fn gemm(comptime t: GgmlType, comptime NT: usize, group: [*]const u8,
 }
 
 // ---------------------------------------------------------------------------
+// 2-bit coarse copy of lm_head for vocab pruning
+//
+// Every weight becomes c * beta with c in {-3,-1,1,3}: Lloyd-Max thresholds
+// for a Gaussian (0 and +-0.98 sigma) and a least-squares beta per row. Scoring
+// all dimensions this coarsely ranks the true argmax far better than an exact
+// dot over a quarter of them: over 3500 teacher-forced positions on
+// Llama-3.2-1B and Qwen3-4B the winner's group never ranked below 249 (the
+// fine pass takes 512), while the first-25%-of-dims score missed the argmax
+// at 4-14% of positions.
+//
+// Per 8-row group and 32 dims: two 32-byte vectors, lane r holding row r.
+// Byte j of a lane packs dims 4k+j (k = 0..3, 2 bits at shift 2k) of one
+// 16-dim half, so shifting by 2k lines four consecutive dims up with a
+// broadcast 4-byte activation slice. The 8 row scales (f32) follow the blocks.
+
+/// Bytes of one 8-row group of `cols` elements in the coarse layout.
+pub fn coarseGroupBytes(cols: usize) usize {
+    return cols / 32 * 64 + 32;
+}
+
+/// Quantize 8 rows of equal length (a multiple of 32) into the coarse layout.
+pub fn packCoarse(rows: [8][]const f32, dst: [*]u8) void {
+    const cols = rows[0].len;
+    const codes = dst[0 .. cols / 32 * 64];
+    @memset(codes, 0);
+    var scales: [8]f32 = undefined;
+    for (rows, 0..) |row, r| {
+        var ss: f64 = 0;
+        for (row) |w| ss += @as(f64, w) * w;
+        const t: f32 = @floatCast(0.9816 * @sqrt(ss / @as(f64, @floatFromInt(cols))));
+        var wc: f64 = 0;
+        var cc: f64 = 0;
+        for (row, 0..) |w, d| {
+            // Stored as u = (c + 3) / 2.
+            const u: u8 = if (w < -t) 0 else if (w < 0) 1 else if (w < t) 2 else 3;
+            const c: f64 = @floatFromInt(@as(i32, u) * 2 - 3);
+            wc += c * w;
+            cc += c * c;
+            const e = d % 16;
+            codes[d / 32 * 64 + (d % 32) / 16 * 32 + r * 4 + e % 4] |= u << @as(u3, @intCast(2 * (e / 4)));
+        }
+        scales[r] = @floatCast(wc / cc);
+    }
+    @memcpy(dst[codes.len..][0..32], std.mem.asBytes(&scales));
+}
+
+/// Coarse scores beta_r * sum_d c_rd * x_d of one group against a Q8B row;
+/// `sum_s` is the sum of the row's per-block `s`.
+pub fn coarseScores(w: [*]const u8, act: [*]const Q8B, nb: usize, sum_s: f32) V8f {
+    const m2: V32u8 = @splat(3);
+    var acc: V8f = @splat(0);
+    for (0..nb) |b| {
+        const blk = w + b * 64;
+        prefetchAhead(blk, 64);
+        const y = &act[b];
+        // u <= 3: eight vpmaddubsw pair sums stay below 8 * 762 in i16.
+        var s: V16i16 = @splat(0);
+        inline for (0..2) |h| {
+            const v = load32(blk + h * 32);
+            inline for (0..4) |k| {
+                const u = (v >> @splat(2 * k)) & m2;
+                s +%= maddubs(u, bc4(y.qs[16 * h + 4 * k ..].ptr));
+            }
+        }
+        acc = @mulAdd(V8f, @splat(y.d), toF(maddwd(s, ones16)), acc);
+    }
+    // sum c*x = 2 * sum u*x - 3 * sum x.
+    const beta = loadVec(V8f, w + nb * 64);
+    return beta * (acc * @as(V8f, @splat(2)) - @as(V8f, @splat(3 * sum_s)));
+}
+
+// ---------------------------------------------------------------------------
 
 fn checkType(comptime t: GgmlType) !void {
     const cols = 512;
@@ -430,4 +502,49 @@ fn checkType(comptime t: GgmlType) !void {
 
 test "x8 kernels match per-row kernels" {
     inline for (.{ GgmlType.q4_0, .q8_0, .q4_k, .q5_k, .q6_k }) |t| try checkType(t);
+}
+
+test "2-bit coarse scores match the decoded weights" {
+    const cols = 256;
+    var prng = std.Random.DefaultPrng.init(7);
+    const r = prng.random();
+    var rows_f: [8][cols]f32 = undefined;
+    var rows: [8][]const f32 = undefined;
+    for (&rows_f, 0..) |*row, i| {
+        const scale = 0.02 + 0.01 * @as(f32, @floatFromInt(i));
+        for (row) |*v| v.* = r.floatNorm(f32) * scale;
+        rows[i] = row;
+    }
+    var buf: [coarseGroupBytes(cols)]u8 align(32) = undefined;
+    packCoarse(rows, &buf);
+
+    var x: [cols]f32 = undefined;
+    for (&x) |*v| v.* = r.floatNorm(f32);
+    var act: [cols / 32]Q8B = undefined;
+    quant.quantizeQ8B(&x, &act);
+    var sum_s: f32 = 0;
+    for (act) |a| sum_s += a.s;
+    const got: [8]f32 = coarseScores(&buf, &act, cols / 32, sum_s);
+
+    // Independent decode of the documented layout.
+    const beta: [8]f32 = @bitCast(buf[cols / 32 * 64 ..][0..32].*);
+    for (0..8) |row| {
+        var want: f64 = 0;
+        var err2: f64 = 0;
+        var norm2: f64 = 0;
+        for (0..cols) |d| {
+            const e = d % 16;
+            const byte = buf[d / 32 * 64 + (d % 32) / 16 * 32 + row * 4 + e % 4];
+            const u = (byte >> @as(u3, @intCast(2 * (e / 4)))) & 3;
+            const wq = beta[row] * @as(f32, @floatFromInt(@as(i32, u) * 2 - 3));
+            const blk = act[d / 32];
+            want += wq * blk.d * @as(f32, @floatFromInt(blk.qs[d % 32]));
+            const diff = wq - rows_f[row][d];
+            err2 += diff * diff;
+            norm2 += rows_f[row][d] * rows_f[row][d];
+        }
+        try std.testing.expectApproxEqAbs(want, got[row], 1e-3 * @max(1.0, @abs(want)));
+        // 2-bit Lloyd-Max keeps a Gaussian row within ~0.34 relative L2 error.
+        try std.testing.expect(@sqrt(err2 / norm2) < 0.4);
+    }
 }
