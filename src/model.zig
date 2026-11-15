@@ -1152,6 +1152,22 @@ pub const State = struct {
         }
     }
 
+    /// Short-conv state after the first `t` tokens of the last forward batch;
+    /// checkpointed only for batches of at most `max_spec` tokens. Empty for
+    /// models without short-conv layers.
+    pub fn convCheckpointState(s: *const State, t: usize) []const f32 {
+        return s.conv_checkpoint[t * s.conv_state.len ..][0..s.conv_state.len];
+    }
+
+    /// Keep only the first `pos` cached tokens. `conv` is the short-conv state
+    /// at exactly that position (empty for models without short-conv layers);
+    /// attention entries past `pos` are overwritten before they are read.
+    pub fn truncate(s: *State, pos: usize, conv: []const f32) void {
+        std.debug.assert(pos <= s.pos and conv.len == s.conv_state.len);
+        s.pos = pos;
+        @memcpy(s.conv_state, conv);
+    }
+
     /// Start of one (attention layer, kv head) region in k_cache / v_cache.
     inline fn cacheIndex(s: *const State, slot: usize, kh: usize) usize {
         const c = &s.model.cfg;

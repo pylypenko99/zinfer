@@ -321,8 +321,7 @@ fn handleChatCompletion(
 
     if (tokens.items.len == 0) return;
 
-    // Every request starts from an empty context.
-    g.reset();
+    // The prefix shared with the previous request stays in the cache.
     g.stats = .{};
 
     if (stream_mode) {
@@ -341,7 +340,7 @@ fn handleChatCompletion(
         }
         try w.flush();
 
-        _ = try g.run(tokens.items, max_tokens, SseSink{ .w = w, .responses = is_responses_api });
+        _ = try g.runPrompt(tokens.items, max_tokens, SseSink{ .w = w, .responses = is_responses_api });
 
         if (is_responses_api) {
             try w.writeAll("data: {\"type\":\"response.completed\"}\n\n");
@@ -353,7 +352,7 @@ fn handleChatCompletion(
     } else {
         var resp_text: std.ArrayList(u8) = .empty;
         defer resp_text.deinit(gpa);
-        _ = try g.run(tokens.items, max_tokens, BufSink{ .gpa = gpa, .buf = &resp_text });
+        _ = try g.runPrompt(tokens.items, max_tokens, BufSink{ .gpa = gpa, .buf = &resp_text });
 
         try w.print(
             "HTTP/1.1 200 OK\r\n" ++

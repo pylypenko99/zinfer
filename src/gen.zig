@@ -28,6 +28,8 @@ pub const Timer = struct {
 
 pub const Stats = struct {
     n_prompt: usize = 0,
+    /// Prompt tokens reused from the cache instead of being processed.
+    n_cached: usize = 0,
     n_gen: usize = 0,
     n_drafted: usize = 0,
     n_accepted: usize = 0,
@@ -47,29 +49,125 @@ pub const Gen = struct {
     draft_st: ?*model_mod.State = null,
     draft_smp: ?*sampler_mod.Sampler = null,
     stats: Stats = .{},
+    /// Tokens in the target cache, in order (`st.pos` of them).
+    cached: std.ArrayList(u32) = .empty,
+    /// Short-conv states saved by `runPrompt` at the end of the last prompt:
+    /// entry i is the state at position `snap_pos + i`. Attention caches can
+    /// be cut at any position, short-conv state only where it was saved.
+    snaps: []f32 = &.{},
+    snap_pos: usize = 0,
+    n_snaps: usize = 0,
+
+    pub fn deinit(g: *Gen) void {
+        g.cached.deinit(g.gpa);
+        g.gpa.free(g.snaps);
+    }
 
     /// Forget the context of both models and the repeat-penalty history.
     pub fn reset(g: *Gen) void {
         g.st.reset();
         if (g.draft_st) |d| d.reset();
         g.smp.n_recent = 0;
+        g.cached.clearRetainingCapacity();
+        g.n_snaps = 0;
     }
 
-    /// Feed `input`, then sample up to `n` tokens, passing each token's bytes
-    /// to `sink.emit`. Returns the end-of-generation token if one was sampled
-    /// (it is not yet in the KV cache).
+    /// Feed `input` after the current context, then sample up to `n` tokens,
+    /// passing each token's bytes to `sink.emit`. Returns the end-of-generation
+    /// token if one was sampled (it is not yet in the KV cache).
     pub fn run(g: *Gen, input: []const u32, n: usize, sink: anytype) !?u32 {
-        var timer: Timer = .start(g.io);
-        const logits = try g.st.forward(input);
-        // The draft mirrors the target cache; it needs no logits for the input.
-        if (g.draft_st) |dst| _ = try dst.forwardN(input, 0);
-        g.stats.t_prompt_ns += timer.lap();
-        g.stats.n_prompt += input.len;
-        for (input) |t| g.smp.accept(t);
+        return g.generate(input, 0, false, n, sink);
+    }
 
+    /// `reset` followed by `run(prompt)` for a request that carries the whole
+    /// conversation, except that the prefix shared with the cached context is
+    /// kept and only the rest of `prompt` is processed.
+    pub fn runPrompt(g: *Gen, prompt: []const u32, n: usize, sink: anytype) !?u32 {
+        const keep = g.reusablePrefix(prompt);
+        g.truncate(keep);
+        g.smp.n_recent = 0;
+        return g.generate(prompt, keep, g.st.conv_state.len > 0, n, sink);
+    }
+
+    /// Longest cached prefix of `prompt` both caches can be cut back to. At
+    /// least one prompt token stays to be processed: its logits start the
+    /// generation.
+    fn reusablePrefix(g: *const Gen, prompt: []const u32) usize {
+        if (prompt.len == 0) return 0;
+        const shared = std.mem.indexOfDiff(u32, g.cached.items, prompt) orelse prompt.len;
+        const limit = @min(shared, prompt.len - 1);
+        if (g.st.conv_state.len == 0 or limit == g.st.pos) return limit;
+        if (g.n_snaps == 0 or limit < g.snap_pos) return 0;
+        return g.snap_pos + @min(limit - g.snap_pos, g.n_snaps - 1);
+    }
+
+    /// Cut both caches back to `keep` tokens, a position from `reusablePrefix`.
+    fn truncate(g: *Gen, keep: usize) void {
+        if (keep == g.st.pos) return;
+        if (keep == 0) return g.reset();
+        const sz = g.st.conv_state.len;
+        if (sz == 0) {
+            g.st.truncate(keep, &.{});
+        } else {
+            g.st.truncate(keep, g.snaps[(keep - g.snap_pos) * sz ..][0..sz]);
+            // Later snapshots belong to the discarded continuation.
+            g.n_snaps = keep - g.snap_pos + 1;
+        }
+        // The draft mirrors the target cache and has no short-conv layers.
+        if (g.draft_st) |d| d.truncate(keep, &.{});
+        g.cached.shrinkRetainingCapacity(keep);
+    }
+
+    /// Feed `prompt[keep..]` to a cache that ends with `prompt[0..keep]`, then
+    /// sample as `run` does. With `snapshot`, the short-conv states at the end
+    /// of the prompt are saved for the next `runPrompt`.
+    fn generate(g: *Gen, prompt: []const u32, keep: usize, snapshot: bool, n: usize, sink: anytype) !?u32 {
+        std.debug.assert(g.cached.items.len == g.st.pos and keep < prompt.len);
+        const base = g.st.pos - keep;
         var history: std.ArrayList(u32) = .empty;
         defer history.deinit(g.gpa);
-        try history.appendSlice(g.gpa, input);
+        const eog = g.decode(prompt, keep, snapshot, n, sink, &history) catch |e| {
+            // An interrupted round can leave unverified drafts in the caches.
+            g.reset();
+            return e;
+        };
+        // Tokens enter the cache in `history` order, so it holds a prefix of it.
+        g.cached.shrinkRetainingCapacity(base);
+        g.cached.appendSlice(g.gpa, history.items[0 .. g.st.pos - base]) catch |e| {
+            g.reset();
+            return e;
+        };
+        return eog;
+    }
+
+    /// Prefill with the last few tokens as one small batch: its short-conv
+    /// checkpoints become the snapshots `runPrompt` can cut back to. Clients
+    /// diverge from the cached context right there: a prompt ends with the
+    /// assistant header (and `<think>`), the next request with the stored reply.
+    fn prefillSnapshots(g: *Gen, feed: []const u32) ![]f32 {
+        if (g.st.pos + feed.len > g.st.ctx) return error.ContextFull;
+        const tail = @min(feed.len, model_mod.max_spec);
+        if (feed.len > tail) _ = try g.st.forwardN(feed[0 .. feed.len - tail], 0);
+        const logits = try g.st.forward(feed[feed.len - tail ..]);
+        const sz = g.st.conv_state.len;
+        if (g.snaps.len == 0) g.snaps = try g.gpa.alloc(f32, (model_mod.max_spec + 1) * sz);
+        for (0..tail + 1) |t| @memcpy(g.snaps[t * sz ..][0..sz], g.st.convCheckpointState(t));
+        g.snap_pos = g.st.pos - tail;
+        g.n_snaps = tail + 1;
+        return logits;
+    }
+
+    fn decode(g: *Gen, prompt: []const u32, keep: usize, snapshot: bool, n: usize, sink: anytype, history: *std.ArrayList(u32)) !?u32 {
+        var timer: Timer = .start(g.io);
+        const feed = prompt[keep..];
+        const logits = if (snapshot) try g.prefillSnapshots(feed) else try g.st.forward(feed);
+        // The draft mirrors the target cache; it needs no logits for the input.
+        if (g.draft_st) |dst| _ = try dst.forwardN(feed, 0);
+        g.stats.t_prompt_ns += timer.lap();
+        g.stats.n_prompt += feed.len;
+        g.stats.n_cached += keep;
+        for (prompt) |t| g.smp.accept(t);
+        try history.appendSlice(g.gpa, prompt);
 
         // Tokens emitted by this call: `n` limits every call on its own.
         var n_run: usize = 0;
@@ -78,7 +176,7 @@ pub const Gen = struct {
             g.stats.t_gen_ns += timer.lap();
             return cur_tok;
         }
-        try g.take(sink, &history, cur_tok, &n_run);
+        try g.take(sink, history, cur_tok, &n_run);
 
         const max_spec_draft = model_mod.max_spec - 1;
         var draft_buf: [max_spec_draft]u32 = undefined;
@@ -122,7 +220,7 @@ pub const Gen = struct {
                     g.stats.t_gen_ns += timer.lap();
                     return next_tok;
                 }
-                try g.take(sink, &history, next_tok, &n_run);
+                try g.take(sink, history, next_tok, &n_run);
                 cur_tok = next_tok;
             } else {
                 g.stats.n_drafted += k;
@@ -140,7 +238,7 @@ pub const Gen = struct {
                     const l = all_logits[accepted_count * vocab ..][0..vocab];
                     const pred = g.smp.sample(l);
                     if (pred == draft_buf[accepted_count] and !g.tok.isEog(pred) and n_run < n) {
-                        try g.take(sink, &history, pred, &n_run);
+                        try g.take(sink, history, pred, &n_run);
                         g.stats.n_accepted += 1;
                     } else {
                         next_cur = pred;
@@ -171,7 +269,7 @@ pub const Gen = struct {
                     g.stats.t_gen_ns += timer.lap();
                     return next_tok;
                 }
-                try g.take(sink, &history, next_tok, &n_run);
+                try g.take(sink, history, next_tok, &n_run);
                 cur_tok = next_tok;
             }
         }
@@ -201,10 +299,9 @@ pub const Gen = struct {
                 return if (ns == 0) 0 else @as(f64, @floatFromInt(n)) * 1e9 / @as(f64, @floatFromInt(ns));
             }
         }.f;
-        std.debug.print("prompt: {d} tok in {d:.1} ms ({d:.2} tok/s) | gen: {d} tok in {d:.1} ms ({d:.2} tok/s)", .{
-            s.n_prompt, ms(s.t_prompt_ns), rate(s.n_prompt, s.t_prompt_ns),
-            s.n_gen,    ms(s.t_gen_ns),    rate(s.n_gen, s.t_gen_ns),
-        });
+        std.debug.print("prompt: {d} tok in {d:.1} ms ({d:.2} tok/s)", .{ s.n_prompt, ms(s.t_prompt_ns), rate(s.n_prompt, s.t_prompt_ns) });
+        if (s.n_cached > 0) std.debug.print(" + {d} cached", .{s.n_cached});
+        std.debug.print(" | gen: {d} tok in {d:.1} ms ({d:.2} tok/s)", .{ s.n_gen, ms(s.t_gen_ns), rate(s.n_gen, s.t_gen_ns) });
         if (s.n_drafted > 0) {
             std.debug.print(" | spec: {d}/{d} accepted ({d:.1}%)\n", .{
                 s.n_accepted,

@@ -323,6 +323,7 @@ pub fn main(init: std.process.Init) !void {
         .draft_st = if (draft_st) |*d| d else null,
         .draft_smp = if (draft_smp) |*d| d else null,
     };
+    defer gen.deinit();
 
     if (args.bench) |b| return bench(gpa, io, &st, b[0], b[1]);
     if (args.server) {
