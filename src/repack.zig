@@ -25,7 +25,7 @@ extern fn @"llvm.x86.avx2.psign.b"(@Vector(32, i8), @Vector(32, i8)) @Vector(32,
 
 pub fn supported(t: GgmlType) bool {
     return switch (t) {
-        .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => true,
+        .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q4_k, .q5_k, .q6_k => true,
         else => false,
     };
 }
@@ -34,6 +34,9 @@ pub fn supported(t: GgmlType) bool {
 pub fn blockBytes(t: GgmlType) usize {
     return switch (t) {
         .q4_0 => 144, // d[8]f16 | qs[4 k][8 r][4]
+        .q4_1 => 160, // d[8] | m[8] | qs[4 k][8 r][4]
+        .q5_0 => 176, // d[8] | qh[4 k][8 r] | qs[4 k][8 r][4]
+        .q5_1 => 192, // d[8] | m[8] | qh[4 k][8 r] | qs[4 k][8 r][4]
         .q8_0 => 272, // d[8]f16 | qs[8 k][8 r][4]
         .q4_k => 1184, // d[8] | dmin[8] | sc[8 j][8 r] | mn[8 j][8 r] | qs[4 c][8 k][8 r][4]
         .q5_k => 1440, // q4_k layout with qh[8 k][8 r][4] inserted before qs
@@ -63,6 +66,23 @@ pub fn repackGroup(t: GgmlType, rows: [8][*]const u8, nb: usize, dst: [*]u8) voi
                     @memcpy(o[r * 2 ..][0..2], x[0..2]);
                     const ng: usize = if (t == .q4_0) 4 else 8;
                     for (0..ng) |k| @memcpy(o[16 + (k * 8 + r) * 4 ..][0..4], x[2 + 4 * k ..][0..4]);
+                },
+                .q4_1, .q5_0, .q5_1 => {
+                    const has_m = t != .q5_0;
+                    const has_h = t != .q4_1;
+                    @memcpy(o[r * 2 ..][0..2], x[0..2]);
+                    if (has_m) @memcpy(o[16 + r * 2 ..][0..2], x[2..4]);
+                    const qh_src: usize = if (has_m) 4 else 2;
+                    const qh_off: usize = if (has_m) 32 else 16;
+                    const qs_src = qh_src + @as(usize, if (has_h) 4 else 0);
+                    const qs_off = qh_off + @as(usize, if (has_h) 32 else 0);
+                    if (has_h) {
+                        // Byte (k, r): the 5th bits of row r's values 4k..4k+3
+                        // (low nibble) and 16+4k..16+4k+3 (high nibble).
+                        const qh = std.mem.readInt(u32, x[qh_src..][0..4], .little);
+                        for (0..4) |k| o[qh_off + k * 8 + r] = @truncate(((qh >> @intCast(4 * k)) & 0xf) | ((qh >> @intCast(16 + 4 * k)) & 0xf) << 4);
+                    }
+                    for (0..4) |k| @memcpy(o[qs_off + (k * 8 + r) * 4 ..][0..4], x[qs_src + 4 * k ..][0..4]);
                 },
                 .q4_k, .q5_k => {
                     @memcpy(o[r * 2 ..][0..2], x[0..2]);
@@ -150,6 +170,17 @@ inline fn applySign(a: V32i8, s: V32i8) V32i8 {
     if (quant.has_avx2) return @"llvm.x86.avx2.psign.b"(a, s);
     return @select(i8, s < @as(V32i8, @splat(0)), @as(V32i8, @splat(0)) -% a, a);
 }
+
+/// One byte per row (8 rows) -> lanes 4r..4r+3 of row r.
+inline fn spreadRows(p: [*]const u8) V32u8 {
+    const v: @Vector(8, u8) = p[0..8].*;
+    return @shuffle(u8, v, undefined, [32]i32{ 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7 });
+}
+
+/// Bits of a spreadRows byte holding lane i's 5th bit: low-nibble value i,
+/// high-nibble value i.
+const h_lo: V32u8 = @bitCast(@as(@Vector(8, u32), @splat(0x08040201)));
+const h_hi: V32u8 = @bitCast(@as(@Vector(8, u32), @splat(0x80402010)));
 
 const ones16: V16i16 = @splat(1);
 const m4: V32u8 = @splat(0x0f);
@@ -299,29 +330,50 @@ fn gemmQ6K(comptime NT: usize, w: [*]const u8, acts: [NT][*]const Q8K, nb: usize
     return out;
 }
 
-fn gemmQ4_0(comptime NT: usize, w: [*]const u8, acts: [NT][*]const Q8B, nb: usize) [NT]V8f {
+/// Q4_0, Q4_1, Q5_0, Q5_1: 32-value blocks, one scale per row, plus a min
+/// (Q4_1, Q5_1) or a zero point of 8 / 16 folded into the scale.
+fn gemmLegacy(comptime t: GgmlType, comptime NT: usize, w: [*]const u8, acts: [NT][*]const Q8B, nb: usize) [NT]V8f {
     @setEvalBranchQuota(100_000);
+    const has_m = t == .q4_1 or t == .q5_1;
+    const has_h = t == .q5_0 or t == .q5_1;
+    const BS = comptime blockBytes(t);
+    const qh_off = if (has_m) 32 else 16;
+    const qs_off = qh_off + if (has_h) 32 else 0;
+    const sixteen: V32u8 = @splat(0x10);
+    const zero: V32u8 = @splat(0);
     var out: [NT]V8f = @splat(@splat(0));
     const n_k = hidden(4);
     for (0..nb) |b| {
-        const blk = w + b * 144;
-        prefetchAhead(blk, 144);
+        const blk = w + b * BS;
+        prefetchAhead(blk, BS);
+        // 4-bit values: the block's eight vpmaddubsw pair sums stay below
+        // 8 * 3810 in i16. 5-bit ones reach 2 * 7874 per step: widen each step.
         var s: [NT]V16i16 = @splat(@splat(0));
+        var acc: [NT]V8i32 = @splat(@splat(0));
         var k: usize = 0;
         while (k < n_k) : (k += 1) {
-            const wv = load32(blk + 16 + k * 32);
-            const lo = wv & m4;
-            const hi = wv >> @splat(4);
-            inline for (0..NT) |t| {
-                const y = &acts[t][b];
-                s[t] +%= maddubs(lo, bc4(y.qs[4 * k ..].ptr)) +% maddubs(hi, bc4(y.qs[16 + 4 * k ..].ptr));
+            const wv = load32(blk + qs_off + k * 32);
+            var lo = wv & m4;
+            var hi = wv >> @splat(4);
+            if (has_h) {
+                const hb = spreadRows(blk + qh_off + k * 8);
+                lo |= @select(u8, (hb & h_lo) == h_lo, sixteen, zero);
+                hi |= @select(u8, (hb & h_hi) == h_hi, sixteen, zero);
+            }
+            inline for (0..NT) |tk| {
+                const y = &acts[tk][b];
+                const p = maddubs(lo, bc4(y.qs[4 * k ..].ptr)) +% maddubs(hi, bc4(y.qs[16 + 4 * k ..].ptr));
+                if (has_h) acc[tk] += maddwd(p, ones16) else s[tk] +%= p;
             }
         }
         const d8 = halfs(blk);
-        inline for (0..NT) |t| {
-            const y = &acts[t][b];
-            out[t] = @mulAdd(V8f, d8 * @as(V8f, @splat(y.d)), toF(maddwd(s[t], ones16)), out[t]);
-            out[t] = @mulAdd(V8f, d8, @splat(-8.0 * y.s), out[t]);
+        // Offset per unit of activation sum: the min, or the zero point times d.
+        const c8: V8f = if (has_m) halfs(blk + 16) else d8 * @as(V8f, @splat(if (has_h) -16 else -8));
+        inline for (0..NT) |tk| {
+            const y = &acts[tk][b];
+            const ints = if (has_h) acc[tk] else maddwd(s[tk], ones16);
+            out[tk] = @mulAdd(V8f, d8 * @as(V8f, @splat(y.d)), toF(ints), out[tk]);
+            out[tk] = @mulAdd(V8f, c8, @splat(y.s), out[tk]);
         }
     }
     return out;
@@ -362,7 +414,7 @@ pub inline fn gemm(comptime t: GgmlType, comptime NT: usize, group: [*]const u8,
         .q4_k => gemmK45(false, NT, group, castActs(Q8K, NT, acts), cols / 256),
         .q5_k => gemmK45(true, NT, group, castActs(Q8K, NT, acts), cols / 256),
         .q6_k => gemmQ6K(NT, group, castActs(Q8K, NT, acts), cols / 256),
-        .q4_0 => gemmQ4_0(NT, group, castActs(Q8B, NT, acts), cols / 32),
+        .q4_0, .q4_1, .q5_0, .q5_1 => gemmLegacy(t, NT, group, castActs(Q8B, NT, acts), cols / 32),
         .q8_0 => gemmQ8_0(NT, group, castActs(Q8B, NT, acts), cols / 32),
         else => unreachable,
     };
@@ -458,7 +510,11 @@ fn checkType(comptime t: GgmlType) !void {
             }
         }.f;
         switch (t) {
-            .q4_0, .q8_0 => put(blk[0..2], 0.01 + r.float(f32) * 0.05),
+            .q4_0, .q5_0, .q8_0 => put(blk[0..2], 0.01 + r.float(f32) * 0.05),
+            .q4_1, .q5_1 => {
+                put(blk[0..2], 0.01 + r.float(f32) * 0.05);
+                put(blk[2..4], 0.01 + r.float(f32) * 0.05);
+            },
             .q4_k, .q5_k => {
                 put(blk[0..2], 0.01 + r.float(f32) * 0.05);
                 put(blk[2..4], 0.01 + r.float(f32) * 0.05);
@@ -501,7 +557,7 @@ fn checkType(comptime t: GgmlType) !void {
 }
 
 test "x8 kernels match per-row kernels" {
-    inline for (.{ GgmlType.q4_0, .q8_0, .q4_k, .q5_k, .q6_k }) |t| try checkType(t);
+    inline for (.{ GgmlType.q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q4_k, .q5_k, .q6_k }) |t| try checkType(t);
 }
 
 test "2-bit coarse scores match the decoded weights" {

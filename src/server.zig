@@ -1,7 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const gen_mod = @import("gen.zig");
-const Tokenizer = @import("tokenizer.zig").Tokenizer;
+const chat_mod = @import("chat.zig");
 
 pub const ServerConfig = struct {
     port: u16 = 8080,
@@ -166,37 +166,6 @@ fn handleConnection(
     try writer.interface.flush();
 }
 
-const Template = enum { llama3, chatml, lfm, plain };
-
-fn detectTemplate(tok: *const Tokenizer) Template {
-    if (tok.tokenId("<|start_header_id|>") != null and tok.tokenId("<|eot_id|>") != null) return .llama3;
-    if (tok.tokenId("<|im_start|>") != null and tok.tokenId("<|im_end|>") != null)
-        return if (tok.tokenId("<|startoftext|>") != null) .lfm else .chatml;
-    return .plain;
-}
-
-fn appendTurn(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), tpl: Template, role: []const u8, msg: []const u8) !void {
-    switch (tpl) {
-        .llama3 => try buf.print(gpa, "<|start_header_id|>{s}<|end_header_id|>\n\n{s}<|eot_id|>", .{ role, msg }),
-        .chatml, .lfm => try buf.print(gpa, "<|im_start|>{s}\n{s}<|im_end|>\n", .{ role, msg }),
-        .plain => try buf.print(gpa, "{s}: {s}\n", .{ role, msg }),
-    }
-}
-
-fn appendAssistantHeader(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), tpl: Template, has_think: bool, no_think: bool) !void {
-    try buf.appendSlice(gpa, switch (tpl) {
-        .llama3 => "<|start_header_id|>assistant<|end_header_id|>\n\n",
-        .chatml, .lfm => "<|im_start|>assistant\n",
-        .plain => "assistant:",
-    });
-    if (!has_think) return;
-    switch (tpl) {
-        .chatml => if (no_think) try buf.appendSlice(gpa, "<think>\n\n</think>\n\n"),
-        .lfm => try buf.appendSlice(gpa, if (no_think) "<think></think>" else "<think>"),
-        else => {},
-    }
-}
-
 fn writeJsonEscaped(w: *Io.Writer, str: []const u8) !void {
     for (str) |c| {
         switch (c) {
@@ -293,10 +262,9 @@ fn handleChatCompletion(
     var prompt_text: std.ArrayList(u8) = .empty;
     defer prompt_text.deinit(gpa);
 
-    const tpl = detectTemplate(tok);
-    const has_think = tok.tokenId("<think>") != null;
-
-    if (tpl == .lfm) try prompt_text.appendSlice(gpa, "<|startoftext|>");
+    var chat: chat_mod.Writer = .{ .gpa = gpa, .buf = &prompt_text, .tpl = .detect(tok) };
+    defer chat.deinit();
+    try chat.begin();
 
     var text_buf: std.ArrayList(u8) = .empty;
     defer text_buf.deinit(gpa);
@@ -310,9 +278,9 @@ fn handleChatCompletion(
         text_buf.clearRetainingCapacity();
         try extractTextContent(gpa, content_val, &text_buf);
 
-        try appendTurn(gpa, &prompt_text, tpl, role_val.string, text_buf.items);
+        try chat.turn(role_val.string, text_buf.items);
     }
-    try appendAssistantHeader(gpa, &prompt_text, tpl, has_think, cfg.no_think);
+    try chat.assistantHeader(chat_mod.hasThinkSwitch(tok, g.st.model.file.getString("tokenizer.chat_template")), cfg.no_think);
 
     // Tokenize
     var tokens: std.ArrayList(u32) = .empty;

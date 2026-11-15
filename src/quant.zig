@@ -24,6 +24,9 @@ inline fn dpbusd(acc: V8i32, u: V32u8, s: V32i8) V8i32 {
 }
 
 pub const BlockQ4_0 = extern struct { d: f16, qs: [16]u8 };
+pub const BlockQ4_1 = extern struct { d: f16, m: f16, qs: [16]u8 };
+pub const BlockQ5_0 = extern struct { d: f16, qh: [4]u8, qs: [16]u8 };
+pub const BlockQ5_1 = extern struct { d: f16, m: f16, qh: [4]u8, qs: [16]u8 };
 pub const BlockQ8_0 = extern struct { d: f16, qs: [32]i8 };
 pub const BlockQ4_K = extern struct { d: f16, dmin: f16, scales: [12]u8, qs: [128]u8 };
 pub const BlockQ5_K = extern struct { d: f16, dmin: f16, scales: [12]u8, qh: [32]u8, qs: [128]u8 };
@@ -37,6 +40,9 @@ pub const Q8B = extern struct { qs: [32]i8 align(32), d: f32, s: f32 };
 
 comptime {
     std.debug.assert(@sizeOf(BlockQ4_0) == 18);
+    std.debug.assert(@sizeOf(BlockQ4_1) == 20);
+    std.debug.assert(@sizeOf(BlockQ5_0) == 22);
+    std.debug.assert(@sizeOf(BlockQ5_1) == 24);
     std.debug.assert(@sizeOf(BlockQ8_0) == 34);
     std.debug.assert(@sizeOf(BlockQ4_K) == 144);
     std.debug.assert(@sizeOf(BlockQ5_K) == 176);
@@ -48,14 +54,14 @@ pub const ActKind = enum { f32, q8k, q8b };
 pub fn actKind(t: GgmlType) ActKind {
     return switch (t) {
         .q4_k, .q5_k, .q6_k => .q8k,
-        .q4_0, .q8_0 => .q8b,
+        .q4_0, .q4_1, .q5_0, .q5_1, .q8_0 => .q8b,
         else => .f32,
     };
 }
 
 pub fn isSupported(t: GgmlType) bool {
     return switch (t) {
-        .f32, .f16, .bf16, .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => true,
+        .f32, .f16, .bf16, .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q4_k, .q5_k, .q6_k => true,
         else => false,
     };
 }
@@ -323,29 +329,64 @@ const concat16: [32]i32 = blk: {
     break :blk m;
 };
 
-fn dotQ4_0(comptime NT: usize, row: [*]const u8, acts: [NT][*]const Q8B, nb: usize) [NT]f32 {
-    const w: [*]const BlockQ4_0 = @ptrCast(@alignCast(row));
+/// Block type of the 32-value "legacy" formats: Q4_0 / Q5_0 hold q - 8 /
+/// q - 16 under one scale, Q4_1 / Q5_1 hold d * q + m; Q5 adds the 5th bit
+/// of every value in `qh` (bit j for value j).
+pub fn LegacyBlock(comptime t: GgmlType) type {
+    return switch (t) {
+        .q4_0 => BlockQ4_0,
+        .q4_1 => BlockQ4_1,
+        .q5_0 => BlockQ5_0,
+        .q5_1 => BlockQ5_1,
+        else => unreachable,
+    };
+}
+
+/// 0x10 in lane j where bit j of a Q5 block's `qh` is set.
+inline fn highBits(qh: [4]u8) V32u8 {
+    const spread: [32]i32 = comptime blk: {
+        var m: [32]i32 = undefined;
+        for (&m, 0..) |*e, j| e.* = @intCast(j / 8);
+        break :blk m;
+    };
+    const bit: V32u8 = comptime blk: {
+        var m: [32]u8 = undefined;
+        for (&m, 0..) |*e, j| e.* = @as(u8, 1) << @intCast(j % 8);
+        break :blk m;
+    };
+    const h: @Vector(4, u8) = qh;
+    const b: V32u8 = @shuffle(u8, h, undefined, spread);
+    return @select(u8, (b & bit) == bit, @as(V32u8, @splat(0x10)), @as(V32u8, @splat(0)));
+}
+
+/// Unsigned x signed byte dot, partial sums of 4 lanes per i32.
+inline fn dot32(q: V32u8, a: V32i8) V8i32 {
+    if (has_vnni) return dpbusd(@splat(0), q, a);
+    return maddwd(maddubs(q, a), ones16);
+}
+
+fn dotLegacy(comptime t: GgmlType, comptime NT: usize, row: [*]const u8, acts: [NT][*]const Q8B, nb: usize) [NT]f32 {
+    const B = LegacyBlock(t);
+    const w: [*]const B = @ptrCast(@alignCast(row));
     var accf: [NT]V8f = @splat(@splat(0));
     var off: [NT]f32 = @splat(0);
     for (0..nb) |i| {
         const x = &w[i];
         const qs: @Vector(16, u8) = x.qs;
-        const lo = qs & @as(@Vector(16, u8), @splat(0x0f));
-        const hi = qs >> @splat(4);
-        const q: V32u8 = @shuffle(u8, lo, hi, concat16);
+        var q: V32u8 = @shuffle(u8, qs & @as(@Vector(16, u8), @splat(0x0f)), qs >> @splat(4), concat16);
+        if (@hasField(B, "qh")) q |= highBits(x.qh);
         const d = f16f(x.d);
-        inline for (0..NT) |t| {
-            const y = &acts[t][i];
-            if (has_vnni) {
-                accf[t] += @as(V8f, @splat(d * y.d)) * toF(dpbusd(@splat(0), q, y.qs));
-            } else {
-                accf[t] += @as(V8f, @splat(d * y.d)) * toF(maddwd(maddubs(q, y.qs), ones16));
-            }
-            off[t] += d * y.s;
+        // Block offset per unit of activation sum: the min, or the zero
+        // point (-8 / -16) times the scale.
+        const c = if (@hasField(B, "m")) f16f(x.m) else d * @as(f32, if (@hasField(B, "qh")) -16 else -8);
+        inline for (0..NT) |k| {
+            const y = &acts[k][i];
+            accf[k] += @as(V8f, @splat(d * y.d)) * toF(dot32(q, y.qs));
+            off[k] += c * y.s;
         }
     }
     var r: [NT]f32 = undefined;
-    inline for (0..NT) |t| r[t] = @reduce(.Add, accf[t]) - 8.0 * off[t];
+    inline for (0..NT) |k| r[k] = @reduce(.Add, accf[k]) + off[k];
     return r;
 }
 
@@ -424,7 +465,7 @@ pub inline fn dotN(comptime t: GgmlType, comptime NT: usize, row: [*]const u8, a
         .q4_k => return dotK45(false, NT, row, castActs(Q8K, NT, acts), n / 256),
         .q5_k => return dotK45(true, NT, row, castActs(Q8K, NT, acts), n / 256),
         .q6_k => return dotQ6K(NT, row, castActs(Q8K, NT, acts), n / 256),
-        .q4_0 => return dotQ4_0(NT, row, castActs(Q8B, NT, acts), n / 32),
+        .q4_0, .q4_1, .q5_0, .q5_1 => return dotLegacy(t, NT, row, castActs(Q8B, NT, acts), n / 32),
         .q8_0 => return dotQ8_0(NT, row, castActs(Q8B, NT, acts), n / 32),
         .f32, .f16, .bf16 => {
             var r: [NT]f32 = undefined;
@@ -457,13 +498,20 @@ pub fn dequantRow(t: GgmlType, src: [*]const u8, dst: []f32) void {
         .bf16 => for (dst, @as([*]const u16, @ptrCast(@alignCast(src)))[0..n]) |*d, s| {
             d.* = bf16f(s);
         },
-        .q4_0 => {
-            const bs: [*]const BlockQ4_0 = @ptrCast(@alignCast(src));
+        inline .q4_0, .q4_1, .q5_0, .q5_1 => |lt| {
+            const B = LegacyBlock(lt);
+            const bs: [*]const B = @ptrCast(@alignCast(src));
+            const zero: i32 = if (@hasField(B, "m")) 0 else if (@hasField(B, "qh")) 16 else 8;
             for (0..n / 32) |i| {
-                const d = f16f(bs[i].d);
+                const x = &bs[i];
+                const d = f16f(x.d);
+                const m: f32 = if (@hasField(B, "m")) f16f(x.m) else 0;
+                const qh: u32 = if (@hasField(B, "qh")) std.mem.readInt(u32, &x.qh, .little) else 0;
                 for (0..16) |l| {
-                    dst[i * 32 + l] = d * (@as(f32, @floatFromInt(bs[i].qs[l] & 0xf)) - 8);
-                    dst[i * 32 + 16 + l] = d * (@as(f32, @floatFromInt(bs[i].qs[l] >> 4)) - 8);
+                    const lo: i32 = (x.qs[l] & 0xf) | @as(i32, @intCast((qh >> @intCast(l)) & 1)) << 4;
+                    const hi: i32 = (x.qs[l] >> 4) | @as(i32, @intCast((qh >> @intCast(l + 16)) & 1)) << 4;
+                    dst[i * 32 + l] = d * @as(f32, @floatFromInt(lo - zero)) + m;
+                    dst[i * 32 + 16 + l] = d * @as(f32, @floatFromInt(hi - zero)) + m;
                 }
             }
         },
@@ -568,7 +616,11 @@ fn checkKernel(comptime t: GgmlType) !void {
             }
         }.put;
         switch (t) {
-            .q4_0, .q8_0 => sane(blk[0..2], 0.01 + r.float(f32) * 0.05),
+            .q4_0, .q5_0, .q8_0 => sane(blk[0..2], 0.01 + r.float(f32) * 0.05),
+            .q4_1, .q5_1 => {
+                sane(blk[0..2], 0.01 + r.float(f32) * 0.05);
+                sane(blk[2..4], 0.01 + r.float(f32) * 0.05);
+            },
             .q4_k, .q5_k => {
                 sane(blk[0..2], 0.01 + r.float(f32) * 0.05);
                 sane(blk[2..4], 0.01 + r.float(f32) * 0.05);
@@ -622,7 +674,7 @@ fn checkKernel(comptime t: GgmlType) !void {
 }
 
 test "quantized kernels match dequantized reference" {
-    inline for (.{ GgmlType.q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .f16, .bf16, .f32 }) |t| try checkKernel(t);
+    inline for (.{ GgmlType.q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q4_k, .q5_k, .q6_k, .f16, .bf16, .f32 }) |t| try checkKernel(t);
 }
 
 test "Q8K quantization round-trips within half a step" {

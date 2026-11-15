@@ -17,7 +17,7 @@ const Chunks = pool_mod.Chunks;
 const GgmlType = gguf.GgmlType;
 const Allocator = std.mem.Allocator;
 
-pub const Arch = enum { llama, qwen2, qwen3, lfm3 };
+pub const Arch = enum { llama, qwen2, qwen3, lfm2, lfm3, gemma3 };
 
 pub const Config = struct {
     arch: Arch,
@@ -37,11 +37,18 @@ pub const Config = struct {
     n_rot: usize,
     rope_neox: bool,
     ctx_train: usize,
-    /// Sliding-window attention layers (0 = none): window size and RoPE base.
+    /// Sliding-window attention layers (0 = none): window size and RoPE base/scale.
     swa_window: usize = 0,
     rope_base_swa: f32 = 10000,
+    rope_scale_swa: f32 = 1,
     /// Short-convolution layers (LFM): kernel length, 0 = none.
     conv_kernel: usize = 0,
+    /// Token embeddings are multiplied by this (Gemma: sqrt(dim)).
+    embd_scale: f32 = 1,
+    /// Scale of the attention logits q.k.
+    attn_scale: f32 = 1,
+    /// GELU-gated FFN (Gemma) instead of SiLU.
+    gelu: bool = false,
 };
 
 pub const Tensor = struct {
@@ -271,7 +278,7 @@ pub const Model = struct {
         const f = &self.file;
         const arch_s = f.getString("general.architecture") orelse return error.MissingArchitecture;
         const arch = std.meta.stringToEnum(Arch, arch_s) orelse {
-            std.log.err("unsupported architecture '{s}' (supported: llama, qwen2, qwen3, lfm3)", .{arch_s});
+            std.log.err("unsupported architecture '{s}' (supported: llama, qwen2, qwen3, lfm2, lfm3, gemma3)", .{arch_s});
             return error.UnsupportedArchitecture;
         };
         self.cfg.arch = arch;
@@ -309,8 +316,22 @@ pub const Model = struct {
             }
         }
         c.swa_window = @intCast(f.getUint(self.key(&kb, "attention.sliding_window")) orelse 0);
-        c.rope_base_swa = @floatCast(f.getFloat(self.key(&kb, "rope.freq_base_swa")) orelse c.rope_base);
+        // Gemma 3 local layers default to base 10000 without scaling; LFM2's
+        // windowed layers use the global RoPE.
+        c.rope_base_swa = @floatCast(f.getFloat(self.key(&kb, "rope.freq_base_swa")) orelse if (arch == .gemma3) 10000 else c.rope_base);
+        c.rope_scale_swa = if (arch == .lfm2) c.rope_scale else 1;
         c.conv_kernel = @intCast(f.getUint(self.key(&kb, "shortconv.l_cache")) orelse 0);
+        c.attn_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim)));
+        c.embd_scale = if (arch == .gemma3) @sqrt(@as(f32, @floatFromInt(c.dim))) else 1;
+        c.gelu = arch == .gemma3;
+        if (arch == .gemma3) {
+            // gemma_pytorch: the 27B scales queries by 1 / sqrt(dim / n_heads).
+            if (c.n_layers == 62) c.attn_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.dim / c.n_heads)));
+            if ((f.getFloat(self.key(&kb, "final_logit_softcapping")) orelse 0) != 0) {
+                std.log.err("gemma3: final logit soft-capping is not implemented", .{});
+                return error.UnsupportedArchitecture;
+            }
+        }
         for (0..c.n_layers) |i| {
             const kv = self.layerKvHeads(i);
             if (kv == 0 and c.conv_kernel < 2) return error.InvalidConfig;
@@ -340,8 +361,18 @@ pub const Model = struct {
     fn layerIsSwa(self: *const Model, i: usize) bool {
         if (self.cfg.swa_window == 0) return false;
         var kb: [128]u8 = undefined;
-        const a = self.file.getArray(self.key(&kb, "attention.sliding_window_pattern")) orelse return false;
-        return a.elem == .bool and i < a.len and a.item(u8, i) != 0;
+        const k = self.key(&kb, "attention.sliding_window_pattern");
+        if (self.file.getArray(k)) |a| return a.elem == .bool and i < a.len and a.item(u8, i) != 0;
+        return switch (self.cfg.arch) {
+            // Every attention layer is windowed.
+            .lfm2 => true,
+            // n - 1 local layers, then a global one (period 6 unless given).
+            .gemma3 => blk: {
+                const n = self.file.getUint(k) orelse 6;
+                break :blk n == 0 or i % n < n - 1;
+            },
+            else => false,
+        };
     }
 
     fn tensor(self: *Model, name: []const u8, cols: usize, rows: ?usize) !Tensor {
@@ -350,7 +381,7 @@ pub const Model = struct {
             return error.MissingTensor;
         };
         if (!quant.isSupported(ti.typ)) {
-            std.log.err("tensor {s}: unsupported type {d} (supported: F32 F16 BF16 Q4_0 Q8_0 Q4_K Q5_K Q6_K)", .{ name, @backingInt(ti.typ) });
+            std.log.err("tensor {s}: unsupported type {d} (supported: F32 F16 BF16 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q4_K Q5_K Q6_K)", .{ name, @backingInt(ti.typ) });
             return error.UnsupportedTensorType;
         }
         if (ti.dims[0] != cols or (rows != null and ti.dims[1] != rows.?) or ti.n_dims > 2) {
@@ -390,7 +421,8 @@ pub const Model = struct {
             try self.tensor("output.weight", c.dim, c.vocab)
         else
             self.embd;
-        self.out_norm = try self.vector(gpa, "output_norm.weight", c.dim);
+        // LFM2 names its final norm token_embd_norm.
+        self.out_norm = try self.vector(gpa, if (c.arch == .lfm2) "token_embd_norm.weight" else "output_norm.weight", c.dim);
         self.layers = try gpa.alloc(Layer, c.n_layers);
         var nb: [96]u8 = undefined;
         for (self.layers, 0..) |*L, i| {
@@ -456,10 +488,10 @@ pub const Model = struct {
         return out;
     }
 
-    fn ropeFreqs(c: *const Config, base: f32, factors: ?[]const f32, out: []f32) void {
+    fn ropeFreqs(c: *const Config, base: f32, scale: f32, factors: ?[]const f32, out: []f32) void {
         for (out, 0..) |*v, i| {
             const e = -2.0 * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(c.n_rot));
-            var w = std.math.pow(f64, base, e) * c.rope_scale;
+            var w = std.math.pow(f64, base, e) * scale;
             if (factors) |fr| w /= fr[i];
             v.* = @floatCast(w);
         }
@@ -470,10 +502,10 @@ pub const Model = struct {
         const half = c.n_rot / 2;
         self.inv_freq = try gpa.alloc(f32, half);
         // rope_freqs factors belong to the full-attention layers only.
-        ropeFreqs(c, c.rope_base, try self.optVector(gpa, "rope_freqs.weight", half), self.inv_freq);
+        ropeFreqs(c, c.rope_base, c.rope_scale, try self.optVector(gpa, "rope_freqs.weight", half), self.inv_freq);
         if (c.swa_window > 0) {
             self.inv_freq_swa = try gpa.alloc(f32, half);
-            ropeFreqs(c, c.rope_base_swa, null, self.inv_freq_swa);
+            ropeFreqs(c, c.rope_base_swa, c.rope_scale_swa, null, self.inv_freq_swa);
         }
     }
 };
@@ -628,7 +660,7 @@ fn groupsDot(comptime t: GgmlType, comptime acc: bool, w: *const Tensor, r0: usi
 fn rowsDispatch(acc: bool, w: *const Tensor, r0: usize, r1: usize, act: *const Act, t0: usize, t1: usize, out: [*]f32, ostride: usize) void {
     if (w.x8) {
         switch (w.typ) {
-            inline .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => |t| {
+            inline .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q4_k, .q5_k, .q6_k => |t| {
                 if (acc) groupsDot(t, true, w, r0, r1, act, t0, t1, out, ostride) else groupsDot(t, false, w, r0, r1, act, t0, t1, out, ostride);
             },
             else => unreachable,
@@ -636,7 +668,7 @@ fn rowsDispatch(acc: bool, w: *const Tensor, r0: usize, r1: usize, act: *const A
         return;
     }
     switch (w.typ) {
-        inline .f32, .f16, .bf16, .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => |t| {
+        inline .f32, .f16, .bf16, .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q4_k, .q5_k, .q6_k => |t| {
             if (acc) rowsDot(t, true, w, r0, r1, act, t0, t1, out, ostride) else rowsDot(t, false, w, r0, r1, act, t0, t1, out, ostride);
         },
         else => unreachable,
@@ -675,6 +707,7 @@ const FfnJob = struct {
     out: []f32,
     ntok: usize,
     rows_chunk: usize,
+    gelu: bool,
     chunks: Chunks,
 };
 
@@ -694,7 +727,8 @@ fn ffnWorker(job: *FfnJob, _: usize, _: usize) void {
             for (ts..te) |tk| {
                 const gi = g[(tk - ts) * nr ..][0..nr];
                 const ui = u[(tk - ts) * nr ..][0..nr];
-                silu_mul(job.out[tk * ffn + r0 ..][0..nr], gi, ui);
+                const o = job.out[tk * ffn + r0 ..][0..nr];
+                if (job.gelu) gelu_mul(o, gi, ui) else silu_mul(o, gi, ui);
             }
         }
     }
@@ -734,10 +768,7 @@ fn prunedFineWorker(job: *PrunedFineJob, _: usize, _: usize) void {
             const g = job.cands[i];
             const group_ptr = w.data + @as(usize, g) * w.row_bytes;
             const v8 = switch (typ) {
-                .q6_k => repack.gemm(.q6_k, 1, group_ptr, acts, w.cols)[0],
-                .q4_k => repack.gemm(.q4_k, 1, group_ptr, acts, w.cols)[0],
-                .q8_0 => repack.gemm(.q8_0, 1, group_ptr, acts, w.cols)[0],
-                .q4_0 => repack.gemm(.q4_0, 1, group_ptr, acts, w.cols)[0],
+                inline .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q4_k, .q5_k, .q6_k => |t| repack.gemm(t, 1, group_ptr, acts, w.cols)[0],
                 else => unreachable,
             };
             const out: *[8]f32 = job.logits[g * 8 ..][0..8];
@@ -773,6 +804,31 @@ fn silu_mul(out: []f32, g: []const f32, u: []const f32) void {
         out[i..][0..8].* = gv / (@as(V8f, @splat(1)) + expV(-gv)) * uv;
     }
     while (i < out.len) : (i += 1) out[i] = g[i] / (1 + @exp(-g[i])) * u[i];
+}
+
+/// GELU-gated FFN (Gemma): gelu(g) * u, tanh approximation written as
+/// x * sigmoid(2 * sqrt(2/pi) * (x + 0.044715 x^3)). The gate goes through f16
+/// on the way in and out, |x| >= 10 bypasses it: ggml's CPU table does the
+/// same, and matching it keeps greedy output identical to llama.cpp.
+fn gelu_mul(out: []f32, g: []const f32, u: []const f32) void {
+    const H = @Vector(8, f16);
+    const k0: V8f = @splat(2 * 0.79788456080286535587989211986876);
+    const k1: V8f = @splat(0.044715);
+    const one: V8f = @splat(1);
+    var i: usize = 0;
+    while (i + 8 <= out.len) : (i += 8) {
+        const x: V8f = g[i..][0..8].*;
+        const xh: V8f = @floatCast(@as(H, @floatCast(x)));
+        const gl: V8f = @floatCast(@as(H, @floatCast(xh / (one + expV(-k0 * xh * (one + k1 * xh * xh))))));
+        const y = @select(f32, x <= @as(V8f, @splat(-10)), @as(V8f, @splat(0)), @select(f32, x >= @as(V8f, @splat(10)), x, gl));
+        out[i..][0..8].* = y * @as(V8f, u[i..][0..8].*);
+    }
+    while (i < out.len) : (i += 1) {
+        const x = g[i];
+        const xh: f32 = @as(f16, @floatCast(x));
+        const gl: f32 = @as(f16, @floatCast(xh / (1 + @exp(-k0[0] * xh * (1 + k1[0] * xh * xh)))));
+        out[i] = (if (x <= -10) 0 else if (x >= 10) x else gl) * u[i];
+    }
 }
 
 fn rmsnorm(out: []f32, x: []const f32, w: []const f32, eps: f32) void {
@@ -967,7 +1023,7 @@ fn attnWorker(job: *AttnJob, _: usize, _: usize) void {
     const c = &st.model.cfg;
     const hd = c.head_dim;
     const g = c.n_heads / job.n_kv;
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const scale = c.attn_scale;
     const nq_total = job.ntok * g;
     while (job.chunks.grab()) |range| for (range[0]..range[1]) |item| {
         const kh = item / job.qblocks;
@@ -1475,7 +1531,13 @@ pub const State = struct {
         const c = &m.cfg;
         const nt = tokens.len;
         const pos0 = s.pos;
-        for (tokens, 0..) |tok, t| quant.dequantRow(m.embd.typ, m.embd.row(tok), s.x[t * c.dim ..][0..c.dim]);
+        for (tokens, 0..) |tok, t| {
+            const xt = s.x[t * c.dim ..][0..c.dim];
+            quant.dequantRow(m.embd.typ, m.embd.row(tok), xt);
+            if (c.embd_scale != 1) for (xt) |*v| {
+                v.* *= c.embd_scale;
+            };
+        }
         s.ropeTables(pos0, nt);
 
         for (m.layers) |*L| {
@@ -1495,7 +1557,7 @@ pub const State = struct {
             s.xn.prepare(quant.actKind(L.w_gate.typ), s.pool);
             s.xn.prepare(quant.actKind(L.w_up.typ), s.pool);
             const rc = rowsChunk(c.ffn_dim, s.pool.nth);
-            var fj: FfnJob = .{ .gate = &L.w_gate, .up = &L.w_up, .act = &s.xn, .out = s.hb.f, .ntok = nt, .rows_chunk = rc, .chunks = .init((c.ffn_dim + rc - 1) / rc, 1) };
+            var fj: FfnJob = .{ .gate = &L.w_gate, .up = &L.w_up, .act = &s.xn, .out = s.hb.f, .ntok = nt, .rows_chunk = rc, .gelu = c.gelu, .chunks = .init((c.ffn_dim + rc - 1) / rc, 1) };
             s.pool.run(&fj, ffnWorker);
             s.hb.reset(nt);
             const ffn_direct = L.post_ffn_norm == null;

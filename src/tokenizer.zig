@@ -253,9 +253,13 @@ pub const Tokenizer = struct {
         return self.map.get(s);
     }
 
-    /// Encode text. Special-token strings are matched when `parse_special`.
+    /// Encode text. Special-token strings are matched when `parse_special`;
+    /// then a text that already starts with the BOS string (chat templates)
+    /// gets no second BOS from `add_bos`.
     pub fn encode(self: *const Tokenizer, gpa: Allocator, text: []const u8, add_bos: bool, parse_special: bool, out: *std.ArrayList(u32)) !void {
-        if (add_bos and self.add_bos) if (self.bos) |b| try out.append(gpa, b);
+        if (add_bos and self.add_bos) if (self.bos) |b| {
+            if (!(parse_special and std.mem.startsWith(u8, text, self.vocab[b]))) try out.append(gpa, b);
+        };
         var start: usize = 0;
         var i: usize = 0;
         var first_fragment = true;
