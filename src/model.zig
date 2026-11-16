@@ -1029,11 +1029,22 @@ inline fn quantBlock32_q4(xs: *const [32]f32, q4: *[32]u8, sc: *align(1) f16) vo
     }
 }
 
+pub const max_flash_chunks: usize = 16;
+
+pub const PartialStats = struct {
+    m: [max_q]f32,
+    l: [max_q]f32,
+};
+
 /// Online-softmax attention of NQ queries against one KV head; query i sees
 /// positions [lo[i], np[i]). Writes the normalized outputs to `out`.
 /// CACHE selects f16, q8_0, or q4_0 cache layout; kt/vr are raw bytes.
 /// If window > 0, the KV cache is addressed as a ring buffer of w_tiles tiles.
 fn attendBlock(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt: [*]const u8, vr: [*]const u8, q: [NQ][*]const f32, lo: [NQ]usize, np: [NQ]usize, out: [NQ][*]f32, scale: f32, window: usize, w_tiles: usize) void {
+    attendBlockChunk(NQ, CACHE, hd, kt, vr, q, lo, np, out, scale, window, w_tiles, 0, std.math.maxInt(usize), null);
+}
+
+fn attendBlockChunk(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt: [*]const u8, vr: [*]const u8, q: [NQ][*]const f32, lo: [NQ]usize, np: [NQ]usize, out: [NQ][*]f32, scale: f32, window: usize, w_tiles: usize, tile_start: usize, tile_end: usize, partial_stats: ?*PartialStats) void {
     // f16 tile: hd*16 f16 values = hd*32 bytes.
     // q8_0 tile: hd/32 blocks of [32*16 i8 + 16 f16 scales] = hd*17 bytes.
     // q4_0 tile: hd/32 blocks of [32*8 u8 nibbles + 16 f16 scales] = hd*9 bytes.
@@ -1055,7 +1066,10 @@ fn attendBlock(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt: [*]
     }
     const ntiles = (maxnp + kv_tile - 1) / kv_tile;
 
-    for (minlo / kv_tile..ntiles) |j| {
+    const j_start = @max(minlo / kv_tile, tile_start);
+    const j_end = @min(ntiles, tile_end);
+
+    for (j_start..j_end) |j| {
         const tile_idx = if (window > 0) j % w_tiles else j;
         const tile = kt + tile_idx * tile_bytes;
         var s: [NQ]V16f = @splat(@splat(0));
@@ -1338,14 +1352,27 @@ fn attendBlock(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt: [*]
             },
         }
     }
-    inline for (0..NQ) |i| {
-        const inv: V8f = @splat(if (l[i] > 0) 1.0 / l[i] else 0);
-        var d: usize = 0;
-        while (d + 16 <= hd) : (d += 16) {
-            out[i][d..][0..8].* = @as(V8f, o[i][d..][0..8].*) * inv;
-            out[i][d + 8 ..][0..8].* = @as(V8f, o[i][d + 8 ..][0..8].*) * inv;
+    if (partial_stats) |ps| {
+        inline for (0..NQ) |i| {
+            ps.m[i] = m[i];
+            ps.l[i] = l[i];
+            var d: usize = 0;
+            while (d + 16 <= hd) : (d += 16) {
+                out[i][d..][0..8].* = o[i][d..][0..8].*;
+                out[i][d + 8 ..][0..8].* = o[i][d + 8 ..][0..8].*;
+            }
+            while (d < hd) : (d += 8) out[i][d..][0..8].* = o[i][d..][0..8].*;
         }
-        while (d < hd) : (d += 8) out[i][d..][0..8].* = @as(V8f, o[i][d..][0..8].*) * inv;
+    } else {
+        inline for (0..NQ) |i| {
+            const inv: V8f = @splat(if (l[i] > 0) 1.0 / l[i] else 0);
+            var d: usize = 0;
+            while (d + 16 <= hd) : (d += 16) {
+                out[i][d..][0..8].* = @as(V8f, o[i][d..][0..8].*) * inv;
+                out[i][d + 8 ..][0..8].* = @as(V8f, o[i][d + 8 ..][0..8].*) * inv;
+            }
+            while (d < hd) : (d += 8) out[i][d..][0..8].* = @as(V8f, o[i][d..][0..8].*) * inv;
+        }
     }
 }
 
@@ -1361,6 +1388,9 @@ const AttnJob = struct {
     block_q: usize,
     /// Query blocks per KV head.
     qblocks: usize,
+    flash_chunks: usize = 1,
+    chunk_tiles: usize = 0,
+    tile_start: usize = 0,
     chunks: Chunks,
 };
 
@@ -1372,13 +1402,23 @@ fn attnWorker(job: *AttnJob, _: usize, _: usize) void {
     const scale = c.attn_scale;
     const nq_total = job.ntok * g;
     const bq = job.block_q;
+    const is_flash = job.flash_chunks > 1;
+    const qb_total = job.qblocks * job.flash_chunks;
+
     while (job.chunks.grab()) |range| for (range[0]..range[1]) |item| {
-        const kh = item / job.qblocks;
-        const qb = item % job.qblocks;
+        const kh: usize = if (is_flash) item / qb_total else item / job.qblocks;
+        const rem: usize = if (is_flash) item % qb_total else item % job.qblocks;
+        const qb: usize = if (is_flash) rem / job.flash_chunks else rem;
+        const c_idx: usize = if (is_flash) rem % job.flash_chunks else 0;
+
         const first = qb * bq;
         const nq = @min(bq, nq_total - first);
         const kt = st.k_cache.ptr + st.cacheIndex(job.slot, kh);
         const vr = st.v_cache.ptr + st.cacheIndex(job.slot, kh);
+
+        const t_start = if (is_flash) job.tile_start + c_idx * job.chunk_tiles else 0;
+        const t_end = if (is_flash) t_start + job.chunk_tiles else std.math.maxInt(usize);
+
         switch (nq) {
             inline 1...max_q => |n| {
                 var qp: [n][*]const f32 = undefined;
@@ -1392,17 +1432,93 @@ fn attnWorker(job: *AttnJob, _: usize, _: usize) void {
                     qp[i] = st.q.ptr + t * c.q_dim + h * hd;
                     np[i] = job.pos0 + t + 1;
                     lo[i] = if (job.window > 0 and np[i] > job.window) np[i] - job.window else 0;
-                    op[i] = st.att.f.ptr + t * c.q_dim + h * hd;
+                    op[i] = if (is_flash)
+                        st.flash_o.ptr + c_idx * c.q_dim + h * hd
+                    else
+                        st.att.f.ptr + t * c.q_dim + h * hd;
                 }
-                switch (st.cache_type) {
-                    .f16 => attendBlock(n, .f16, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles),
-                    .q8_0 => attendBlock(n, .q8_0, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles),
-                    .q4_0 => attendBlock(n, .q4_0, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles),
+                if (is_flash) {
+                    var ps: PartialStats = undefined;
+                    switch (st.cache_type) {
+                        .f16 => attendBlockChunk(n, .f16, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles, t_start, t_end, &ps),
+                        .q8_0 => attendBlockChunk(n, .q8_0, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles, t_start, t_end, &ps),
+                        .q4_0 => attendBlockChunk(n, .q4_0, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles, t_start, t_end, &ps),
+                    }
+                    inline for (0..n) |i| {
+                        const h = kh * g + (first + i) % g;
+                        st.flash_m[c_idx * c.n_heads + h] = ps.m[i];
+                        st.flash_l[c_idx * c.n_heads + h] = ps.l[i];
+                    }
+                } else {
+                    switch (st.cache_type) {
+                        .f16 => attendBlockChunk(n, .f16, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles, 0, std.math.maxInt(usize), null),
+                        .q8_0 => attendBlockChunk(n, .q8_0, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles, 0, std.math.maxInt(usize), null),
+                        .q4_0 => attendBlockChunk(n, .q4_0, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles, 0, std.math.maxInt(usize), null),
+                    }
                 }
             },
             else => unreachable,
         }
     };
+}
+
+fn reduceFlashDecoding(s: *State, n_chunks: usize) void {
+    const c = &s.model.cfg;
+    const hd = c.head_dim;
+    for (0..c.n_heads) |h| {
+        var max_m: f32 = -std.math.inf(f32);
+        for (0..n_chunks) |ci| {
+            max_m = @max(max_m, s.flash_m[ci * c.n_heads + h]);
+        }
+
+        if (max_m == -std.math.inf(f32)) {
+            @memset(s.att.f[h * hd ..][0..hd], 0);
+            continue;
+        }
+
+        var total_l: f32 = 0;
+        var alpha: [max_flash_chunks]f32 = undefined;
+        for (0..n_chunks) |ci| {
+            const mc = s.flash_m[ci * c.n_heads + h];
+            if (mc > -std.math.inf(f32)) {
+                const a = @exp(mc - max_m);
+                alpha[ci] = a;
+                total_l += s.flash_l[ci * c.n_heads + h] * a;
+            } else {
+                alpha[ci] = 0;
+            }
+        }
+
+        const inv_l: V8f = @splat(if (total_l > 0) 1.0 / total_l else 0.0);
+        const out_ptr = s.att.f.ptr + h * hd;
+
+        var d: usize = 0;
+        while (d + 16 <= hd) : (d += 16) {
+            var acc0: V8f = @splat(0);
+            var acc1: V8f = @splat(0);
+            for (0..n_chunks) |ci| {
+                const a = alpha[ci];
+                if (a == 0) continue;
+                const av: V8f = @splat(a);
+                const chunk_ptr = s.flash_o.ptr + ci * c.q_dim + h * hd + d;
+                acc0 = @mulAdd(V8f, av, chunk_ptr[0..8].*, acc0);
+                acc1 = @mulAdd(V8f, av, (chunk_ptr + 8)[0..8].*, acc1);
+            }
+            out_ptr[d..][0..8].* = acc0 * inv_l;
+            (out_ptr + d + 8)[0..8].* = acc1 * inv_l;
+        }
+        while (d < hd) : (d += 8) {
+            var acc: V8f = @splat(0);
+            for (0..n_chunks) |ci| {
+                const a = alpha[ci];
+                if (a == 0) continue;
+                const av: V8f = @splat(a);
+                const chunk_ptr = s.flash_o.ptr + ci * c.q_dim + h * hd + d;
+                acc = @mulAdd(V8f, av, chunk_ptr[0..8].*, acc);
+            }
+            out_ptr[d..][0..8].* = acc * inv_l;
+        }
+    }
 }
 
 pub const State = struct {
@@ -1444,6 +1560,10 @@ pub const State = struct {
     tmp: []f32,
     /// Per-head attention gate logits [bmax][n_heads].
     gate: []f32,
+    /// FlashDecoding partial outputs and accumulators [max_flash_chunks][q_dim]
+    flash_o: []f32,
+    flash_m: []f32,
+    flash_l: []f32,
     /// Short conv: in_proj output [bmax][3*dim], input history
     /// [(kernel-1) + bmax][dim], and the last kernel-1 inputs of every conv layer.
     conv_in: []f32,
@@ -1490,6 +1610,9 @@ pub const State = struct {
             .{ "conv_hist", if (has_conv) (hist + batch_cap) * c.dim else 0 },
             .{ "conv_state", model.n_conv_layers * hist * c.dim },
             .{ "conv_checkpoint", if (has_conv) (max_spec + 1) * model.n_conv_layers * hist * c.dim else 0 },
+            .{ "flash_o", max_flash_chunks * c.q_dim },
+            .{ "flash_m", max_flash_chunks * c.n_heads },
+            .{ "flash_l", max_flash_chunks * c.n_heads },
         };
         var done: usize = 0;
         errdefer inline for (bufs, 0..) |b, i| {
@@ -1553,7 +1676,7 @@ pub const State = struct {
         s.xn.deinit(gpa);
         s.att.deinit(gpa);
         s.hb.deinit(gpa);
-        inline for (.{ "x", "q", "k", "v", "logits", "rope_cs", "rope_cs_swa", "tmp", "gate", "conv_in", "conv_hist", "conv_state", "conv_checkpoint" }) |name| gpa.free(@field(s, name));
+        inline for (.{ "x", "q", "k", "v", "logits", "rope_cs", "rope_cs_swa", "tmp", "gate", "conv_in", "conv_hist", "conv_state", "conv_checkpoint", "flash_o", "flash_m", "flash_l" }) |name| gpa.free(@field(s, name));
         gpa.free(s.slot_offsets);
         gpa.free(s.slot_strides);
         gpa.free(s.slot_tiles);
@@ -1793,7 +1916,27 @@ pub const State = struct {
             bq /= 2;
         }
         const qblocks = (nt * g + bq - 1) / bq;
-        const total_items = A.n_kv_heads * qblocks;
+        var total_items = A.n_kv_heads * qblocks;
+        var flash_chunks: usize = 1;
+        var chunk_tiles: usize = 0;
+        var tile_start: usize = 0;
+
+        if (nt == 1 and s.pool.nth > 1) {
+            const np = pos0 + 1;
+            const lo = if (is_swa and np > c.swa_window) np - c.swa_window else 0;
+            tile_start = lo / kv_tile;
+            const tile_end = (np + kv_tile - 1) / kv_tile;
+            const total_tiles = if (tile_end > tile_start) tile_end - tile_start else 0;
+            if (total_tiles >= 32) {
+                const target_tiles: usize = 16;
+                flash_chunks = std.math.clamp((total_tiles + target_tiles - 1) / target_tiles, 1, max_flash_chunks);
+                if (flash_chunks > 1) {
+                    chunk_tiles = (total_tiles + flash_chunks - 1) / flash_chunks;
+                    total_items = A.n_kv_heads * qblocks * flash_chunks;
+                }
+            }
+        }
+
         const chunk = if (s.pool.nth > 1) std.math.clamp(total_items / (s.pool.nth * 4), 1, 8) else 1;
         var aj: AttnJob = .{
             .st = s,
@@ -1805,9 +1948,16 @@ pub const State = struct {
             .ntok = nt,
             .block_q = bq,
             .qblocks = qblocks,
+            .flash_chunks = flash_chunks,
+            .chunk_tiles = chunk_tiles,
+            .tile_start = tile_start,
             .chunks = .init(total_items, chunk),
         };
         s.pool.run(&aj, attnWorker);
+
+        if (flash_chunks > 1) {
+            reduceFlashDecoding(s, flash_chunks);
+        }
 
         if (A.gate != null) {
             for (0..nt) |t| for (0..c.n_heads) |h| {
@@ -2671,6 +2821,151 @@ test "SWA ring buffer attention matches linear reference" {
             var want: f64 = 0;
             for (lo[i]..np[i]) |p| want += s[p] / sum * vf_q[p][d];
             try std.testing.expectApproxEqAbs(want, out_q[i][d], 1e-4);
+        }
+    }
+}
+
+test "FlashDecoding chunked attention matches unchunked reference across cache formats" {
+    var prng = std.Random.DefaultPrng.init(12345);
+    const r = prng.random();
+    const hd = 128;
+    const npos = 128; // 8 tiles
+    const ntiles = (npos + kv_tile - 1) / kv_tile;
+
+    // Test across all cache types
+    inline for (.{ CacheType.f16, CacheType.q8_0, CacheType.q4_0 }) |cache_type| {
+        const tile_bytes: usize = switch (cache_type) {
+            .f16 => hd * 32,
+            .q8_0 => hd * 17,
+            .q4_0 => hd * 9,
+        };
+        var kt_buf: [ntiles * (hd * 32)]u8 align(32) = undefined;
+        var vr_buf: [ntiles * (hd * 32)]u8 align(32) = undefined;
+        const kt = kt_buf[0 .. ntiles * tile_bytes];
+        const vr = vr_buf[0 .. ntiles * tile_bytes];
+        @memset(kt, 0);
+        @memset(vr, 0);
+
+        var ksrc: [npos][hd]f32 = undefined;
+        var vsrc: [npos][hd]f32 = undefined;
+        for (&ksrc) |*row| for (row) |*x| {
+            x.* = r.floatNorm(f32);
+        };
+        for (&vsrc) |*row| for (row) |*x| {
+            x.* = r.floatNorm(f32);
+        };
+
+        const nblocks = hd / 32;
+        switch (cache_type) {
+            .f16 => {
+                const kt_f16: [*]f16 = @ptrCast(@alignCast(kt.ptr));
+                const vr_f16: [*]f16 = @ptrCast(@alignCast(vr.ptr));
+                for (0..npos) |p| {
+                    const tile = p / kv_tile;
+                    const pl = p % kv_tile;
+                    for (0..hd) |d| {
+                        kt_f16[tile * hd * kv_tile + d * kv_tile + pl] = @floatCast(ksrc[p][d]);
+                        vr_f16[tile * hd * kv_tile + pl * hd + d] = @floatCast(vsrc[p][d]);
+                    }
+                }
+            },
+            .q8_0 => {
+                for (0..npos) |p| {
+                    const tile = p / kv_tile;
+                    const pl = p % kv_tile;
+                    for (0..nblocks) |b| {
+                        quantBlock32(ksrc[p][b * 32 ..][0..32], kt.ptr + tile * tile_bytes + b * 544 + pl, kv_tile, @ptrCast(kt.ptr + tile * tile_bytes + b * 544 + 512 + pl * 2));
+                        quantBlock32(vsrc[p][b * 32 ..][0..32], vr.ptr + tile * tile_bytes + pl * hd + b * 32, 1, @ptrCast(vr.ptr + tile * tile_bytes + 16 * hd + b * 32 + pl * 2));
+                    }
+                }
+            },
+            .q4_0 => {
+                for (0..npos) |p| {
+                    const tile = p / kv_tile;
+                    const pl = p % kv_tile;
+                    for (0..nblocks) |b| {
+                        var q4_k: [32]u8 = undefined;
+                        var sc_k: f16 = undefined;
+                        quantBlock32_q4(ksrc[p][b * 32 ..][0..32], &q4_k, &sc_k);
+
+                        const k_bp = kt.ptr + tile * tile_bytes + b * 288;
+                        if (pl == 0) @memset(k_bp[0..256], 0);
+                        @as(*align(1) f16, @ptrCast(k_bp + 256 + pl * 2)).* = sc_k;
+                        if (pl < 8) {
+                            inline for (0..32) |dp| {
+                                k_bp[dp * 8 + pl] = (k_bp[dp * 8 + pl] & 0xF0) | q4_k[dp];
+                            }
+                        } else {
+                            inline for (0..32) |dp| {
+                                k_bp[dp * 8 + (pl - 8)] = (k_bp[dp * 8 + (pl - 8)] & 0x0F) | (q4_k[dp] << 4);
+                            }
+                        }
+
+                        var q4_v: [32]u8 = undefined;
+                        var sc_v: f16 = undefined;
+                        quantBlock32_q4(vsrc[p][b * 32 ..][0..32], &q4_v, &sc_v);
+
+                        const vt = vr.ptr + tile * tile_bytes;
+                        @as(*align(1) f16, @ptrCast(vt + 8 * hd + b * 32 + pl * 2)).* = sc_v;
+                        const v_dst = vt + pl * (hd / 2) + b * 16;
+                        const q_lo: @Vector(8, u8) = q4_v[0..8].*;
+                        const q_hi: @Vector(8, u8) = q4_v[8..16].*;
+                        const v0: [8]u8 = q_lo | (q_hi << @as(@Vector(8, u8), @splat(4)));
+                        const q_lo2: @Vector(8, u8) = q4_v[16..24].*;
+                        const q_hi2: @Vector(8, u8) = q4_v[24..32].*;
+                        const v1: [8]u8 = q_lo2 | (q_hi2 << @as(@Vector(8, u8), @splat(4)));
+                        @memcpy(v_dst[0..8], &v0);
+                        @memcpy(v_dst[8..16], &v1);
+                    }
+                }
+            },
+        }
+
+        var q: [hd]f32 = undefined;
+        for (&q) |*x| {
+            x.* = r.floatNorm(f32) * 2;
+        }
+        const lo = [1]usize{0};
+        const np = [1]usize{npos};
+        var ref_out: [1][hd]f32 = undefined;
+        const scale: f32 = 0.125;
+        attendBlock(1, cache_type, hd, kt.ptr, vr.ptr, .{&q}, lo, np, .{&ref_out[0]}, scale, 0, 0);
+
+        // Test with 2, 4, and 8 chunks
+        inline for (.{ 2, 4, 8 }) |n_chunks| {
+            var chunk_out: [n_chunks][hd]f32 = undefined;
+            var ps: [n_chunks]PartialStats = undefined;
+            const chunk_tiles = (ntiles + n_chunks - 1) / n_chunks;
+            for (0..n_chunks) |c_idx| {
+                const t_start = c_idx * chunk_tiles;
+                const t_end = t_start + chunk_tiles;
+                attendBlockChunk(1, cache_type, hd, kt.ptr, vr.ptr, .{&q}, lo, np, .{&chunk_out[c_idx]}, scale, 0, 0, t_start, t_end, &ps[c_idx]);
+            }
+            // Reduction across chunks
+            var max_m: f32 = -std.math.inf(f32);
+            for (0..n_chunks) |c_idx| {
+                max_m = @max(max_m, ps[c_idx].m[0]);
+            }
+            var total_l: f32 = 0;
+            var alpha: [n_chunks]f32 = undefined;
+            for (0..n_chunks) |c_idx| {
+                if (ps[c_idx].m[0] > -std.math.inf(f32)) {
+                    const a = @exp(ps[c_idx].m[0] - max_m);
+                    alpha[c_idx] = a;
+                    total_l += ps[c_idx].l[0] * a;
+                } else {
+                    alpha[c_idx] = 0;
+                }
+            }
+            const inv_l = if (total_l > 0) 1.0 / total_l else 0.0;
+            for (0..hd) |d| {
+                var acc: f32 = 0;
+                for (0..n_chunks) |c_idx| {
+                    if (alpha[c_idx] > 0) acc += alpha[c_idx] * chunk_out[c_idx][d];
+                }
+                const got = acc * inv_l;
+                try std.testing.expectApproxEqAbs(ref_out[0][d], got, 1e-4);
+            }
         }
     }
 }
