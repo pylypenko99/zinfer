@@ -1853,7 +1853,7 @@ pub const State = struct {
             for (s.x[t * c.dim ..][0..c.dim], y) |*a, b| a.* += b;
         }
     }
-    fn outputCoarseToFine(s: *State) void {
+    fn outputCoarseToFine(s: *State, t: usize) void {
         const m = s.model;
         const w = &m.output;
         const typ = w.typ;
@@ -1862,15 +1862,15 @@ pub const State = struct {
         const kind = quant.actKind(typ);
         s.xn.prepare(kind, s.pool);
         const act_ptr: [*]const u8 = switch (kind) {
-            .q8k => @ptrCast(s.xn.q8k.ptr),
-            .q8b => @ptrCast(s.xn.q8b.ptr),
-            .f32 => @ptrCast(s.xn.f.ptr),
+            .q8k => s.xn.rowPtr(.q8k, t),
+            .q8b => s.xn.rowPtr(.q8b, t),
+            .f32 => s.xn.rowPtr(.f32, t),
         };
 
         // 1. Parallel coarse pass over all groups: 2-bit weights x Q8B activations.
         s.xn.prepare(.q8b, s.pool);
         const nb = w.cols / 32;
-        const q8b = s.xn.q8b[0..nb];
+        const q8b = s.xn.q8b[t * nb ..][0..nb];
         var sum_s: f32 = 0;
         for (q8b) |b| sum_s += b.s;
         var c_job: CoarseJob = .{
@@ -1941,14 +1941,15 @@ pub const State = struct {
             }
         }
 
-        @memset(s.logits[0..m.cfg.vocab], -std.math.inf(f32));
+        const l_out = s.logits.ptr + t * m.cfg.vocab;
+        @memset(l_out[0..m.cfg.vocab], -std.math.inf(f32));
 
         // 3. Parallel fine pass only on candidate groups
         var f_job: PrunedFineJob = .{
             .w = w,
             .act_ptr = act_ptr,
             .cands = s.cands[0..actual_cands],
-            .logits = s.logits.ptr,
+            .logits = l_out,
             .chunks = .init(actual_cands, 32),
         };
         s.pool.run(&f_job, prunedFineWorker);
@@ -2080,8 +2081,8 @@ pub const State = struct {
             const start = tokens.len - n_logits;
             const out_kind = quant.actKind(m.output.typ);
             s.fusedNorm(n_logits, s.x.ptr + start * c.dim, m.out_norm, out_kind);
-            if (n_logits == 1 and m.output_coarse != null) {
-                s.outputCoarseToFine();
+            if (m.output_coarse != null) {
+                for (0..n_logits) |t| s.outputCoarseToFine(t);
             } else {
                 s.matmul(&.{.{ .w = &m.output, .out = s.logits.ptr, .stride = c.vocab }}, &s.xn);
             }

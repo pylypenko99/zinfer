@@ -121,7 +121,25 @@ pub const PromptLookup = struct {
         if (history.len < 4 or max_k == 0) return 0;
         const k = @min(max_k, out.len);
 
-        // 1. Try 3-gram match first
+        // 1. Try 4-gram match first (highest confidence)
+        if (history.len >= 8) {
+            const target = history[history.len - 4 ..][0..4];
+            const search_len = history.len - 4;
+            var idx: usize = search_len - 4 + 1;
+            while (idx > 0) {
+                idx -= 1;
+                if (std.mem.eql(u32, history[idx .. idx + 4], target)) {
+                    const start = idx + 4;
+                    const avail = @min(k, search_len - start);
+                    if (avail > 0) {
+                        @memcpy(out[0..avail], history[start .. start + avail]);
+                        return avail;
+                    }
+                }
+            }
+        }
+
+        // 2. Try 3-gram match
         if (history.len >= 6) {
             const target = history[history.len - 3 ..][0..3];
             const search_len = history.len - 3;
@@ -139,7 +157,7 @@ pub const PromptLookup = struct {
             }
         }
 
-        // 2. Try 2-gram match
+        // 3. Try 2-gram match (draft at most 2 tokens to avoid false divergence)
         if (history.len >= 4) {
             const target = history[history.len - 2 ..][0..2];
             const search_len = history.len - 2;
@@ -148,7 +166,7 @@ pub const PromptLookup = struct {
                 idx -= 1;
                 if (std.mem.eql(u32, history[idx .. idx + 2], target)) {
                     const start = idx + 2;
-                    const avail = @min(k, search_len - start);
+                    const avail = @min(@min(k, 2), search_len - start);
                     if (avail > 0) {
                         @memcpy(out[0..avail], history[start .. start + avail]);
                         return avail;
@@ -172,6 +190,11 @@ test "PromptLookup finds continuation of matching 3-gram and 2-gram" {
     const n2 = PromptLookup.find(&hist2, 2, &draft);
     try std.testing.expectEqual(2, n2);
     try std.testing.expectEqualSlices(u32, &.{ 88, 99 }, draft[0..2]);
+
+    const hist4 = [_]u32{ 10, 20, 30, 40, 50, 60, 70, 99, 10, 20, 30, 40 };
+    const n4 = PromptLookup.find(&hist4, 3, &draft);
+    try std.testing.expectEqual(3, n4);
+    try std.testing.expectEqualSlices(u32, &.{ 50, 60, 70 }, draft[0..3]);
 }
 
 const V8f = @Vector(8, f32);
