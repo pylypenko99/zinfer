@@ -45,6 +45,8 @@ pub const Gen = struct {
     smp: *sampler_mod.Sampler,
     /// Speculative lookahead: n-gram prompt lookup, or the draft model if set.
     draft_k: usize = 0,
+    /// Whether to dynamically tune lookahead based on real-time acceptance rate.
+    draft_adaptive: bool = true,
     /// Draft model state and sampler; between rounds its cache mirrors `st`.
     draft_st: ?*model_mod.State = null,
     draft_smp: ?*sampler_mod.Sampler = null,
@@ -291,6 +293,55 @@ pub const Gen = struct {
         return logits;
     }
 
+    pub const AdaptiveDraft = struct {
+        cur_k: usize,
+        max_k: usize,
+        min_k: usize = 1,
+        consecutive_rejections: usize = 0,
+        cooldown_steps: usize = 0,
+
+        pub fn init(max_k: usize) AdaptiveDraft {
+            return .{
+                .cur_k = @min(max_k, 3),
+                .max_k = max_k,
+            };
+        }
+
+        /// Returns target draft length for this round (0 = skip drafting).
+        pub fn nextDraft(self: *AdaptiveDraft) usize {
+            if (self.cooldown_steps > 0) {
+                self.cooldown_steps -= 1;
+                return 0;
+            }
+            return self.cur_k;
+        }
+
+        /// Feedback update after verification round.
+        pub fn update(self: *AdaptiveDraft, accepted: usize, drafted: usize) void {
+            if (drafted == 0) return;
+
+            if (accepted == drafted) {
+                self.consecutive_rejections = 0;
+                if (self.cur_k < self.max_k) self.cur_k += 1;
+            } else if (accepted > 0) {
+                self.consecutive_rejections = 0;
+                if (accepted * 2 < drafted and self.cur_k > self.min_k) {
+                    self.cur_k -= 1;
+                }
+            } else {
+                self.consecutive_rejections += 1;
+                if (self.cur_k > self.min_k) {
+                    self.cur_k -= 1;
+                }
+                if (self.consecutive_rejections >= 2) {
+                    self.cooldown_steps = 2;
+                    self.consecutive_rejections = 0;
+                    self.cur_k = @min(self.max_k, 2);
+                }
+            }
+        }
+    };
+
     fn decode(g: *Gen, prompt: []const u32, keep: usize, snapshot: bool, n: usize, sink: anytype, history: *std.ArrayList(u32)) !?u32 {
         var timer: Timer = .start(g.io);
         const feed = prompt[keep..];
@@ -323,15 +374,18 @@ pub const Gen = struct {
         const max_spec_draft = model_mod.max_spec - 1;
         var draft_buf: [max_spec_draft]u32 = undefined;
         var cand_buf: [model_mod.max_spec]u32 = undefined;
+        var adaptive: AdaptiveDraft = .init(g.draft_k);
 
         while (n_run < n and g.st.pos < g.st.ctx) {
-            const max_draft = @min(g.draft_k, max_spec_draft);
+            const current_max_k = if (g.draft_adaptive) adaptive.nextDraft() else g.draft_k;
+            const max_draft = @min(current_max_k, max_spec_draft);
             const d = g.draft_st;
             // Invariant at round start: the draft cache ends just before
             // cur_tok, mirroring the target cache.
             const k = blk: {
+                if (max_draft == 0) break :blk 0;
                 if (d) |dst| {
-                    if (max_draft == 0 or g.st.pos + max_draft + 1 > g.st.ctx or dst.pos + max_draft + 1 > dst.ctx)
+                    if (g.st.pos + max_draft + 1 > g.st.ctx or dst.pos + max_draft + 1 > dst.ctx)
                         break :blk 0;
                     // Autoregressive draft: feed cur_tok, then each sampled
                     // token. Stop early on EOG (the target rejects it anyway).
@@ -345,7 +399,7 @@ pub const Gen = struct {
                     }
                     break :blk produced;
                 }
-                if (max_draft > 0 and g.st.pos + max_draft + 2 <= g.st.ctx)
+                if (g.st.pos + max_draft + 2 <= g.st.ctx)
                     break :blk sampler_mod.PromptLookup.find(history.items, max_draft, &draft_buf);
                 break :blk 0;
             };
@@ -387,6 +441,8 @@ pub const Gen = struct {
                         break;
                     }
                 }
+
+                if (g.draft_adaptive) adaptive.update(accepted_count, k);
 
                 if (next_cur == null) {
                     const l = all_logits[k * vocab ..][0..vocab];
@@ -632,4 +688,35 @@ test "saveCache and loadCache roundtrip" {
     st2.model = &model;
     st2.ctx = 16;
     try std.testing.expectError(error.ContextFull, g2.loadCache(test_cache_path));
+}
+
+test "AdaptiveDraft feedback control" {
+    var ad = Gen.AdaptiveDraft.init(5);
+    try std.testing.expectEqual(@as(usize, 3), ad.nextDraft());
+
+    // Perfect round: 3/3 accepted -> grows to 4
+    ad.update(3, 3);
+    try std.testing.expectEqual(@as(usize, 4), ad.nextDraft());
+
+    // Perfect round: 4/4 accepted -> grows to 5 (max)
+    ad.update(4, 4);
+    try std.testing.expectEqual(@as(usize, 5), ad.nextDraft());
+
+    // Partial success: 3/5 accepted -> stays 5
+    ad.update(3, 5);
+    try std.testing.expectEqual(@as(usize, 5), ad.nextDraft());
+
+    // Low acceptance: 1/5 accepted (< 5/2) -> drops to 4
+    ad.update(1, 5);
+    try std.testing.expectEqual(@as(usize, 4), ad.nextDraft());
+
+    // 0 accepted -> drops to 3
+    ad.update(0, 4);
+    try std.testing.expectEqual(@as(usize, 3), ad.nextDraft());
+
+    // 0 accepted second time in a row -> triggers cooldown for 2 steps!
+    ad.update(0, 3);
+    try std.testing.expectEqual(@as(usize, 0), ad.nextDraft()); // cooldown step 1
+    try std.testing.expectEqual(@as(usize, 0), ad.nextDraft()); // cooldown step 2
+    try std.testing.expectEqual(@as(usize, 2), ad.nextDraft()); // resumes with cautious probe k=2
 }

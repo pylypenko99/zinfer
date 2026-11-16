@@ -39,6 +39,7 @@ const usage =
     \\  --draft N             n-gram prompt lookup draft tokens, 0 = off (default 0, 3-5 recommended)
     \\  --draft-model PATH    small model as draft; --draft sets lookahead (default 3)
     \\                        (draft must share the target's tokenizer)
+    \\  --no-adaptive-draft   disable real-time dynamic draft length adaptation
     \\
     \\  --server              run OpenAI / llama.cpp-compatible HTTP server
     \\  --port N              server port (default 8080; implies --server)
@@ -76,6 +77,7 @@ const Args = struct {
     port: u16 = 8080,
     draft: usize = 0,
     draft_model: ?[]const u8 = null,
+    draft_adaptive: bool = true,
     threads: usize = 0,
     pin: bool = true,
     ctx: usize = 0,
@@ -160,6 +162,10 @@ fn parseArgs(argv: []const [:0]const u8) Args {
             a.draft = r.uint();
         } else if (r.is(&.{"--draft-model"})) {
             a.draft_model = r.str();
+        } else if (r.is(&.{"--no-adaptive-draft"})) {
+            a.draft_adaptive = false;
+        } else if (r.is(&.{"--draft-adaptive"})) {
+            a.draft_adaptive = true;
         } else if (r.is(&.{"--server"})) {
             a.server = true;
         } else if (r.is(&.{"--port"})) {
@@ -314,6 +320,7 @@ pub fn main(init: std.process.Init) !void {
         .tok = &tok,
         .smp = &smp,
         .draft_k = args.draft,
+        .draft_adaptive = args.draft_adaptive,
         .draft_st = if (draft_st) |*d| d else null,
         .draft_smp = if (draft_smp) |*d| d else null,
     };
