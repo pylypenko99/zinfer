@@ -207,6 +207,73 @@ inline fn prefetchAhead(blk: [*]const u8, comptime block_bytes: usize) void {
 // Kernels: one 8-row group (nb x8 blocks) against NT activation rows.
 // Result lane r is row r.
 
+fn gemvK45(comptime is5: bool, w: [*]const u8, act: [*]const Q8K, nb: usize) V8f {
+    @setEvalBranchQuota(100_000);
+    const BS = if (is5) 1440 else 1184;
+    const qs_off = if (is5) 416 else 160;
+    const flush_every = if (is5) 4 else 8;
+    var out: V8f = @splat(0);
+    for (0..nb) |b| {
+        const blk = w + b * BS;
+        prefetchAhead(blk, BS);
+        const y = &act[b];
+        var acc: V8i32 = @splat(0);
+        inline for (0..4) |c| {
+            const scl = dupU8(blk + 32 + (2 * c) * 8);
+            const sch = dupU8(blk + 32 + (2 * c + 1) * 8);
+            const mlo: V32u8 = @splat(@as(u8, 1) << @intCast(2 * c));
+            const mhi: V32u8 = @splat(@as(u8, 2) << @intCast(2 * c));
+            inline for (0..8 / flush_every) |f| {
+                var slo0: V16i16 = @splat(0);
+                var slo1: V16i16 = @splat(0);
+                var shi0: V16i16 = @splat(0);
+                var shi1: V16i16 = @splat(0);
+                inline for (0..flush_every / 2) |pair| {
+                    const k0 = f * flush_every + pair * 2;
+                    const k1 = k0 + 1;
+
+                    const wv0 = load32(blk + qs_off + (c * 8 + k0) * 32);
+                    const wv1 = load32(blk + qs_off + (c * 8 + k1) * 32);
+                    var lo0 = wv0 & m4;
+                    var hi0 = wv0 >> @splat(4);
+                    var lo1 = wv1 & m4;
+                    var hi1 = wv1 >> @splat(4);
+
+                    if (is5) {
+                        const sixteen: V32u8 = @splat(16);
+                        const zero: V32u8 = @splat(0);
+                        const h0 = load32(blk + 160 + k0 * 32);
+                        const h1 = load32(blk + 160 + k1 * 32);
+                        lo0 |= @select(u8, (h0 & mlo) == mlo, sixteen, zero);
+                        hi0 |= @select(u8, (h0 & mhi) == mhi, sixteen, zero);
+                        lo1 |= @select(u8, (h1 & mlo) == mlo, sixteen, zero);
+                        hi1 |= @select(u8, (h1 & mhi) == mhi, sixteen, zero);
+                    }
+
+                    slo0 +%= maddubs(lo0, bc4(y.qs[64 * c + 4 * k0 ..].ptr));
+                    shi0 +%= maddubs(hi0, bc4(y.qs[64 * c + 32 + 4 * k0 ..].ptr));
+                    slo1 +%= maddubs(lo1, bc4(y.qs[64 * c + 4 * k1 ..].ptr));
+                    shi1 +%= maddubs(hi1, bc4(y.qs[64 * c + 32 + 4 * k1 ..].ptr));
+                }
+                const slo = slo0 +% slo1;
+                const shi = shi0 +% shi1;
+                acc += maddwd(slo, scl) + maddwd(shi, sch);
+            }
+        }
+        var mm: V8i32 = @splat(0);
+        inline for (0..4) |p| {
+            const mp = pairU8(blk + 96 + 2 * p * 8);
+            mm += maddwd(mp, @bitCast(bc4(@ptrCast(&y.bsums32[2 * p]))));
+        }
+        const d8 = halfs(blk);
+        const dmin8 = halfs(blk + 16);
+        const yd: V8f = @splat(y.d);
+        out = @mulAdd(V8f, d8 * yd, toF(acc), out);
+        out = @mulAdd(V8f, -dmin8 * yd, toF(mm), out);
+    }
+    return out;
+}
+
 fn gemmK45(comptime is5: bool, comptime NT: usize, w: [*]const u8, acts: [NT][*]const Q8K, nb: usize) [NT]V8f {
     @setEvalBranchQuota(100_000);
     const BS = if (is5) 1440 else 1184;
@@ -281,6 +348,46 @@ inline fn q6(comptime m: usize, la: V32u8, lb: V32u8, h: V32u8) V32u8 {
     };
 }
 
+fn gemvQ6K(w: [*]const u8, act: [*]const Q8K, nb: usize) V8f {
+    @setEvalBranchQuota(100_000);
+    var out: V8f = @splat(0);
+    for (0..nb) |b| {
+        const blk = w + b * 1696;
+        prefetchAhead(blk, 1696);
+        const y = &act[b];
+        var acc: V8i32 = @splat(0);
+        inline for (0..8) |p| {
+            const sp = pairI8(blk + 32 + 2 * p * 8);
+            acc -%= maddwd(sp, @bitCast(bc4(@ptrCast(&y.bsums[2 * p])))) << @splat(5);
+        }
+        inline for (0..2) |n| {
+            inline for (0..2) |kh| {
+                var sc: [4]V16i16 = undefined;
+                inline for (0..4) |m| sc[m] = dupI8(blk + 32 + (8 * n + 2 * m + kh) * 8);
+                inline for (0..2) |kp| {
+                    const k = kh * 4 + 2 * kp;
+                    const b0 = blk + 160 + (n * 8 + k) * 96;
+                    const la0 = load32(b0);
+                    const lb0 = load32(b0 + 32);
+                    const h0 = load32(b0 + 64);
+                    const la1 = load32(b0 + 96);
+                    const lb1 = load32(b0 + 128);
+                    const h1 = load32(b0 + 160);
+                    inline for (0..4) |m| {
+                        const q0 = q6(m, la0, lb0, h0);
+                        const q1 = q6(m, la1, lb1, h1);
+                        const a = y.qs[128 * n + 32 * m + 4 * k ..];
+                        acc += maddwd(maddubs(q0, bc4(a.ptr)) +% maddubs(q1, bc4(a.ptr + 4)), sc[m]);
+                    }
+                }
+            }
+        }
+        const d8 = halfs(blk);
+        out = @mulAdd(V8f, d8 * @as(V8f, @splat(y.d)), toF(acc), out);
+    }
+    return out;
+}
+
 fn gemmQ6K(comptime NT: usize, w: [*]const u8, acts: [NT][*]const Q8K, nb: usize) [NT]V8f {
     @setEvalBranchQuota(100_000);
     var out: [NT]V8f = @splat(@splat(0));
@@ -332,6 +439,43 @@ fn gemmQ6K(comptime NT: usize, w: [*]const u8, acts: [NT][*]const Q8K, nb: usize
 
 /// Q4_0, Q4_1, Q5_0, Q5_1: 32-value blocks, one scale per row, plus a min
 /// (Q4_1, Q5_1) or a zero point of 8 / 16 folded into the scale.
+fn gemvLegacy(comptime t: GgmlType, w: [*]const u8, act: [*]const Q8B, nb: usize) V8f {
+    @setEvalBranchQuota(100_000);
+    const has_m = t == .q4_1 or t == .q5_1;
+    const has_h = t == .q5_0 or t == .q5_1;
+    const BS = comptime blockBytes(t);
+    const qh_off = if (has_m) 32 else 16;
+    const qs_off = qh_off + if (has_h) 32 else 0;
+    const sixteen: V32u8 = @splat(0x10);
+    const zero: V32u8 = @splat(0);
+    var out: V8f = @splat(0);
+    for (0..nb) |b| {
+        const blk = w + b * BS;
+        prefetchAhead(blk, BS);
+        const y = &act[b];
+        var s: V16i16 = @splat(0);
+        var acc: V8i32 = @splat(0);
+        inline for (0..4) |k| {
+            const wv = load32(blk + qs_off + k * 32);
+            var lo = wv & m4;
+            var hi = wv >> @splat(4);
+            if (has_h) {
+                const hb = spreadRows(blk + qh_off + k * 8);
+                lo |= @select(u8, (hb & h_lo) == h_lo, sixteen, zero);
+                hi |= @select(u8, (hb & h_hi) == h_hi, sixteen, zero);
+            }
+            const p = maddubs(lo, bc4(y.qs[4 * k ..].ptr)) +% maddubs(hi, bc4(y.qs[16 + 4 * k ..].ptr));
+            if (has_h) acc += maddwd(p, ones16) else s +%= p;
+        }
+        const d8 = halfs(blk);
+        const c8: V8f = if (has_m) halfs(blk + 16) else d8 * @as(V8f, @splat(if (has_h) -16 else -8));
+        const ints = if (has_h) acc else maddwd(s, ones16);
+        out = @mulAdd(V8f, d8 * @as(V8f, @splat(y.d)), toF(ints), out);
+        out = @mulAdd(V8f, c8, @splat(y.s), out);
+    }
+    return out;
+}
+
 fn gemmLegacy(comptime t: GgmlType, comptime NT: usize, w: [*]const u8, acts: [NT][*]const Q8B, nb: usize) [NT]V8f {
     @setEvalBranchQuota(100_000);
     const has_m = t == .q4_1 or t == .q5_1;
@@ -379,6 +523,26 @@ fn gemmLegacy(comptime t: GgmlType, comptime NT: usize, w: [*]const u8, acts: [N
     return out;
 }
 
+fn gemvQ8_0(w: [*]const u8, act: [*]const Q8B, nb: usize) V8f {
+    @setEvalBranchQuota(100_000);
+    var out: V8f = @splat(0);
+    for (0..nb) |b| {
+        const blk = w + b * 272;
+        prefetchAhead(blk, 272);
+        const y = &act[b];
+        var acc: V8i32 = @splat(0);
+        inline for (0..8) |k| {
+            const wv: V32i8 = @bitCast(load32(blk + 16 + k * 32));
+            const aw: V32u8 = @abs(wv);
+            const sa = applySign(bc4(y.qs[4 * k ..].ptr), wv);
+            acc += maddwd(maddubs(aw, sa), ones16);
+        }
+        const d8 = halfs(blk);
+        out = @mulAdd(V8f, d8 * @as(V8f, @splat(y.d)), toF(acc), out);
+    }
+    return out;
+}
+
 fn gemmQ8_0(comptime NT: usize, w: [*]const u8, acts: [NT][*]const Q8B, nb: usize) [NT]V8f {
     @setEvalBranchQuota(100_000);
     var out: [NT]V8f = @splat(@splat(0));
@@ -410,6 +574,17 @@ inline fn castActs(comptime T: type, comptime NT: usize, acts: [NT][*]const u8) 
 
 /// 8 rows (one repacked group of `cols` elements) x NT activation rows.
 pub inline fn gemm(comptime t: GgmlType, comptime NT: usize, group: [*]const u8, acts: [NT][*]const u8, cols: usize) [NT]V8f {
+    if (NT == 1) {
+        const v = switch (t) {
+            .q4_k => gemvK45(false, group, @ptrCast(@alignCast(acts[0])), cols / 256),
+            .q5_k => gemvK45(true, group, @ptrCast(@alignCast(acts[0])), cols / 256),
+            .q6_k => gemvQ6K(group, @ptrCast(@alignCast(acts[0])), cols / 256),
+            .q4_0, .q4_1, .q5_0, .q5_1 => gemvLegacy(t, group, @ptrCast(@alignCast(acts[0])), cols / 32),
+            .q8_0 => gemvQ8_0(group, @ptrCast(@alignCast(acts[0])), cols / 32),
+            else => unreachable,
+        };
+        return .{v};
+    }
     return switch (t) {
         .q4_k => gemmK45(false, NT, group, castActs(Q8K, NT, acts), cols / 256),
         .q5_k => gemmK45(true, NT, group, castActs(Q8K, NT, acts), cols / 256),

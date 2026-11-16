@@ -632,6 +632,18 @@ fn rowsDot(comptime t: GgmlType, comptime acc: bool, w: *const Tensor, r0: usize
 /// Same contract as rowsDot for an x8 tensor; r0 and r1 are multiples of 8.
 fn groupsDot(comptime t: GgmlType, comptime acc: bool, w: *const Tensor, r0: usize, r1: usize, act: *const Act, t0: usize, t1: usize, out: [*]f32, ostride: usize) void {
     const kind = comptime quant.actKind(t);
+    if (t1 == t0 + 1) {
+        const act_ptr = act.rowPtr(kind, t0);
+        const acts = [_][*]const u8{act_ptr};
+        var r = r0;
+        while (r < r1) : (r += 8) {
+            const g = w.group(r);
+            const v = repack.gemm(t, 1, g, acts, w.cols)[0];
+            const o: *[8]f32 = out[r - r0 ..][0..8];
+            o.* = if (acc) @as(quant.V8f, o.*) + v else v;
+        }
+        return;
+    }
     var ts = t0;
     while (ts < t1) : (ts += tok_tile) {
         const te = @min(ts + tok_tile, t1);
