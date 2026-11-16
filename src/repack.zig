@@ -17,9 +17,17 @@ const V32i8 = quant.V32i8;
 const V16i16 = quant.V16i16;
 const V8i32 = quant.V8i32;
 const V8f = quant.V8f;
+const V8u32 = @Vector(8, u32);
+const V16u16 = @Vector(16, u16);
 const maddubs = quant.maddubs;
 const maddwd = quant.maddwd;
 const toF = quant.toF;
+
+/// Unaligned vector load. Bitcasting a `[N]u8` copy instead makes Zig 0.17's
+/// LLVM assemble the value byte by byte (~30 instructions per load).
+inline fn loadVec(comptime V: type, p: [*]const u8) V {
+    return @as(*align(1) const V, @ptrCast(p)).*;
+}
 
 extern fn @"llvm.x86.avx2.psign.b"(@Vector(32, i8), @Vector(32, i8)) @Vector(32, i8);
 
@@ -53,66 +61,340 @@ pub fn groupBytes(t: GgmlType, cols: usize) usize {
 // ---------------------------------------------------------------------------
 // Repacking
 
-/// Interleave 8 source rows (each `nb` blocks of type `t`) into `dst`.
-pub fn repackGroup(t: GgmlType, rows: [8][*]const u8, nb: usize, dst: [*]u8) void {
+inline fn transpose8x8(r: [8]V8u32) [8]V8u32 {
+    // Stage 1: 32-bit interleaves (unpacklo/hi epi32)
+    const t0 = @shuffle(u32, r[0], r[1], [8]i32{ 0, -1, 1, -2, 4, -5, 5, -6 });
+    const t1 = @shuffle(u32, r[0], r[1], [8]i32{ 2, -3, 3, -4, 6, -7, 7, -8 });
+    const t2 = @shuffle(u32, r[2], r[3], [8]i32{ 0, -1, 1, -2, 4, -5, 5, -6 });
+    const t3 = @shuffle(u32, r[2], r[3], [8]i32{ 2, -3, 3, -4, 6, -7, 7, -8 });
+    const t4 = @shuffle(u32, r[4], r[5], [8]i32{ 0, -1, 1, -2, 4, -5, 5, -6 });
+    const t5 = @shuffle(u32, r[4], r[5], [8]i32{ 2, -3, 3, -4, 6, -7, 7, -8 });
+    const t6 = @shuffle(u32, r[6], r[7], [8]i32{ 0, -1, 1, -2, 4, -5, 5, -6 });
+    const t7 = @shuffle(u32, r[6], r[7], [8]i32{ 2, -3, 3, -4, 6, -7, 7, -8 });
+
+    // Stage 2: 64-bit interleaves (unpacklo/hi epi64)
+    const p0 = @shuffle(u32, t0, t2, [8]i32{ 0, 1, -1, -2, 4, 5, -5, -6 });
+    const p1 = @shuffle(u32, t0, t2, [8]i32{ 2, 3, -3, -4, 6, 7, -7, -8 });
+    const p2 = @shuffle(u32, t1, t3, [8]i32{ 0, 1, -1, -2, 4, 5, -5, -6 });
+    const p3 = @shuffle(u32, t1, t3, [8]i32{ 2, 3, -3, -4, 6, 7, -7, -8 });
+    const p4 = @shuffle(u32, t4, t6, [8]i32{ 0, 1, -1, -2, 4, 5, -5, -6 });
+    const p5 = @shuffle(u32, t4, t6, [8]i32{ 2, 3, -3, -4, 6, 7, -7, -8 });
+    const p6 = @shuffle(u32, t5, t7, [8]i32{ 0, 1, -1, -2, 4, 5, -5, -6 });
+    const p7 = @shuffle(u32, t5, t7, [8]i32{ 2, 3, -3, -4, 6, 7, -7, -8 });
+
+    // Stage 3: 128-bit lane permute across halves
+    return .{
+        @shuffle(u32, p0, p4, [8]i32{ 0, 1, 2, 3, -1, -2, -3, -4 }),
+        @shuffle(u32, p1, p5, [8]i32{ 0, 1, 2, 3, -1, -2, -3, -4 }),
+        @shuffle(u32, p2, p6, [8]i32{ 0, 1, 2, 3, -1, -2, -3, -4 }),
+        @shuffle(u32, p3, p7, [8]i32{ 0, 1, 2, 3, -1, -2, -3, -4 }),
+        @shuffle(u32, p0, p4, [8]i32{ 4, 5, 6, 7, -5, -6, -7, -8 }),
+        @shuffle(u32, p1, p5, [8]i32{ 4, 5, 6, 7, -5, -6, -7, -8 }),
+        @shuffle(u32, p2, p6, [8]i32{ 4, 5, 6, 7, -5, -6, -7, -8 }),
+        @shuffle(u32, p3, p7, [8]i32{ 4, 5, 6, 7, -5, -6, -7, -8 }),
+    };
+}
+
+fn repackGroup_q4_k(rows: [8][*]const u8, nb: usize, dst: [*]u8) void {
+    const sb = 144;
+    const bb = 1184;
+    for (0..nb) |b| {
+        const o = dst + b * bb;
+        var sm: [8][16]u8 = undefined;
+
+        // 1. Pack d and dmin (32 bytes)
+        const pack_mask = [16]i32{ 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 };
+        var w: [8]u32 = undefined;
+        inline for (0..8) |r| {
+            const xr = rows[r] + b * sb;
+            w[r] = @as(*align(1) const u32, @ptrCast(xr)).*;
+            sm[r] = quant.scalesK4(xr[4..16]);
+        }
+        const v_u16: V16u16 = @bitCast(@as(V8u32, w));
+        const d_dmin: V16u16 = @shuffle(u16, v_u16, undefined, pack_mask);
+        @as(*align(1) V16u16, @ptrCast(o)).* = d_dmin;
+
+        // 2. Pack scales and mins (64 + 64 = 128 bytes)
+        inline for (0..8) |j| {
+            const sc_col = [8]u8{ sm[0][j], sm[1][j], sm[2][j], sm[3][j], sm[4][j], sm[5][j], sm[6][j], sm[7][j] };
+            @as(*align(1) [8]u8, @ptrCast(o + 32 + j * 8)).* = sc_col;
+            const mn_col = [8]u8{ sm[0][8 + j], sm[1][8 + j], sm[2][8 + j], sm[3][8 + j], sm[4][8 + j], sm[5][8 + j], sm[6][8 + j], sm[7][8 + j] };
+            @as(*align(1) [8]u8, @ptrCast(o + 96 + j * 8)).* = mn_col;
+        }
+
+        // 3. Transpose qs (4 chunks of 8x8 u32 = 1024 bytes)
+        inline for (0..4) |c| {
+            const row_c = [8]V8u32{
+                loadVec(V8u32, rows[0] + b * sb + 16 + c * 32),
+                loadVec(V8u32, rows[1] + b * sb + 16 + c * 32),
+                loadVec(V8u32, rows[2] + b * sb + 16 + c * 32),
+                loadVec(V8u32, rows[3] + b * sb + 16 + c * 32),
+                loadVec(V8u32, rows[4] + b * sb + 16 + c * 32),
+                loadVec(V8u32, rows[5] + b * sb + 16 + c * 32),
+                loadVec(V8u32, rows[6] + b * sb + 16 + c * 32),
+                loadVec(V8u32, rows[7] + b * sb + 16 + c * 32),
+            };
+            const cols = transpose8x8(row_c);
+            inline for (0..8) |k| {
+                @as(*align(1) V8u32, @ptrCast(o + 160 + (c * 8 + k) * 32)).* = cols[k];
+            }
+        }
+    }
+}
+
+fn repackGroup_q5_k(rows: [8][*]const u8, nb: usize, dst: [*]u8) void {
+    const sb = 176;
+    const bb = 1440;
+    for (0..nb) |b| {
+        const o = dst + b * bb;
+        var sm: [8][16]u8 = undefined;
+
+        // 1. Pack d and dmin (32 bytes)
+        const pack_mask = [16]i32{ 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 };
+        var w: [8]u32 = undefined;
+        inline for (0..8) |r| {
+            const xr = rows[r] + b * sb;
+            w[r] = @as(*align(1) const u32, @ptrCast(xr)).*;
+            sm[r] = quant.scalesK4(xr[4..16]);
+        }
+        const v_u16: V16u16 = @bitCast(@as(V8u32, w));
+        const d_dmin: V16u16 = @shuffle(u16, v_u16, undefined, pack_mask);
+        @as(*align(1) V16u16, @ptrCast(o)).* = d_dmin;
+
+        // 2. Pack scales and mins (128 bytes)
+        inline for (0..8) |j| {
+            const sc_col = [8]u8{ sm[0][j], sm[1][j], sm[2][j], sm[3][j], sm[4][j], sm[5][j], sm[6][j], sm[7][j] };
+            @as(*align(1) [8]u8, @ptrCast(o + 32 + j * 8)).* = sc_col;
+            const mn_col = [8]u8{ sm[0][8 + j], sm[1][8 + j], sm[2][8 + j], sm[3][8 + j], sm[4][8 + j], sm[5][8 + j], sm[6][8 + j], sm[7][8 + j] };
+            @as(*align(1) [8]u8, @ptrCast(o + 96 + j * 8)).* = mn_col;
+        }
+
+        // 3. Transpose qh (1 chunk of 8x8 u32 = 256 bytes)
+        const row_qh = [8]V8u32{
+            loadVec(V8u32, rows[0] + b * sb + 16),
+            loadVec(V8u32, rows[1] + b * sb + 16),
+            loadVec(V8u32, rows[2] + b * sb + 16),
+            loadVec(V8u32, rows[3] + b * sb + 16),
+            loadVec(V8u32, rows[4] + b * sb + 16),
+            loadVec(V8u32, rows[5] + b * sb + 16),
+            loadVec(V8u32, rows[6] + b * sb + 16),
+            loadVec(V8u32, rows[7] + b * sb + 16),
+        };
+        const cols_qh = transpose8x8(row_qh);
+        inline for (0..8) |k| {
+            @as(*align(1) V8u32, @ptrCast(o + 160 + k * 32)).* = cols_qh[k];
+        }
+
+        // 4. Transpose qs (4 chunks of 8x8 u32 = 1024 bytes)
+        inline for (0..4) |c| {
+            const row_c = [8]V8u32{
+                loadVec(V8u32, rows[0] + b * sb + 48 + c * 32),
+                loadVec(V8u32, rows[1] + b * sb + 48 + c * 32),
+                loadVec(V8u32, rows[2] + b * sb + 48 + c * 32),
+                loadVec(V8u32, rows[3] + b * sb + 48 + c * 32),
+                loadVec(V8u32, rows[4] + b * sb + 48 + c * 32),
+                loadVec(V8u32, rows[5] + b * sb + 48 + c * 32),
+                loadVec(V8u32, rows[6] + b * sb + 48 + c * 32),
+                loadVec(V8u32, rows[7] + b * sb + 48 + c * 32),
+            };
+            const cols = transpose8x8(row_c);
+            inline for (0..8) |k| {
+                @as(*align(1) V8u32, @ptrCast(o + 416 + (c * 8 + k) * 32)).* = cols[k];
+            }
+        }
+    }
+}
+
+fn repackGroup_q6_k(rows: [8][*]const u8, nb: usize, dst: [*]u8) void {
+    const sb = 210;
+    const bb = 1696;
+    for (0..nb) |b| {
+        const o = dst + b * bb;
+
+        // 1. Pack d (16 bytes) and zero pad (16 bytes)
+        const d_vec = @Vector(8, u16){
+            @as(*align(1) const u16, @ptrCast(rows[0] + b * sb + 208)).*,
+            @as(*align(1) const u16, @ptrCast(rows[1] + b * sb + 208)).*,
+            @as(*align(1) const u16, @ptrCast(rows[2] + b * sb + 208)).*,
+            @as(*align(1) const u16, @ptrCast(rows[3] + b * sb + 208)).*,
+            @as(*align(1) const u16, @ptrCast(rows[4] + b * sb + 208)).*,
+            @as(*align(1) const u16, @ptrCast(rows[5] + b * sb + 208)).*,
+            @as(*align(1) const u16, @ptrCast(rows[6] + b * sb + 208)).*,
+            @as(*align(1) const u16, @ptrCast(rows[7] + b * sb + 208)).*,
+        };
+        @as(*align(1) @Vector(8, u16), @ptrCast(o[0..16])).* = d_vec;
+        @memset(o[16..32], 0);
+
+        // 2. Pack scales (16 scales * 8 rows = 128 bytes)
+        inline for (0..16) |s| {
+            const sc_col = [8]u8{
+                (rows[0] + b * sb)[192 + s],
+                (rows[1] + b * sb)[192 + s],
+                (rows[2] + b * sb)[192 + s],
+                (rows[3] + b * sb)[192 + s],
+                (rows[4] + b * sb)[192 + s],
+                (rows[5] + b * sb)[192 + s],
+                (rows[6] + b * sb)[192 + s],
+                (rows[7] + b * sb)[192 + s],
+            };
+            @as(*align(1) [8]u8, @ptrCast(o + 32 + s * 8)).* = sc_col;
+        }
+
+        // 3. Transpose {ql_a, ql_b, qh} (2 * 3 = 6 8x8 matrices = 1536 bytes)
+        inline for (0..2) |n| {
+            const row_qla = [8]V8u32{
+                loadVec(V8u32, rows[0] + b * sb + 64 * n),
+                loadVec(V8u32, rows[1] + b * sb + 64 * n),
+                loadVec(V8u32, rows[2] + b * sb + 64 * n),
+                loadVec(V8u32, rows[3] + b * sb + 64 * n),
+                loadVec(V8u32, rows[4] + b * sb + 64 * n),
+                loadVec(V8u32, rows[5] + b * sb + 64 * n),
+                loadVec(V8u32, rows[6] + b * sb + 64 * n),
+                loadVec(V8u32, rows[7] + b * sb + 64 * n),
+            };
+            const cols_qla = transpose8x8(row_qla);
+
+            const row_qlb = [8]V8u32{
+                loadVec(V8u32, rows[0] + b * sb + 64 * n + 32),
+                loadVec(V8u32, rows[1] + b * sb + 64 * n + 32),
+                loadVec(V8u32, rows[2] + b * sb + 64 * n + 32),
+                loadVec(V8u32, rows[3] + b * sb + 64 * n + 32),
+                loadVec(V8u32, rows[4] + b * sb + 64 * n + 32),
+                loadVec(V8u32, rows[5] + b * sb + 64 * n + 32),
+                loadVec(V8u32, rows[6] + b * sb + 64 * n + 32),
+                loadVec(V8u32, rows[7] + b * sb + 64 * n + 32),
+            };
+            const cols_qlb = transpose8x8(row_qlb);
+
+            const row_qh = [8]V8u32{
+                loadVec(V8u32, rows[0] + b * sb + 128 + 32 * n),
+                loadVec(V8u32, rows[1] + b * sb + 128 + 32 * n),
+                loadVec(V8u32, rows[2] + b * sb + 128 + 32 * n),
+                loadVec(V8u32, rows[3] + b * sb + 128 + 32 * n),
+                loadVec(V8u32, rows[4] + b * sb + 128 + 32 * n),
+                loadVec(V8u32, rows[5] + b * sb + 128 + 32 * n),
+                loadVec(V8u32, rows[6] + b * sb + 128 + 32 * n),
+                loadVec(V8u32, rows[7] + b * sb + 128 + 32 * n),
+            };
+            const cols_qh = transpose8x8(row_qh);
+
+            inline for (0..8) |k| {
+                const base = o + 160 + (n * 8 + k) * 96;
+                @as(*align(1) V8u32, @ptrCast(base)).* = cols_qla[k];
+                @as(*align(1) V8u32, @ptrCast(base + 32)).* = cols_qlb[k];
+                @as(*align(1) V8u32, @ptrCast(base + 64)).* = cols_qh[k];
+            }
+        }
+    }
+}
+
+fn repackGroup_q8_0(rows: [8][*]const u8, nb: usize, dst: [*]u8) void {
+    const sb = 34;
+    const bb = 272;
+    for (0..nb) |b| {
+        const o = dst + b * bb;
+
+        // 1. Pack d (16 bytes)
+        const d_vec = @Vector(8, u16){
+            @as(*align(1) const u16, @ptrCast(rows[0] + b * sb)).*,
+            @as(*align(1) const u16, @ptrCast(rows[1] + b * sb)).*,
+            @as(*align(1) const u16, @ptrCast(rows[2] + b * sb)).*,
+            @as(*align(1) const u16, @ptrCast(rows[3] + b * sb)).*,
+            @as(*align(1) const u16, @ptrCast(rows[4] + b * sb)).*,
+            @as(*align(1) const u16, @ptrCast(rows[5] + b * sb)).*,
+            @as(*align(1) const u16, @ptrCast(rows[6] + b * sb)).*,
+            @as(*align(1) const u16, @ptrCast(rows[7] + b * sb)).*,
+        };
+        @as(*align(1) @Vector(8, u16), @ptrCast(o[0..16])).* = d_vec;
+
+        // 2. Transpose qs (8x8 u32 = 256 bytes)
+        const row_qs = [8]V8u32{
+            loadVec(V8u32, rows[0] + b * sb + 2),
+            loadVec(V8u32, rows[1] + b * sb + 2),
+            loadVec(V8u32, rows[2] + b * sb + 2),
+            loadVec(V8u32, rows[3] + b * sb + 2),
+            loadVec(V8u32, rows[4] + b * sb + 2),
+            loadVec(V8u32, rows[5] + b * sb + 2),
+            loadVec(V8u32, rows[6] + b * sb + 2),
+            loadVec(V8u32, rows[7] + b * sb + 2),
+        };
+        const cols = transpose8x8(row_qs);
+        inline for (0..8) |k| {
+            @as(*align(1) V8u32, @ptrCast(o + 16 + k * 32)).* = cols[k];
+        }
+    }
+}
+
+fn repackGroup_q4_0(rows: [8][*]const u8, nb: usize, dst: [*]u8) void {
+    const sb = 18;
+    const bb = 144;
+    for (0..nb) |b| {
+        const o = dst + b * bb;
+
+        // 1. Pack d (16 bytes)
+        const d_vec = @Vector(8, u16){
+            @as(*align(1) const u16, @ptrCast(rows[0] + b * sb)).*,
+            @as(*align(1) const u16, @ptrCast(rows[1] + b * sb)).*,
+            @as(*align(1) const u16, @ptrCast(rows[2] + b * sb)).*,
+            @as(*align(1) const u16, @ptrCast(rows[3] + b * sb)).*,
+            @as(*align(1) const u16, @ptrCast(rows[4] + b * sb)).*,
+            @as(*align(1) const u16, @ptrCast(rows[5] + b * sb)).*,
+            @as(*align(1) const u16, @ptrCast(rows[6] + b * sb)).*,
+            @as(*align(1) const u16, @ptrCast(rows[7] + b * sb)).*,
+        };
+        @as(*align(1) @Vector(8, u16), @ptrCast(o[0..16])).* = d_vec;
+
+        // 2. Pack qs (4 groups of 32 bytes = 128 bytes)
+        inline for (0..4) |k| {
+            const col = V8u32{
+                @as(*align(1) const u32, @ptrCast(rows[0] + b * sb + 2 + k * 4)).*,
+                @as(*align(1) const u32, @ptrCast(rows[1] + b * sb + 2 + k * 4)).*,
+                @as(*align(1) const u32, @ptrCast(rows[2] + b * sb + 2 + k * 4)).*,
+                @as(*align(1) const u32, @ptrCast(rows[3] + b * sb + 2 + k * 4)).*,
+                @as(*align(1) const u32, @ptrCast(rows[4] + b * sb + 2 + k * 4)).*,
+                @as(*align(1) const u32, @ptrCast(rows[5] + b * sb + 2 + k * 4)).*,
+                @as(*align(1) const u32, @ptrCast(rows[6] + b * sb + 2 + k * 4)).*,
+                @as(*align(1) const u32, @ptrCast(rows[7] + b * sb + 2 + k * 4)).*,
+            };
+            @as(*align(1) V8u32, @ptrCast(o + 16 + k * 32)).* = col;
+        }
+    }
+}
+
+fn repackGroup_legacy(t: GgmlType, rows: [8][*]const u8, nb: usize, dst: [*]u8) void {
     const bb = blockBytes(t);
     const sb = t.layout().?.bytes;
     for (0..nb) |b| {
         const o = dst + b * bb;
         for (rows, 0..) |row, r| {
             const x = row + b * sb;
-            switch (t) {
-                .q4_0, .q8_0 => {
-                    @memcpy(o[r * 2 ..][0..2], x[0..2]);
-                    const ng: usize = if (t == .q4_0) 4 else 8;
-                    for (0..ng) |k| @memcpy(o[16 + (k * 8 + r) * 4 ..][0..4], x[2 + 4 * k ..][0..4]);
-                },
-                .q4_1, .q5_0, .q5_1 => {
-                    const has_m = t != .q5_0;
-                    const has_h = t != .q4_1;
-                    @memcpy(o[r * 2 ..][0..2], x[0..2]);
-                    if (has_m) @memcpy(o[16 + r * 2 ..][0..2], x[2..4]);
-                    const qh_src: usize = if (has_m) 4 else 2;
-                    const qh_off: usize = if (has_m) 32 else 16;
-                    const qs_src = qh_src + @as(usize, if (has_h) 4 else 0);
-                    const qs_off = qh_off + @as(usize, if (has_h) 32 else 0);
-                    if (has_h) {
-                        // Byte (k, r): the 5th bits of row r's values 4k..4k+3
-                        // (low nibble) and 16+4k..16+4k+3 (high nibble).
-                        const qh = std.mem.readInt(u32, x[qh_src..][0..4], .little);
-                        for (0..4) |k| o[qh_off + k * 8 + r] = @truncate(((qh >> @intCast(4 * k)) & 0xf) | ((qh >> @intCast(16 + 4 * k)) & 0xf) << 4);
-                    }
-                    for (0..4) |k| @memcpy(o[qs_off + (k * 8 + r) * 4 ..][0..4], x[qs_src + 4 * k ..][0..4]);
-                },
-                .q4_k, .q5_k => {
-                    @memcpy(o[r * 2 ..][0..2], x[0..2]);
-                    @memcpy(o[16 + r * 2 ..][0..2], x[2..4]);
-                    const sm = quant.scalesK4(x[4..16]);
-                    for (0..8) |j| {
-                        o[32 + j * 8 + r] = sm[j];
-                        o[96 + j * 8 + r] = sm[8 + j];
-                    }
-                    const is5 = t == .q5_k;
-                    const qs = if (is5) x + 48 else x + 16;
-                    const qs_off: usize = if (is5) 416 else 160;
-                    if (is5) for (0..8) |k| @memcpy(o[160 + (k * 8 + r) * 4 ..][0..4], x[16 + 4 * k ..][0..4]);
-                    for (0..4) |c| for (0..8) |k| {
-                        @memcpy(o[qs_off + ((c * 8 + k) * 8 + r) * 4 ..][0..4], qs[c * 32 + 4 * k ..][0..4]);
-                    };
-                },
-                .q6_k => {
-                    @memcpy(o[r * 2 ..][0..2], x[208..210]);
-                    for (0..16) |s| o[32 + s * 8 + r] = x[192 + s];
-                    for (0..2) |n| for (0..8) |k| {
-                        const base = o + 160 + (n * 8 + k) * 96 + r * 4;
-                        @memcpy(base[0..4], x[64 * n + 4 * k ..][0..4]);
-                        @memcpy(base[32..36], x[64 * n + 32 + 4 * k ..][0..4]);
-                        @memcpy(base[64..68], x[128 + 32 * n + 4 * k ..][0..4]);
-                    };
-                },
-                else => unreachable,
+            const has_m = t != .q5_0;
+            const has_h = t != .q4_1;
+            @memcpy(o[r * 2 ..][0..2], x[0..2]);
+            if (has_m) @memcpy(o[16 + r * 2 ..][0..2], x[2..4]);
+            const qh_src: usize = if (has_m) 4 else 2;
+            const qh_off: usize = if (has_m) 32 else 16;
+            const qs_src = qh_src + @as(usize, if (has_h) 4 else 0);
+            const qs_off = qh_off + @as(usize, if (has_h) 32 else 0);
+            if (has_h) {
+                const qh = std.mem.readInt(u32, x[qh_src..][0..4], .little);
+                for (0..4) |k| o[qh_off + k * 8 + r] = @truncate(((qh >> @intCast(4 * k)) & 0xf) | ((qh >> @intCast(16 + 4 * k)) & 0xf) << 4);
             }
+            for (0..4) |k| @memcpy(o[qs_off + (k * 8 + r) * 4 ..][0..4], x[qs_src + 4 * k ..][0..4]);
         }
+    }
+}
+
+/// Interleave 8 source rows (each `nb` blocks of type `t`) into `dst`.
+pub fn repackGroup(t: GgmlType, rows: [8][*]const u8, nb: usize, dst: [*]u8) void {
+    switch (t) {
+        .q4_k => repackGroup_q4_k(rows, nb, dst),
+        .q5_k => repackGroup_q5_k(rows, nb, dst),
+        .q6_k => repackGroup_q6_k(rows, nb, dst),
+        .q8_0 => repackGroup_q8_0(rows, nb, dst),
+        .q4_0 => repackGroup_q4_0(rows, nb, dst),
+        .q4_1, .q5_0, .q5_1 => repackGroup_legacy(t, rows, nb, dst),
+        else => unreachable,
     }
 }
 
@@ -121,11 +403,6 @@ pub fn repackGroup(t: GgmlType, rows: [8][*]const u8, nb: usize, dst: [*]u8) voi
 
 inline fn load32(p: [*]const u8) V32u8 {
     return p[0..32].*;
-}
-/// Unaligned vector load. Bitcasting a `[N]u8` copy instead makes Zig 0.17's
-/// LLVM assemble the value byte by byte (~30 instructions per load).
-inline fn loadVec(comptime V: type, p: [*]const u8) V {
-    return @as(*align(1) const V, @ptrCast(p)).*;
 }
 
 /// Broadcast 4 bytes to all 8 lanes (vpbroadcastd from memory).
