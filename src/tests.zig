@@ -4,4 +4,6 @@ test {
     _ = @import("model.zig");
     _ = @import("tokenizer.zig");
     _ = @import("sampler.zig");
+    _ = @import("gen.zig");
+    _ = @import("pool.zig");
 }

@@ -156,8 +156,17 @@ pub fn quantizeQ8K(x: []const f32, out: []Q8K) void {
     std.debug.assert(x.len == out.len * 256);
     for (out, 0..) |*b, i| {
         const xs = x[i * 256 ..][0..256];
-        var amax: V8f = @splat(0);
-        inline for (0..32) |j| amax = @max(amax, @abs(@as(V8f, xs[j * 8 ..][0..8].*)));
+        var amax0: V8f = @splat(0);
+        var amax1: V8f = @splat(0);
+        var amax2: V8f = @splat(0);
+        var amax3: V8f = @splat(0);
+        inline for (0..8) |j| {
+            amax0 = @max(amax0, @abs(@as(V8f, xs[(j * 4 + 0) * 8 ..][0..8].*)));
+            amax1 = @max(amax1, @abs(@as(V8f, xs[(j * 4 + 1) * 8 ..][0..8].*)));
+            amax2 = @max(amax2, @abs(@as(V8f, xs[(j * 4 + 2) * 8 ..][0..8].*)));
+            amax3 = @max(amax3, @abs(@as(V8f, xs[(j * 4 + 3) * 8 ..][0..8].*)));
+        }
+        const amax = @max(@max(amax0, amax1), @max(amax2, amax3));
         const m = @reduce(.Max, amax);
         if (m == 0) {
             b.* = std.mem.zeroes(Q8K);

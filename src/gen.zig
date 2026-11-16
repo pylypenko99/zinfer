@@ -57,6 +57,7 @@ pub const Gen = struct {
     snaps: []f32 = &.{},
     snap_pos: usize = 0,
     n_snaps: usize = 0,
+    prompt_cache_save: ?[]const u8 = null,
 
     pub fn deinit(g: *Gen) void {
         g.cached.deinit(g.gpa);
@@ -118,6 +119,139 @@ pub const Gen = struct {
         g.cached.shrinkRetainingCapacity(keep);
     }
 
+    pub const CacheHeader = extern struct {
+        magic: [8]u8 = "ZINFCACH".*,
+        version: u32 = 1,
+        arch: u32,
+        n_layers: u32,
+        dim: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        vocab: u32,
+        kv_format: u32,
+        pos: u64,
+        n_tokens: u64,
+        conv_len: u64,
+    };
+
+    pub fn saveCache(g: *Gen, path: []const u8) !void {
+        const file = try std.Io.Dir.cwd().createFile(g.io, path, .{});
+        defer file.close(g.io);
+        var buf: [64 * 1024]u8 = undefined;
+        var writer = file.writer(g.io, &buf);
+
+        const st = g.st;
+        const c = &st.model.cfg;
+        const hdr: CacheHeader = .{
+            .arch = @intFromEnum(c.arch),
+            .n_layers = @intCast(c.n_layers),
+            .dim = @intCast(c.dim),
+            .n_heads = @intCast(c.n_heads),
+            .n_kv_heads = @intCast(c.n_kv_heads),
+            .head_dim = @intCast(c.head_dim),
+            .vocab = @intCast(c.vocab),
+            .kv_format = @intFromEnum(st.cache_type),
+            .pos = @intCast(st.pos),
+            .n_tokens = @intCast(g.cached.items.len),
+            .conv_len = @intCast(st.conv_state.len),
+        };
+        try writer.interface.writeAll(std.mem.asBytes(&hdr));
+
+        if (g.cached.items.len > 0) {
+            try writer.interface.writeAll(std.mem.sliceAsBytes(g.cached.items));
+        }
+        if (st.conv_state.len > 0) {
+            try writer.interface.writeAll(std.mem.sliceAsBytes(st.conv_state));
+        }
+
+        const tb: usize = switch (st.cache_type) {
+            .f16 => c.head_dim * 32,
+            .q8_0 => c.head_dim * 17,
+            .q4_0 => c.head_dim * 9,
+        };
+        for (st.model.layers) |*L| {
+            switch (L.mixer) {
+                .attention => |*A| {
+                    const is_swa = A.swa and c.swa_window > 0;
+                    const max_tiles = st.slot_tiles[A.kv_slot];
+                    const tiles = if (st.pos == 0) 0 else if (is_swa) @min(max_tiles, (st.pos + model_mod.kv_tile - 1) / model_mod.kv_tile) else (st.pos + model_mod.kv_tile - 1) / model_mod.kv_tile;
+                    const bytes_per_head = tiles * tb;
+                    for (0..A.n_kv_heads) |kh| {
+                        const base = st.cacheIndex(A.kv_slot, kh);
+                        try writer.interface.writeAll(st.k_cache[base .. base + bytes_per_head]);
+                        try writer.interface.writeAll(st.v_cache[base .. base + bytes_per_head]);
+                    }
+                },
+                .shortconv => {},
+            }
+        }
+        try writer.interface.flush();
+    }
+
+    pub fn loadCache(g: *Gen, path: []const u8) !void {
+        const file = try std.Io.Dir.cwd().openFile(g.io, path, .{});
+        defer file.close(g.io);
+        var buf: [64 * 1024]u8 = undefined;
+        var reader = file.reader(g.io, &buf);
+
+        var hdr: CacheHeader = undefined;
+        try reader.interface.readSliceAll(std.mem.asBytes(&hdr));
+
+        if (!std.mem.eql(u8, &hdr.magic, "ZINFCACH") or hdr.version != 1) return error.InvalidCache;
+
+        const st = g.st;
+        const c = &st.model.cfg;
+        if (hdr.arch != @intFromEnum(c.arch) or
+            hdr.n_layers != c.n_layers or
+            hdr.dim != c.dim or
+            hdr.n_heads != c.n_heads or
+            hdr.n_kv_heads != c.n_kv_heads or
+            hdr.head_dim != c.head_dim or
+            hdr.vocab != c.vocab or
+            hdr.kv_format != @intFromEnum(st.cache_type))
+        {
+            return error.IncompatibleCache;
+        }
+
+        if (hdr.pos > st.ctx) return error.ContextFull;
+
+        g.reset();
+        try g.cached.resize(g.gpa, @intCast(hdr.n_tokens));
+        if (hdr.n_tokens > 0) {
+            try reader.interface.readSliceAll(std.mem.sliceAsBytes(g.cached.items));
+        }
+        if (hdr.conv_len > 0) {
+            if (hdr.conv_len != st.conv_state.len) return error.IncompatibleCache;
+            try reader.interface.readSliceAll(std.mem.sliceAsBytes(st.conv_state));
+        }
+
+        const tb: usize = switch (st.cache_type) {
+            .f16 => c.head_dim * 32,
+            .q8_0 => c.head_dim * 17,
+            .q4_0 => c.head_dim * 9,
+        };
+        const pos: usize = @intCast(hdr.pos);
+        for (st.model.layers) |*L| {
+            switch (L.mixer) {
+                .attention => |*A| {
+                    const is_swa = A.swa and c.swa_window > 0;
+                    const max_tiles = st.slot_tiles[A.kv_slot];
+                    const tiles = if (pos == 0) 0 else if (is_swa) @min(max_tiles, (pos + model_mod.kv_tile - 1) / model_mod.kv_tile) else (pos + model_mod.kv_tile - 1) / model_mod.kv_tile;
+                    const bytes_per_head = tiles * tb;
+                    for (0..A.n_kv_heads) |kh| {
+                        const base = st.cacheIndex(A.kv_slot, kh);
+                        try reader.interface.readSliceAll(st.k_cache[base .. base + bytes_per_head]);
+                        try reader.interface.readSliceAll(st.v_cache[base .. base + bytes_per_head]);
+                    }
+                },
+                .shortconv => {},
+            }
+        }
+        st.pos = pos;
+        if (g.draft_st) |d| d.reset();
+    }
+
     /// Feed `prompt[keep..]` to a cache that ends with `prompt[0..keep]`, then
     /// sample as `run` does. With `snapshot`, the short-conv states at the end
     /// of the prompt are saved for the next `runPrompt`.
@@ -128,7 +262,7 @@ pub const Gen = struct {
         defer history.deinit(g.gpa);
         const eog = g.decode(prompt, keep, snapshot, n, sink, &history) catch |e| {
             // An interrupted round can leave unverified drafts in the caches.
-            g.reset();
+            if (e != error.ContextFull) g.reset();
             return e;
         };
         // Tokens enter the cache in `history` order, so it holds a prefix of it.
@@ -168,6 +302,14 @@ pub const Gen = struct {
         g.stats.n_cached += keep;
         for (prompt) |t| g.smp.accept(t);
         try history.appendSlice(g.gpa, prompt);
+
+        if (g.prompt_cache_save) |save_path| {
+            // Populate cached prefix with prompt before saving
+            g.cached.shrinkRetainingCapacity(keep);
+            try g.cached.appendSlice(g.gpa, feed);
+            try g.saveCache(save_path);
+            g.prompt_cache_save = null;
+        }
 
         // Tokens emitted by this call: `n` limits every call on its own.
         var n_run: usize = 0;
@@ -313,3 +455,181 @@ pub const Gen = struct {
         }
     }
 };
+
+test "reusablePrefix" {
+    var g: Gen = undefined;
+    var fake_st: model_mod.State = undefined;
+    fake_st.conv_state = &.{};
+    g.st = &fake_st;
+    g.cached = .empty;
+    var list: std.ArrayList(u32) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try list.appendSlice(std.testing.allocator, &.{ 1, 2, 3, 4, 5 });
+    g.cached = list;
+    g.st.pos = 5;
+
+    // Prompt that matches completely:
+    // reusablePrefix returns prompt.len - 1 so at least one token is fed for logits
+    try std.testing.expectEqual(@as(usize, 4), g.reusablePrefix(&.{ 1, 2, 3, 4, 5 }));
+
+    // Prompt with extension:
+    try std.testing.expectEqual(@as(usize, 5), g.reusablePrefix(&.{ 1, 2, 3, 4, 5, 6, 7 }));
+
+    // Prompt with partial divergence:
+    try std.testing.expectEqual(@as(usize, 3), g.reusablePrefix(&.{ 1, 2, 3, 99, 100 }));
+
+    // Prompt with completely different start:
+    try std.testing.expectEqual(@as(usize, 0), g.reusablePrefix(&.{ 9, 8, 7 }));
+
+    // Empty prompt:
+    try std.testing.expectEqual(@as(usize, 0), g.reusablePrefix(&.{}));
+}
+
+test "saveCache and loadCache roundtrip" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var model: model_mod.Model = undefined;
+    model.cfg = .{
+        .arch = .llama,
+        .dim = 64,
+        .n_layers = 1,
+        .n_heads = 2,
+        .n_kv_heads = 1,
+        .head_dim = 32,
+        .q_dim = 64,
+        .kv_dim = 32,
+        .ffn_dim = 128,
+        .vocab = 1000,
+        .eps = 1e-5,
+        .rope_base = 10000,
+        .rope_scale = 1,
+        .n_rot = 32,
+        .rope_neox = true,
+        .ctx_train = 512,
+    };
+    var layer: model_mod.Layer = undefined;
+    layer.mixer = .{
+        .attention = .{
+            .wq = undefined,
+            .wk = undefined,
+            .wv = undefined,
+            .wo = undefined,
+            .gate = null,
+            .bq = null,
+            .bk = null,
+            .bv = null,
+            .q_norm = null,
+            .k_norm = null,
+            .swa = false,
+            .n_kv_heads = 1,
+            .kv_slot = 0,
+        },
+    };
+    model.layers = (&layer)[0..1];
+    model.n_attn_layers = 1;
+    model.n_conv_layers = 0;
+
+    var st: model_mod.State = undefined;
+    st.model = &model;
+    st.ctx = 256;
+    st.cache_type = .f16;
+    st.pos = 32; // 2 tiles of 16 tokens
+    st.conv_state = &.{};
+    st.conv_checkpoint = &.{};
+
+    var slot_tiles = [_]usize{ 16 };
+    var slot_strides = [_]usize{ 16 * 32 * 32 };
+    var slot_offsets = [_]usize{ 0 };
+    st.slot_tiles = &slot_tiles;
+    st.slot_strides = &slot_strides;
+    st.slot_offsets = &slot_offsets;
+
+    const cache_bytes = 16 * 32 * 32;
+    var k_cache: [cache_bytes]u8 align(32) = undefined;
+    var v_cache: [cache_bytes]u8 align(32) = undefined;
+    for (&k_cache, 0..) |*b, i| b.* = @truncate(i * 3 + 1);
+    for (&v_cache, 0..) |*b, i| b.* = @truncate(i * 7 + 5);
+    st.k_cache = &k_cache;
+    st.v_cache = &v_cache;
+
+    var cached_toks: std.ArrayList(u32) = .empty;
+    defer cached_toks.deinit(gpa);
+    for (0..32) |i| try cached_toks.append(gpa, @intCast(100 + i));
+
+    var smp: sampler_mod.Sampler = undefined;
+    smp.n_recent = 0;
+
+    var g: Gen = undefined;
+    g.gpa = gpa;
+    g.io = io;
+    g.st = &st;
+    g.smp = &smp;
+    g.cached = cached_toks;
+    g.draft_st = null;
+    g.snaps = &.{};
+    g.n_snaps = 0;
+
+    const test_cache_path = "test_prompt.cache";
+    defer std.Io.Dir.cwd().deleteFile(io, test_cache_path) catch {};
+
+    try g.saveCache(test_cache_path);
+
+    // Verify cache file exists
+    const file = try std.Io.Dir.cwd().openFile(io, test_cache_path, .{});
+    file.close(io);
+
+    // Prepare fresh state to load into
+    var st2: model_mod.State = undefined;
+    st2.model = &model;
+    st2.ctx = 256;
+    st2.cache_type = .f16;
+    st2.pos = 0;
+    st2.conv_state = &.{};
+    st2.conv_checkpoint = &.{};
+    st2.slot_tiles = &slot_tiles;
+    st2.slot_strides = &slot_strides;
+    st2.slot_offsets = &slot_offsets;
+
+    var k_cache2: [cache_bytes]u8 align(32) = undefined;
+    var v_cache2: [cache_bytes]u8 align(32) = undefined;
+    @memset(&k_cache2, 0);
+    @memset(&v_cache2, 0);
+    st2.k_cache = &k_cache2;
+    st2.v_cache = &v_cache2;
+
+    var g2: Gen = undefined;
+    g2.gpa = gpa;
+    g2.io = io;
+    g2.st = &st2;
+    g2.smp = &smp;
+    g2.cached = .empty;
+    defer g2.cached.deinit(gpa);
+    g2.draft_st = null;
+    g2.snaps = &.{};
+    g2.n_snaps = 0;
+
+    try g2.loadCache(test_cache_path);
+
+    try std.testing.expectEqual(@as(usize, 32), st2.pos);
+    try std.testing.expectEqual(@as(usize, 32), g2.cached.items.len);
+    for (0..32) |i| {
+        try std.testing.expectEqual(@as(u32, @intCast(100 + i)), g2.cached.items[i]);
+    }
+
+    // 2 tiles * 32 head_dim * 32 bytes = 2048 bytes
+    const valid_bytes = 2 * 32 * 32;
+    try std.testing.expectEqualSlices(u8, k_cache[0..valid_bytes], k_cache2[0..valid_bytes]);
+    try std.testing.expectEqualSlices(u8, v_cache[0..valid_bytes], v_cache2[0..valid_bytes]);
+
+    // Incompatible configuration check
+    var model_incompat = model;
+    model_incompat.cfg.dim = 128;
+    st2.model = &model_incompat;
+    try std.testing.expectError(error.IncompatibleCache, g2.loadCache(test_cache_path));
+
+    // Exceeding context limit check
+    st2.model = &model;
+    st2.ctx = 16;
+    try std.testing.expectError(error.ContextFull, g2.loadCache(test_cache_path));
+}

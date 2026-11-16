@@ -174,10 +174,78 @@ test "PromptLookup finds continuation of matching 3-gram and 2-gram" {
     try std.testing.expectEqualSlices(u32, &.{ 88, 99 }, draft[0..2]);
 }
 
+const V8f = @Vector(8, f32);
+const V8u = @Vector(8, u32);
+
 pub fn argmax(x: []const f32) u32 {
-    var best: usize = 0;
-    for (x, 0..) |v, i| if (v > x[best]) {
-        best = i;
-    };
-    return @intCast(best);
+    if (x.len == 0) return 0;
+    if (x.len < 16) {
+        var best: usize = 0;
+        for (x, 0..) |v, i| if (v > x[best]) {
+            best = i;
+        };
+        return @intCast(best);
+    }
+
+    var max0: V8f = x[0..8].*;
+    var max1: V8f = x[8..16].*;
+    var idx0: V8u = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    var idx1: V8u = .{ 8, 9, 10, 11, 12, 13, 14, 15 };
+    var cur_idx0: V8u = idx0;
+    var cur_idx1: V8u = idx1;
+    const step: V8u = @splat(16);
+
+    var i: usize = 16;
+    while (i + 16 <= x.len) : (i += 16) {
+        cur_idx0 +%= step;
+        cur_idx1 +%= step;
+        const v0: V8f = x[i..][0..8].*;
+        const v1: V8f = x[i + 8 ..][0..8].*;
+        const m0 = v0 > max0;
+        const m1 = v1 > max1;
+        max0 = @select(f32, m0, v0, max0);
+        idx0 = @select(u32, m0, cur_idx0, idx0);
+        max1 = @select(f32, m1, v1, max1);
+        idx1 = @select(u32, m1, cur_idx1, idx1);
+    }
+
+    const m = max1 > max0;
+    const max_v = @select(f32, m, max1, max0);
+    const idx_v = @select(u32, m, idx1, idx0);
+
+    var best_val = max_v[0];
+    var best_idx = idx_v[0];
+    inline for (1..8) |j| {
+        if (max_v[j] > best_val) {
+            best_val = max_v[j];
+            best_idx = idx_v[j];
+        }
+    }
+
+    while (i < x.len) : (i += 1) {
+        if (x[i] > best_val) {
+            best_val = x[i];
+            best_idx = @intCast(i);
+        }
+    }
+
+    return best_idx;
+}
+
+test "argmax correctness" {
+    var arr: [1000]f32 = @splat(-100.0);
+    arr[42] = 50.0;
+    try std.testing.expectEqual(@as(u32, 42), argmax(&arr));
+
+    arr[42] = -100.0;
+    arr[999] = 100.0;
+    try std.testing.expectEqual(@as(u32, 999), argmax(&arr));
+
+    arr[999] = -100.0;
+    arr[0] = 12.0;
+    try std.testing.expectEqual(@as(u32, 0), argmax(&arr));
+
+    arr[0] = -100.0;
+    arr[7] = 88.0;
+    try std.testing.expectEqual(@as(u32, 7), argmax(&arr));
 }

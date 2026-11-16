@@ -18,6 +18,7 @@ const GgmlType = gguf.GgmlType;
 const Allocator = std.mem.Allocator;
 
 pub const Arch = enum { llama, qwen2, qwen3, lfm2, lfm3, gemma3 };
+pub const CacheType = enum(u32) { f16 = 0, q8_0 = 1, q4_0 = 2 };
 
 pub const Config = struct {
     arch: Arch,
@@ -79,7 +80,7 @@ pub const Tensor = struct {
     }
 };
 
-const Attention = struct {
+pub const Attention = struct {
     wq: Tensor,
     wk: Tensor,
     wv: Tensor,
@@ -99,7 +100,7 @@ const Attention = struct {
 };
 
 /// LFM gated short convolution: y = C * conv(B * x), all from one in_proj.
-const ShortConv = struct {
+pub const ShortConv = struct {
     in_proj: Tensor,
     out_proj: Tensor,
     /// Depthwise causal kernel, transposed to [tap][channel].
@@ -108,7 +109,7 @@ const ShortConv = struct {
     slot: usize,
 };
 
-const Layer = struct {
+pub const Layer = struct {
     attn_norm: []const f32,
     ffn_norm: []const f32,
     /// Sandwich norms applied to the mixer / FFN output before the residual add.
@@ -778,19 +779,22 @@ fn prunedFineWorker(job: *PrunedFineJob, _: usize, _: usize) void {
 }
 
 const V8f = @Vector(8, f32);
+const V8i32 = @Vector(8, i32);
 
 /// Cephes-style expf on 8 lanes (rel. error ~1e-7).
 inline fn expV(x_in: V8f) V8f {
     var x = @min(@max(x_in, @as(V8f, @splat(-87.3))), @as(V8f, @splat(88.3)));
-    const fx = @floor(x * @as(V8f, @splat(1.44269504088896341)) + @as(V8f, @splat(0.5)));
-    x = x - fx * @as(V8f, @splat(0.693359375)) - fx * @as(V8f, @splat(-2.12194440e-4));
+    const fx = @floor(@mulAdd(V8f, x, @as(V8f, @splat(1.44269504088896341)), @as(V8f, @splat(0.5))));
+    x = @mulAdd(V8f, -fx, @as(V8f, @splat(0.693359375)), x);
+    x = @mulAdd(V8f, -fx, @as(V8f, @splat(-2.12194440e-4)), x);
     var y: V8f = @splat(1.9875691500e-4);
-    y = y * x + @as(V8f, @splat(1.3981999507e-3));
-    y = y * x + @as(V8f, @splat(8.3334519073e-3));
-    y = y * x + @as(V8f, @splat(4.1665795894e-2));
-    y = y * x + @as(V8f, @splat(1.6666665459e-1));
-    y = y * x + @as(V8f, @splat(5.0000001201e-1));
-    y = y * x * x + x + @as(V8f, @splat(1.0));
+    y = @mulAdd(V8f, y, x, @as(V8f, @splat(1.3981999507e-3)));
+    y = @mulAdd(V8f, y, x, @as(V8f, @splat(8.3334519073e-3)));
+    y = @mulAdd(V8f, y, x, @as(V8f, @splat(4.1665795894e-2)));
+    y = @mulAdd(V8f, y, x, @as(V8f, @splat(1.6666665459e-1)));
+    y = @mulAdd(V8f, y, x, @as(V8f, @splat(5.0000001201e-1)));
+    const x2 = x * x;
+    y = @mulAdd(V8f, y, x2, x + @as(V8f, @splat(1.0)));
     const n: @Vector(8, i32) = @intFromFloat(fx);
     const p2: V8f = @bitCast((n + @as(@Vector(8, i32), @splat(127))) << @splat(23));
     return y * p2;
@@ -844,6 +848,108 @@ fn rmsnorm(out: []f32, x: []const f32, w: []const f32, eps: f32) void {
     for (out, x, w) |*o, v, g| o.* = v * scale * g;
 }
 
+fn fusedRmsnormQ8B(out_f: []f32, out_q: []quant.Q8B, x: []const f32, w: []const f32, eps: f32) void {
+    var ss: V8f = @splat(0);
+    var i: usize = 0;
+    while (i + 8 <= x.len) : (i += 8) {
+        const v: V8f = x[i..][0..8].*;
+        ss += v * v;
+    }
+    var s = @reduce(.Add, ss);
+    while (i < x.len) : (i += 1) s += x[i] * x[i];
+    const scale = 1.0 / @sqrt(s / @as(f32, @floatFromInt(x.len)) + eps);
+    const scale_v: V8f = @splat(scale);
+
+    const nb = x.len / 32;
+    std.debug.assert(out_q.len >= nb);
+    for (0..nb) |bi| {
+        const off = bi * 32;
+        const b = &out_q[bi];
+        var v: [4]V8f = undefined;
+        var amax: V8f = @splat(0);
+        inline for (0..4) |j| {
+            const xv: V8f = x[off + j * 8 ..][0..8].*;
+            const wv: V8f = w[off + j * 8 ..][0..8].*;
+            const yv = xv * scale_v * wv;
+            v[j] = yv;
+            out_f[off + j * 8 ..][0..8].* = yv;
+            amax = @max(amax, @abs(yv));
+        }
+        const m = @reduce(.Max, amax);
+        if (m == 0) {
+            b.* = std.mem.zeroes(quant.Q8B);
+            continue;
+        }
+        const id: V8f = @splat(127.0 / m);
+        b.d = m / 127.0;
+        var sum: V8i32 = @splat(0);
+        inline for (0..4) |j| {
+            const q: V8i32 = @intFromFloat(@round(v[j] * id));
+            sum += q;
+            b.qs[j * 8 ..][0..8].* = @as(@Vector(8, i8), @intCast(q));
+        }
+        b.s = b.d * @as(f32, @floatFromInt(@reduce(.Add, sum)));
+    }
+}
+
+fn fusedRmsnormQ8K(out_f: []f32, out_q: []quant.Q8K, x: []const f32, w: []const f32, eps: f32) void {
+    var ss: V8f = @splat(0);
+    var i: usize = 0;
+    while (i + 8 <= x.len) : (i += 8) {
+        const v: V8f = x[i..][0..8].*;
+        ss += v * v;
+    }
+    var s = @reduce(.Add, ss);
+    while (i < x.len) : (i += 1) s += x[i] * x[i];
+    const scale = 1.0 / @sqrt(s / @as(f32, @floatFromInt(x.len)) + eps);
+    const scale_v: V8f = @splat(scale);
+
+    const nb = x.len / 256;
+    std.debug.assert(out_q.len >= nb);
+    for (0..nb) |bi| {
+        const off = bi * 256;
+        const b = &out_q[bi];
+        var amax0: V8f = @splat(0);
+        var amax1: V8f = @splat(0);
+        var amax2: V8f = @splat(0);
+        var amax3: V8f = @splat(0);
+        inline for (0..8) |j| {
+            inline for (0..4) |k| {
+                const idx = j * 4 + k;
+                const xv: V8f = x[off + idx * 8 ..][0..8].*;
+                const wv: V8f = w[off + idx * 8 ..][0..8].*;
+                const yv = xv * scale_v * wv;
+                out_f[off + idx * 8 ..][0..8].* = yv;
+                switch (k) {
+                    0 => amax0 = @max(amax0, @abs(yv)),
+                    1 => amax1 = @max(amax1, @abs(yv)),
+                    2 => amax2 = @max(amax2, @abs(yv)),
+                    3 => amax3 = @max(amax3, @abs(yv)),
+                    else => unreachable,
+                }
+            }
+        }
+        const amax = @max(@max(amax0, amax1), @max(amax2, amax3));
+        const m = @reduce(.Max, amax);
+        if (m == 0) {
+            b.* = std.mem.zeroes(quant.Q8K);
+            continue;
+        }
+        const id: V8f = @splat(127.0 / m);
+        b.d = m / 127.0;
+        inline for (0..16) |j| {
+            const v0: V8f = out_f[off + j * 16 ..][0..8].*;
+            const v1: V8f = out_f[off + j * 16 + 8 ..][0..8].*;
+            const q0: V8i32 = @intFromFloat(@round(v0 * id));
+            const q1: V8i32 = @intFromFloat(@round(v1 * id));
+            b.qs[j * 16 ..][0..8].* = @as(@Vector(8, i8), @intCast(q0));
+            b.qs[j * 16 + 8 ..][0..8].* = @as(@Vector(8, i8), @intCast(q1));
+            b.bsums[j] = @intCast(@reduce(.Add, q0 + q1));
+        }
+        inline for (0..8) |j| b.bsums32[j] = b.bsums[2 * j] + b.bsums[2 * j + 1];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Attention
 //
@@ -861,12 +967,11 @@ fn rmsnorm(out: []f32, x: []const f32, w: []const f32, eps: f32) void {
 // into the softmax weights once per block.
 
 pub const kv_tile = 16;
-const max_q = 4;
+const max_q = 8;
 const max_head_dim = 256;
 pub const max_spec = 8;
 
 const V16f = @Vector(16, f32);
-const V8i32 = @Vector(8, i32);
 
 /// Quantize one 32-value block: max-abs i8 values written with stride
 /// `stride` starting at `vals`, f16 scale at `sc`.
@@ -888,13 +993,43 @@ inline fn quantBlock32(xs: *const [32]f32, vals: [*]u8, stride: usize, sc: *alig
     }
 }
 
+/// Quantize one 32-value block to symmetric 4-bit nibbles:
+/// values in [-7, 7] represented as 4-bit two's complement in [0, 15],
+/// written to `q4[0..32]`, with f16 scale written to `sc`.
+inline fn quantBlock32_q4(xs: *const [32]f32, q4: *[32]u8, sc: *align(1) f16) void {
+    var amax: V8f = @splat(0);
+    inline for (0..4) |j| amax = @max(amax, @abs(@as(V8f, xs[j * 8 ..][0..8].*)));
+    const m = @reduce(.Max, amax);
+    if (m == 0) {
+        @memset(q4, 0);
+        sc.* = 0;
+        return;
+    }
+    const id: V8f = @splat(7.0 / m);
+    sc.* = @floatCast(m / 7.0);
+    inline for (0..4) |j| {
+        const v = @as(V8f, xs[j * 8 ..][0..8].*) * id;
+        const q: V8i32 = @intFromFloat(@round(v));
+        const qc = @min(@max(q, @as(V8i32, @splat(-7))), @as(V8i32, @splat(7)));
+        const qb: @Vector(8, i8) = @intCast(qc);
+        const qu: [8]u8 = @as(@Vector(8, u8), @bitCast(qb)) & @as(@Vector(8, u8), @splat(0x0F));
+        q4[j * 8 ..][0..8].* = qu;
+    }
+}
+
 /// Online-softmax attention of NQ queries against one KV head; query i sees
 /// positions [lo[i], np[i]). Writes the normalized outputs to `out`.
-/// QUANT selects the q8_0 cache layout (see above); kt/vr are raw bytes.
-fn attendBlock(comptime NQ: usize, comptime QUANT: bool, hd: usize, kt: [*]const u8, vr: [*]const u8, q: [NQ][*]const f32, lo: [NQ]usize, np: [NQ]usize, out: [NQ][*]f32, scale: f32) void {
-    // f16 tile: hd*16 f16 values. q8_0 tile: hd/32 blocks of
-    // [32*16 i8 + 16 f16 scales] = hd*17 bytes.
-    const tile_bytes = if (QUANT) hd * 17 else hd * 32;
+/// CACHE selects f16, q8_0, or q4_0 cache layout; kt/vr are raw bytes.
+/// If window > 0, the KV cache is addressed as a ring buffer of w_tiles tiles.
+fn attendBlock(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt: [*]const u8, vr: [*]const u8, q: [NQ][*]const f32, lo: [NQ]usize, np: [NQ]usize, out: [NQ][*]f32, scale: f32, window: usize, w_tiles: usize) void {
+    // f16 tile: hd*16 f16 values = hd*32 bytes.
+    // q8_0 tile: hd/32 blocks of [32*16 i8 + 16 f16 scales] = hd*17 bytes.
+    // q4_0 tile: hd/32 blocks of [32*8 u8 nibbles + 16 f16 scales] = hd*9 bytes.
+    const tile_bytes: usize = switch (CACHE) {
+        .f16 => hd * 32,
+        .q8_0 => hd * 17,
+        .q4_0 => hd * 9,
+    };
     const nblocks = hd / 32;
     var o: [NQ][max_head_dim]f32 align(32) = undefined;
     var m: [NQ]f32 = @splat(-std.math.inf(f32));
@@ -909,98 +1044,295 @@ fn attendBlock(comptime NQ: usize, comptime QUANT: bool, hd: usize, kt: [*]const
     const ntiles = (maxnp + kv_tile - 1) / kv_tile;
 
     for (minlo / kv_tile..ntiles) |j| {
-        const tile = kt + j * tile_bytes;
+        const tile_idx = if (window > 0) j % w_tiles else j;
+        const tile = kt + tile_idx * tile_bytes;
         var s: [NQ]V16f = @splat(@splat(0));
-        if (QUANT) {
-            var bp = tile;
-            var b: usize = 0;
-            while (b < nblocks) : (b += 1) {
-                const ksc: [*]const f16 = @ptrCast(@alignCast(bp + 512));
-                const sv: V16f = @floatCast(@as(@Vector(16, f16), ksc[0..kv_tile].*));
-                inline for (0..32) |dp| {
-                    const d = b * 32 + dp;
-                    const kf: V16f = @floatFromInt(@as(@Vector(16, i8), @bitCast(@as(@Vector(16, u8), bp[dp * 16 ..][0..16].*))));
-                    inline for (0..NQ) |i| s[i] = @mulAdd(V16f, @splat(q[i][d]), kf * sv, s[i]);
+        switch (CACHE) {
+            .q4_0 => {
+                comptime var qs: usize = 0;
+                inline while (qs < NQ) : (qs += 4) {
+                    const q_sub = comptime @min(4, NQ - qs);
+                    var bp = tile;
+                    var b: usize = 0;
+                    var s0_acc: [q_sub]V8f = @splat(@splat(0));
+                    var s1_acc: [q_sub]V8f = @splat(@splat(0));
+                    while (b < nblocks) : (b += 1) {
+                        const ksc: [*]const f16 = @ptrCast(@alignCast(bp + 256));
+                        const sv: V16f = @floatCast(@as(@Vector(16, f16), ksc[0..kv_tile].*));
+                        const sv0: V8f = @as([16]f32, sv)[0..8].*;
+                        const sv1: V8f = @as([16]f32, sv)[8..16].*;
+                        inline for (0..32) |dp| {
+                            const d = b * 32 + dp;
+                            const raw8: [8]u8 = bp[dp * 8 ..][0..8].*;
+                            const u8_8: @Vector(8, u8) = raw8;
+                            const lo_u = u8_8 & @as(@Vector(8, u8), @splat(0x0F));
+                            const hi_u = (u8_8 >> @as(@Vector(8, u8), @splat(4))) & @as(@Vector(8, u8), @splat(0x0F));
+                            const s0: @Vector(8, i8) = @as(@Vector(8, i8), @bitCast(lo_u ^ @as(@Vector(8, u8), @splat(0x08)))) -% @as(@Vector(8, i8), @splat(8));
+                            const s1: @Vector(8, i8) = @as(@Vector(8, i8), @bitCast(hi_u ^ @as(@Vector(8, u8), @splat(0x08)))) -% @as(@Vector(8, i8), @splat(8));
+                            const kf0: V8f = @floatFromInt(s0);
+                            const kf1: V8f = @floatFromInt(s1);
+                            const kd0 = kf0 * sv0;
+                            const kd1 = kf1 * sv1;
+                            inline for (0..q_sub) |qi_idx| {
+                                const i = qs + qi_idx;
+                                const qi: V8f = @splat(q[i][d]);
+                                s0_acc[qi_idx] = @mulAdd(V8f, qi, kd0, s0_acc[qi_idx]);
+                                s1_acc[qi_idx] = @mulAdd(V8f, qi, kd1, s1_acc[qi_idx]);
+                            }
+                        }
+                        bp += 288;
+                    }
+                    inline for (0..q_sub) |qi_idx| {
+                        const i = qs + qi_idx;
+                        var s_arr: [16]f32 = undefined;
+                        s_arr[0..8].* = s0_acc[qi_idx];
+                        s_arr[8..16].* = s1_acc[qi_idx];
+                        s[i] = s_arr;
+                    }
                 }
-                bp += 544;
-            }
-        } else {
-            const kf16: [*]const f16 = @ptrCast(@alignCast(tile));
-            for (0..hd) |d| {
-                const kf: V16f = @floatCast(@as(@Vector(16, f16), kf16[d * kv_tile ..][0..kv_tile].*));
-                inline for (0..NQ) |i| s[i] = @mulAdd(V16f, @splat(q[i][d]), kf, s[i]);
-            }
+            },
+            .q8_0 => {
+                comptime var qs: usize = 0;
+                inline while (qs < NQ) : (qs += 4) {
+                    const q_sub = comptime @min(4, NQ - qs);
+                    var bp = tile;
+                    var b: usize = 0;
+                    var s_sub: [q_sub]V16f = @splat(@splat(0));
+                    while (b < nblocks) : (b += 1) {
+                        const ksc: [*]const f16 = @ptrCast(@alignCast(bp + 512));
+                        const sv: V16f = @floatCast(@as(@Vector(16, f16), ksc[0..kv_tile].*));
+                        inline for (0..32) |dp| {
+                            const d = b * 32 + dp;
+                            const kf: V16f = @floatFromInt(@as(@Vector(16, i8), @bitCast(@as(@Vector(16, u8), bp[dp * 16 ..][0..16].*))));
+                            const k_dequant = kf * sv;
+                            inline for (0..q_sub) |qi_idx| {
+                                const i = qs + qi_idx;
+                                s_sub[qi_idx] = @mulAdd(V16f, @splat(q[i][d]), k_dequant, s_sub[qi_idx]);
+                            }
+                        }
+                        bp += 544;
+                    }
+                    inline for (0..q_sub) |qi_idx| {
+                        s[qs + qi_idx] = s_sub[qi_idx];
+                    }
+                }
+            },
+            .f16 => {
+                comptime var qs: usize = 0;
+                inline while (qs < NQ) : (qs += 4) {
+                    const q_sub = comptime @min(4, NQ - qs);
+                    const kf16: [*]const f16 = @ptrCast(@alignCast(tile));
+                    var s_sub: [q_sub]V16f = @splat(@splat(0));
+                    for (0..hd) |d| {
+                        const kf: V16f = @floatCast(@as(@Vector(16, f16), kf16[d * kv_tile ..][0..kv_tile].*));
+                        inline for (0..q_sub) |qi_idx| {
+                            const i = qs + qi_idx;
+                            s_sub[qi_idx] = @mulAdd(V16f, @splat(q[i][d]), kf, s_sub[qi_idx]);
+                        }
+                    }
+                    inline for (0..q_sub) |qi_idx| {
+                        s[qs + qi_idx] = s_sub[qi_idx];
+                    }
+                }
+            },
         }
         // Mask, then fold the tile into the running softmax of each query.
         var p: [NQ][kv_tile]f32 = undefined;
         const base = j * kv_tile;
+        var has_active_p = false;
         inline for (0..NQ) |i| {
-            var sv = s[i] * @as(V16f, @splat(scale));
-            if (base < lo[i] or base + kv_tile > np[i]) {
-                const lane = std.simd.iota(u32, kv_tile) + @as(@Vector(kv_tile, u32), @splat(@intCast(base)));
-                const visible = (lane < @as(@Vector(kv_tile, u32), @splat(@intCast(np[i])))) & (lane >= @as(@Vector(kv_tile, u32), @splat(@intCast(lo[i]))));
-                sv = @select(f32, visible, sv, @as(V16f, @splat(-std.math.inf(f32))));
-            }
-            const tmax = @reduce(.Max, sv);
-            if (tmax == -std.math.inf(f32)) {
+            if (base >= np[i] or base + kv_tile <= lo[i]) {
                 p[i] = @splat(0);
             } else {
-                const m_new = @max(m[i], tmax);
-                const corr = @exp(m[i] - m_new);
-                const mv: V8f = @splat(m_new);
-                const e0 = expV(@as(V8f, @as([kv_tile]f32, sv)[0..8].*) - mv);
-                const e1 = expV(@as(V8f, @as([kv_tile]f32, sv)[8..16].*) - mv);
-                p[i][0..8].* = e0;
-                p[i][8..16].* = e1;
-                l[i] = l[i] * corr + @reduce(.Add, e0 + e1);
-                if (corr != 1) {
-                    const cv: V8f = @splat(corr);
-                    var d: usize = 0;
-                    while (d < hd) : (d += 8) o[i][d..][0..8].* = @as(V8f, o[i][d..][0..8].*) * cv;
+                var sv = s[i] * @as(V16f, @splat(scale));
+                if (base < lo[i] or base + kv_tile > np[i]) {
+                    const lane = std.simd.iota(u32, kv_tile) + @as(@Vector(kv_tile, u32), @splat(@intCast(base)));
+                    const visible = (lane < @as(@Vector(kv_tile, u32), @splat(@intCast(np[i])))) & (lane >= @as(@Vector(kv_tile, u32), @splat(@intCast(lo[i]))));
+                    sv = @select(f32, visible, sv, @as(V16f, @splat(-std.math.inf(f32))));
                 }
-                m[i] = m_new;
+                const tmax = @reduce(.Max, sv);
+                if (tmax == -std.math.inf(f32)) {
+                    p[i] = @splat(0);
+                } else {
+                    has_active_p = true;
+                    const m_new = @max(m[i], tmax);
+                    const corr = @exp(m[i] - m_new);
+                    const mv: V8f = @splat(m_new);
+                    const e0 = expV(@as(V8f, @as([kv_tile]f32, sv)[0..8].*) - mv);
+                    const e1 = expV(@as(V8f, @as([kv_tile]f32, sv)[8..16].*) - mv);
+                    p[i][0..8].* = e0;
+                    p[i][8..16].* = e1;
+                    l[i] = l[i] * corr + @reduce(.Add, e0 + e1);
+                    if (corr != 1) {
+                        const cv: V8f = @splat(corr);
+                        var d: usize = 0;
+                        while (d + 16 <= hd) : (d += 16) {
+                            o[i][d..][0..8].* = @as(V8f, o[i][d..][0..8].*) * cv;
+                            o[i][d + 8 ..][0..8].* = @as(V8f, o[i][d + 8 ..][0..8].*) * cv;
+                        }
+                        while (d < hd) : (d += 8) o[i][d..][0..8].* = @as(V8f, o[i][d..][0..8].*) * cv;
+                    }
+                    m[i] = m_new;
+                }
             }
         }
-        // o += p . V for this tile, 8 output dims at a time kept in registers.
+
+        if (!has_active_p) continue;
+
+        // o += p . V for this tile, 8 or 16 output dims at a time kept in registers.
         const nvalid = @min(kv_tile, maxnp - base);
-        if (QUANT) {
-            // Fold each block's per-position scales into the softmax weights
-            // once; the inner loop then accumulates plain i8 values.
-            const vt = vr + j * tile_bytes;
-            var ps: [NQ][kv_tile]f32 = undefined;
-            var b: usize = 0;
-            while (b < nblocks) : (b += 1) {
-                const vsc: [*]const f16 = @ptrCast(@alignCast(vt + 16 * hd + b * 32));
-                const sv: V16f = @floatCast(@as(@Vector(16, f16), vsc[0..kv_tile].*));
-                inline for (0..NQ) |i| ps[i][0..kv_tile].* = @as(V16f, p[i][0..kv_tile].*) * sv;
-                inline for (0..4) |c| {
-                    const d = b * 32 + c * 8;
-                    var acc: [NQ]V8f = undefined;
-                    inline for (0..NQ) |i| acc[i] = o[i][d..][0..8].*;
-                    for (0..nvalid) |n| {
-                        const vv: V8f = @floatFromInt(@as(@Vector(8, i8), @bitCast(@as(@Vector(8, u8), vt[n * hd + d ..][0..8].*))));
-                        inline for (0..NQ) |i| acc[i] = @mulAdd(V8f, @splat(ps[i][n]), vv, acc[i]);
+        switch (CACHE) {
+            .q4_0 => {
+                const vt = vr + tile_idx * tile_bytes;
+                comptime var qs: usize = 0;
+                inline while (qs < NQ) : (qs += 4) {
+                    const q_sub = comptime @min(4, NQ - qs);
+                    var ps: [q_sub][kv_tile]f32 = undefined;
+                    var b: usize = 0;
+                    while (b < nblocks) : (b += 1) {
+                        const vsc: [*]const f16 = @ptrCast(@alignCast(vt + 8 * hd + b * 32));
+                        const sv: V16f = @floatCast(@as(@Vector(16, f16), vsc[0..kv_tile].*));
+                        inline for (0..q_sub) |qi_idx| {
+                            const i = qs + qi_idx;
+                            ps[qi_idx][0..kv_tile].* = @as(V16f, p[i][0..kv_tile].*) * sv;
+                        }
+                        inline for (0..2) |c2| {
+                            const d = b * 32 + c2 * 16;
+                            var acc0: [q_sub]V8f = undefined;
+                            var acc1: [q_sub]V8f = undefined;
+                            inline for (0..q_sub) |qi_idx| {
+                                const i = qs + qi_idx;
+                                acc0[qi_idx] = o[i][d..][0..8].*;
+                                acc1[qi_idx] = o[i][d + 8 ..][0..8].*;
+                            }
+                            for (0..nvalid) |n| {
+                                const raw8: [8]u8 = vt[n * (hd / 2) + b * 16 + c2 * 8 ..][0..8].*;
+                                const u8_8: @Vector(8, u8) = raw8;
+                                const lo_u = u8_8 & @as(@Vector(8, u8), @splat(0x0F));
+                                const hi_u = (u8_8 >> @as(@Vector(8, u8), @splat(4))) & @as(@Vector(8, u8), @splat(0x0F));
+                                const s0: @Vector(8, i8) = @as(@Vector(8, i8), @bitCast(lo_u ^ @as(@Vector(8, u8), @splat(0x08)))) -% @as(@Vector(8, i8), @splat(8));
+                                const s1: @Vector(8, i8) = @as(@Vector(8, i8), @bitCast(hi_u ^ @as(@Vector(8, u8), @splat(0x08)))) -% @as(@Vector(8, i8), @splat(8));
+                                const vv0: V8f = @floatFromInt(s0);
+                                const vv1: V8f = @floatFromInt(s1);
+                                inline for (0..q_sub) |qi_idx| {
+                                    const psi: V8f = @splat(ps[qi_idx][n]);
+                                    acc0[qi_idx] = @mulAdd(V8f, psi, vv0, acc0[qi_idx]);
+                                    acc1[qi_idx] = @mulAdd(V8f, psi, vv1, acc1[qi_idx]);
+                                }
+                            }
+                            inline for (0..q_sub) |qi_idx| {
+                                const i = qs + qi_idx;
+                                o[i][d..][0..8].* = acc0[qi_idx];
+                                o[i][d + 8 ..][0..8].* = acc1[qi_idx];
+                            }
+                        }
                     }
-                    inline for (0..NQ) |i| o[i][d..][0..8].* = acc[i];
                 }
-            }
-        } else {
-            const vt: [*]const f16 = @ptrCast(@alignCast(vr + base * hd * 2));
-            var d: usize = 0;
-            while (d < hd) : (d += 8) {
-                var acc: [NQ]V8f = undefined;
-                inline for (0..NQ) |i| acc[i] = o[i][d..][0..8].*;
-                for (0..nvalid) |n| {
-                    const vv: V8f = @floatCast(@as(@Vector(8, f16), vt[n * hd + d ..][0..8].*));
-                    inline for (0..NQ) |i| acc[i] = @mulAdd(V8f, @splat(p[i][n]), vv, acc[i]);
+            },
+            .q8_0 => {
+                // Fold each block's per-position scales into the softmax weights
+                // once; the inner loop then accumulates plain i8 values.
+                const vt = vr + tile_idx * tile_bytes;
+                comptime var qs: usize = 0;
+                inline while (qs < NQ) : (qs += 4) {
+                    const q_sub = comptime @min(4, NQ - qs);
+                    var ps: [q_sub][kv_tile]f32 = undefined;
+                    var b: usize = 0;
+                    while (b < nblocks) : (b += 1) {
+                        const vsc: [*]const f16 = @ptrCast(@alignCast(vt + 16 * hd + b * 32));
+                        const sv: V16f = @floatCast(@as(@Vector(16, f16), vsc[0..kv_tile].*));
+                        inline for (0..q_sub) |qi_idx| {
+                            const i = qs + qi_idx;
+                            ps[qi_idx][0..kv_tile].* = @as(V16f, p[i][0..kv_tile].*) * sv;
+                        }
+                        inline for (0..2) |c2| {
+                            const d = b * 32 + c2 * 16;
+                            var acc0: [q_sub]V8f = undefined;
+                            var acc1: [q_sub]V8f = undefined;
+                            inline for (0..q_sub) |qi_idx| {
+                                const i = qs + qi_idx;
+                                acc0[qi_idx] = o[i][d..][0..8].*;
+                                acc1[qi_idx] = o[i][d + 8 ..][0..8].*;
+                            }
+                            for (0..nvalid) |n| {
+                                const v16: [16]u8 = vt[n * hd + d ..][0..16].*;
+                                const vv0: V8f = @floatFromInt(@as(@Vector(8, i8), @bitCast(@as(@Vector(8, u8), v16[0..8].*))));
+                                const vv1: V8f = @floatFromInt(@as(@Vector(8, i8), @bitCast(@as(@Vector(8, u8), v16[8..16].*))));
+                                inline for (0..q_sub) |qi_idx| {
+                                    const psi: V8f = @splat(ps[qi_idx][n]);
+                                    acc0[qi_idx] = @mulAdd(V8f, psi, vv0, acc0[qi_idx]);
+                                    acc1[qi_idx] = @mulAdd(V8f, psi, vv1, acc1[qi_idx]);
+                                }
+                            }
+                            inline for (0..q_sub) |qi_idx| {
+                                const i = qs + qi_idx;
+                                o[i][d..][0..8].* = acc0[qi_idx];
+                                o[i][d + 8 ..][0..8].* = acc1[qi_idx];
+                            }
+                        }
+                    }
                 }
-                inline for (0..NQ) |i| o[i][d..][0..8].* = acc[i];
-            }
+            },
+            .f16 => {
+                const vt: [*]const f16 = @ptrCast(@alignCast(vr + tile_idx * tile_bytes));
+                comptime var qs: usize = 0;
+                inline while (qs < NQ) : (qs += 4) {
+                    const q_sub = comptime @min(4, NQ - qs);
+                    var d: usize = 0;
+                    while (d + 16 <= hd) : (d += 16) {
+                        var acc0: [q_sub]V8f = undefined;
+                        var acc1: [q_sub]V8f = undefined;
+                        inline for (0..q_sub) |qi_idx| {
+                            const i = qs + qi_idx;
+                            acc0[qi_idx] = o[i][d..][0..8].*;
+                            acc1[qi_idx] = o[i][d + 8 ..][0..8].*;
+                        }
+                        for (0..nvalid) |n| {
+                            const v16: [16]f16 = vt[n * hd + d ..][0..16].*;
+                            const vv0: V8f = @floatCast(@as(@Vector(8, f16), v16[0..8].*));
+                            const vv1: V8f = @floatCast(@as(@Vector(8, f16), v16[8..16].*));
+                            inline for (0..q_sub) |qi_idx| {
+                                const i = qs + qi_idx;
+                                const pi: V8f = @splat(p[i][n]);
+                                acc0[qi_idx] = @mulAdd(V8f, pi, vv0, acc0[qi_idx]);
+                                acc1[qi_idx] = @mulAdd(V8f, pi, vv1, acc1[qi_idx]);
+                            }
+                        }
+                        inline for (0..q_sub) |qi_idx| {
+                            const i = qs + qi_idx;
+                            o[i][d..][0..8].* = acc0[qi_idx];
+                            o[i][d + 8 ..][0..8].* = acc1[qi_idx];
+                        }
+                    }
+                    while (d < hd) : (d += 8) {
+                        var acc: [q_sub]V8f = undefined;
+                        inline for (0..q_sub) |qi_idx| {
+                            const i = qs + qi_idx;
+                            acc[qi_idx] = o[i][d..][0..8].*;
+                        }
+                        for (0..nvalid) |n| {
+                            const vv: V8f = @floatCast(@as(@Vector(8, f16), vt[n * hd + d ..][0..8].*));
+                            inline for (0..q_sub) |qi_idx| {
+                                const i = qs + qi_idx;
+                                acc[qi_idx] = @mulAdd(V8f, @splat(p[i][n]), vv, acc[qi_idx]);
+                            }
+                        }
+                        inline for (0..q_sub) |qi_idx| {
+                            const i = qs + qi_idx;
+                            o[i][d..][0..8].* = acc[qi_idx];
+                        }
+                    }
+                }
+            },
         }
     }
     inline for (0..NQ) |i| {
         const inv: V8f = @splat(if (l[i] > 0) 1.0 / l[i] else 0);
         var d: usize = 0;
+        while (d + 16 <= hd) : (d += 16) {
+            out[i][d..][0..8].* = @as(V8f, o[i][d..][0..8].*) * inv;
+            out[i][d + 8 ..][0..8].* = @as(V8f, o[i][d + 8 ..][0..8].*) * inv;
+        }
         while (d < hd) : (d += 8) out[i][d..][0..8].* = @as(V8f, o[i][d..][0..8].*) * inv;
     }
 }
@@ -1011,8 +1343,10 @@ const AttnJob = struct {
     n_kv: usize,
     /// Sliding window length, 0 = full causal attention.
     window: usize,
+    w_tiles: usize,
     pos0: usize,
     ntok: usize,
+    block_q: usize,
     /// Query blocks per KV head.
     qblocks: usize,
     chunks: Chunks,
@@ -1025,11 +1359,12 @@ fn attnWorker(job: *AttnJob, _: usize, _: usize) void {
     const g = c.n_heads / job.n_kv;
     const scale = c.attn_scale;
     const nq_total = job.ntok * g;
+    const bq = job.block_q;
     while (job.chunks.grab()) |range| for (range[0]..range[1]) |item| {
         const kh = item / job.qblocks;
         const qb = item % job.qblocks;
-        const first = qb * max_q;
-        const nq = @min(max_q, nq_total - first);
+        const first = qb * bq;
+        const nq = @min(bq, nq_total - first);
         const kt = st.k_cache.ptr + st.cacheIndex(job.slot, kh);
         const vr = st.v_cache.ptr + st.cacheIndex(job.slot, kh);
         switch (nq) {
@@ -1047,10 +1382,10 @@ fn attnWorker(job: *AttnJob, _: usize, _: usize) void {
                     lo[i] = if (job.window > 0 and np[i] > job.window) np[i] - job.window else 0;
                     op[i] = st.att.f.ptr + t * c.q_dim + h * hd;
                 }
-                if (st.kv_q8) {
-                    attendBlock(n, true, hd, kt, vr, qp, lo, np, op, scale);
-                } else {
-                    attendBlock(n, false, hd, kt, vr, qp, lo, np, op, scale);
+                switch (st.cache_type) {
+                    .f16 => attendBlock(n, .f16, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles),
+                    .q8_0 => attendBlock(n, .q8_0, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles),
+                    .q4_0 => attendBlock(n, .q4_0, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles),
                 }
             },
             else => unreachable,
@@ -1080,12 +1415,17 @@ pub const State = struct {
     /// Per (attention layer, kv head) byte region: K and V in tiles of 16
     /// positions. f16: hd*16 f16 values per tile (V row-major). q8_0: hd*17
     /// bytes per tile (32 i8 values + 16 f16 scales per 32 head dims).
+    /// q4_0: hd*9 bytes per tile (32 4-bit values + 16 f16 scales per 32 head dims).
     k_cache: []align(32) u8,
     v_cache: []align(32) u8,
-    /// Bytes of k_cache / v_cache per (attention layer, kv head).
-    cache_stride: usize,
-    /// K/V cached as q8_0 instead of f16.
-    kv_q8: bool,
+    /// Byte offsets into k_cache / v_cache for each attention layer slot.
+    slot_offsets: []usize,
+    /// Bytes of k_cache / v_cache per KV head for each attention layer slot.
+    slot_strides: []usize,
+    /// Number of 16-token tiles allocated per KV head for each attention layer slot.
+    slot_tiles: []usize,
+    /// K/V cache format: f16, q8_0, or q4_0.
+    cache_type: CacheType,
     /// ctx rounded up to whole K tiles.
     ctx_pad: usize,
     /// Mixer / FFN output awaiting its post-norm (sandwich-norm models).
@@ -1101,10 +1441,10 @@ pub const State = struct {
     coarse_scores: []f32 = &.{},
     cands: []u32 = &.{},
 
-    pub fn init(gpa: Allocator, model: *const Model, pool: *Pool, ctx: usize, bmax: usize, kv_q8: bool) !State {
+    pub fn init(gpa: Allocator, model: *const Model, pool: *Pool, ctx: usize, bmax: usize, cache_type: CacheType) !State {
         const c = &model.cfg;
         if (c.head_dim % 8 != 0 or c.head_dim > max_head_dim) return error.UnsupportedHeadDim;
-        if (kv_q8 and c.head_dim % 32 != 0) return error.UnsupportedHeadDim;
+        if (cache_type != .f16 and c.head_dim % 32 != 0) return error.UnsupportedHeadDim;
         var s: State = undefined;
         s.gpa = gpa;
         s.model = model;
@@ -1113,7 +1453,7 @@ pub const State = struct {
         const batch_cap = @max(bmax, max_spec + 1);
         s.bmax = batch_cap;
         s.pos = 0;
-        s.kv_q8 = kv_q8;
+        s.cache_type = cache_type;
         s.ctx_pad = std.mem.alignForward(usize, ctx, kv_tile);
         const hist = if (c.conv_kernel > 0) c.conv_kernel - 1 else 0;
         const has_conv = model.n_conv_layers > 0;
@@ -1148,14 +1488,41 @@ pub const State = struct {
             done += 1;
         }
         @memset(s.conv_state, 0);
-        // Tile bytes per position group: f16 stores hd*16 f16 values; q8_0
-        // stores hd/32 blocks of 32*16 i8 values + 16 f16 scales = hd*17.
-        const tile_bytes = if (kv_q8) c.head_dim * 17 else c.head_dim * 32;
-        s.cache_stride = (s.ctx_pad / kv_tile) * tile_bytes;
-        const cache_len = model.n_attn_layers * c.n_kv_heads * s.cache_stride;
-        s.k_cache = try gpa.alignedAlloc(u8, .@"32", cache_len);
+        // Tile bytes per position group: f16 stores hd*16 f16 values (hd*32);
+        // q8_0 stores hd/32 blocks of 32*16 i8 + 16 f16 scales (hd*17);
+        // q4_0 stores hd/32 blocks of 32*8 nibbles + 16 f16 scales (hd*9).
+        const tile_bytes: usize = switch (cache_type) {
+            .f16 => c.head_dim * 32,
+            .q8_0 => c.head_dim * 17,
+            .q4_0 => c.head_dim * 9,
+        };
+
+        s.slot_offsets = try gpa.alloc(usize, model.n_attn_layers);
+        errdefer gpa.free(s.slot_offsets);
+        s.slot_strides = try gpa.alloc(usize, model.n_attn_layers);
+        errdefer gpa.free(s.slot_strides);
+        s.slot_tiles = try gpa.alloc(usize, model.n_attn_layers);
+        errdefer gpa.free(s.slot_tiles);
+
+        var total_bytes: usize = 0;
+        for (model.layers) |*L| {
+            switch (L.mixer) {
+                .attention => |*A| {
+                    const is_swa = A.swa and c.swa_window > 0;
+                    const tiles = if (is_swa) (c.swa_window + kv_tile - 1) / kv_tile + 1 else s.ctx_pad / kv_tile;
+                    const head_bytes = tiles * tile_bytes;
+                    s.slot_tiles[A.kv_slot] = tiles;
+                    s.slot_strides[A.kv_slot] = head_bytes;
+                    s.slot_offsets[A.kv_slot] = total_bytes;
+                    total_bytes += c.n_kv_heads * head_bytes;
+                },
+                .shortconv => {},
+            }
+        }
+
+        s.k_cache = try gpa.alignedAlloc(u8, .@"32", total_bytes);
         errdefer gpa.free(s.k_cache);
-        s.v_cache = try gpa.alignedAlloc(u8, .@"32", cache_len);
+        s.v_cache = try gpa.alignedAlloc(u8, .@"32", total_bytes);
         if (model.output_coarse != null) {
             const n_groups = c.vocab / 8;
             s.coarse_scores = try gpa.alloc(f32, n_groups);
@@ -1175,6 +1542,9 @@ pub const State = struct {
         s.att.deinit(gpa);
         s.hb.deinit(gpa);
         inline for (.{ "x", "q", "k", "v", "logits", "rope_cs", "rope_cs_swa", "tmp", "gate", "conv_in", "conv_hist", "conv_state", "conv_checkpoint" }) |name| gpa.free(@field(s, name));
+        gpa.free(s.slot_offsets);
+        gpa.free(s.slot_strides);
+        gpa.free(s.slot_tiles);
         gpa.free(s.k_cache);
         gpa.free(s.v_cache);
         if (s.coarse_scores.len > 0) gpa.free(s.coarse_scores);
@@ -1225,9 +1595,8 @@ pub const State = struct {
     }
 
     /// Start of one (attention layer, kv head) region in k_cache / v_cache.
-    inline fn cacheIndex(s: *const State, slot: usize, kh: usize) usize {
-        const c = &s.model.cfg;
-        return (slot * c.n_kv_heads + kh) * s.cache_stride;
+    pub inline fn cacheIndex(s: *const State, slot: usize, kh: usize) usize {
+        return s.slot_offsets[slot] + kh * s.slot_strides[slot];
     }
 
     fn matmul(s: *State, outs: []const MatOut, act: *Act) void {
@@ -1328,44 +1697,103 @@ pub const State = struct {
             }
             s.rope(q, t, A.swa);
             s.rope(k, t, A.swa);
+            const is_swa = A.swa and c.swa_window > 0;
+            const w_tiles = s.slot_tiles[A.kv_slot];
             const p = pos0 + t;
-            const tile = p / kv_tile;
+            const tile = if (is_swa) (p / kv_tile) % w_tiles else p / kv_tile;
             const pl = p % kv_tile;
-            const tb = if (s.kv_q8) hd * 17 else hd * 32;
+            const tb: usize = switch (s.cache_type) {
+                .f16 => hd * 32,
+                .q8_0 => hd * 17,
+                .q4_0 => hd * 9,
+            };
             for (0..A.n_kv_heads) |kh| {
                 const base = s.cacheIndex(A.kv_slot, kh);
-                if (s.kv_q8) {
-                    const kt = s.k_cache.ptr + base + tile * tb;
-                    const vt = s.v_cache.ptr + base + tile * tb;
-                    const kq = k[kh * hd ..][0..hd];
-                    const vq = v[kh * hd ..][0..hd];
-                    var b: usize = 0;
-                    while (b < hd / 32) : (b += 1) {
-                        quantBlock32(kq[b * 32 ..][0..32], kt + b * 544 + pl, kv_tile, @ptrCast(kt + b * 544 + 512 + pl * 2));
-                        quantBlock32(vq[b * 32 ..][0..32], vt + pl * hd + b * 32, 1, @ptrCast(vt + 16 * hd + b * 32 + pl * 2));
-                    }
-                } else {
-                    const kt: [*]f16 = @ptrCast(@alignCast(s.k_cache.ptr + base + tile * tb + pl * 2));
-                    const vr: [*]f16 = @ptrCast(@alignCast(s.v_cache.ptr + base + p * hd * 2));
-                    for (0..hd) |d| {
-                        kt[d * kv_tile] = @floatCast(k[kh * hd + d]);
-                        vr[d] = @floatCast(v[kh * hd + d]);
-                    }
+                switch (s.cache_type) {
+                    .q4_0 => {
+                        const kt = s.k_cache.ptr + base + tile * tb;
+                        const vt = s.v_cache.ptr + base + tile * tb;
+                        const kq = k[kh * hd ..][0..hd];
+                        const vq = v[kh * hd ..][0..hd];
+                        var b: usize = 0;
+                        while (b < hd / 32) : (b += 1) {
+                            var q4_k: [32]u8 = undefined;
+                            var sc_k: f16 = undefined;
+                            quantBlock32_q4(kq[b * 32 ..][0..32], &q4_k, &sc_k);
+
+                            const k_bp = kt + b * 288;
+                            if (pl == 0) @memset(k_bp[0..256], 0);
+                            @as(*align(1) f16, @ptrCast(k_bp + 256 + pl * 2)).* = sc_k;
+                            if (pl < 8) {
+                                inline for (0..32) |dp| {
+                                    k_bp[dp * 8 + pl] = (k_bp[dp * 8 + pl] & 0xF0) | q4_k[dp];
+                                }
+                            } else {
+                                inline for (0..32) |dp| {
+                                    k_bp[dp * 8 + (pl - 8)] = (k_bp[dp * 8 + (pl - 8)] & 0x0F) | (q4_k[dp] << 4);
+                                }
+                            }
+
+                            var q4_v: [32]u8 = undefined;
+                            var sc_v: f16 = undefined;
+                            quantBlock32_q4(vq[b * 32 ..][0..32], &q4_v, &sc_v);
+
+                            @as(*align(1) f16, @ptrCast(vt + 8 * hd + b * 32 + pl * 2)).* = sc_v;
+                            const v_dst = vt + pl * (hd / 2) + b * 16;
+                            const q_lo: @Vector(8, u8) = q4_v[0..8].*;
+                            const q_hi: @Vector(8, u8) = q4_v[8..16].*;
+                            const v0: [8]u8 = q_lo | (q_hi << @as(@Vector(8, u8), @splat(4)));
+                            const q_lo2: @Vector(8, u8) = q4_v[16..24].*;
+                            const q_hi2: @Vector(8, u8) = q4_v[24..32].*;
+                            const v1: [8]u8 = q_lo2 | (q_hi2 << @as(@Vector(8, u8), @splat(4)));
+                            @memcpy(v_dst[0..8], &v0);
+                            @memcpy(v_dst[8..16], &v1);
+                        }
+                    },
+                    .q8_0 => {
+                        const kt = s.k_cache.ptr + base + tile * tb;
+                        const vt = s.v_cache.ptr + base + tile * tb;
+                        const kq = k[kh * hd ..][0..hd];
+                        const vq = v[kh * hd ..][0..hd];
+                        var b: usize = 0;
+                        while (b < hd / 32) : (b += 1) {
+                            quantBlock32(kq[b * 32 ..][0..32], kt + b * 544 + pl, kv_tile, @ptrCast(kt + b * 544 + 512 + pl * 2));
+                            quantBlock32(vq[b * 32 ..][0..32], vt + pl * hd + b * 32, 1, @ptrCast(vt + 16 * hd + b * 32 + pl * 2));
+                        }
+                    },
+                    .f16 => {
+                        const kt: [*]f16 = @ptrCast(@alignCast(s.k_cache.ptr + base + tile * tb + pl * 2));
+                        const vr: [*]f16 = @ptrCast(@alignCast(s.v_cache.ptr + base + tile * tb + pl * hd * 2));
+                        for (0..hd) |d| {
+                            kt[d * kv_tile] = @floatCast(k[kh * hd + d]);
+                            vr[d] = @floatCast(v[kh * hd + d]);
+                        }
+                    },
                 }
             }
         }
 
+        const is_swa = A.swa and c.swa_window > 0;
+        const w_tiles = s.slot_tiles[A.kv_slot];
         const g = c.n_heads / A.n_kv_heads;
-        const qblocks = (nt * g + max_q - 1) / max_q;
+        var bq: usize = max_q;
+        while (bq > 1 and A.n_kv_heads * ((nt * g + bq - 1) / bq) < s.pool.nth) {
+            bq /= 2;
+        }
+        const qblocks = (nt * g + bq - 1) / bq;
+        const total_items = A.n_kv_heads * qblocks;
+        const chunk = if (s.pool.nth > 1) std.math.clamp(total_items / (s.pool.nth * 4), 1, 8) else 1;
         var aj: AttnJob = .{
             .st = s,
             .slot = A.kv_slot,
             .n_kv = A.n_kv_heads,
-            .window = if (A.swa) c.swa_window else 0,
+            .window = if (is_swa) c.swa_window else 0,
+            .w_tiles = w_tiles,
             .pos0 = pos0,
             .ntok = nt,
+            .block_q = bq,
             .qblocks = qblocks,
-            .chunks = .init(A.n_kv_heads * qblocks, 1),
+            .chunks = .init(total_items, chunk),
         };
         s.pool.run(&aj, attnWorker);
 
@@ -1526,6 +1954,86 @@ pub const State = struct {
         s.pool.run(&f_job, prunedFineWorker);
     }
 
+    const NormJob = struct {
+        s: *State,
+        x: [*]const f32,
+        w: []const f32,
+        eps: f32,
+        kind: quant.ActKind,
+        chunks: Chunks,
+    };
+
+    fn normWorker(j: *NormJob, _: usize, _: usize) void {
+        const c = j.s.model.cfg;
+        while (j.chunks.grab()) |r| {
+            for (r[0]..r[1]) |t| {
+                const src_x = j.x[t * c.dim ..][0..c.dim];
+                const dst_f = j.s.xn.f[t * c.dim ..][0..c.dim];
+                switch (j.kind) {
+                    .q8k => fusedRmsnormQ8K(dst_f, j.s.xn.q8k[t * (c.dim / 256) ..][0 .. c.dim / 256], src_x, j.w, j.eps),
+                    .q8b => fusedRmsnormQ8B(dst_f, j.s.xn.q8b[t * (c.dim / 32) ..][0 .. c.dim / 32], src_x, j.w, j.eps),
+                    .f32 => rmsnorm(dst_f, src_x, j.w, j.eps),
+                }
+            }
+        }
+    }
+
+    fn fusedNorm(s: *State, nt: usize, x_src: [*]const f32, w: []const f32, kind: quant.ActKind) void {
+        const c = s.model.cfg;
+        s.xn.reset(nt);
+        switch (kind) {
+            .q8k => {
+                s.xn.have_q8k = true;
+                if (nt * c.dim >= 32768 and s.pool.nth > 1) {
+                    var job: NormJob = .{ .s = s, .x = x_src, .w = w, .eps = c.eps, .kind = .q8k, .chunks = .init(nt, 1) };
+                    s.pool.run(&job, normWorker);
+                } else {
+                    for (0..nt) |t| {
+                        fusedRmsnormQ8K(
+                            s.xn.f[t * c.dim ..][0..c.dim],
+                            s.xn.q8k[t * (c.dim / 256) ..][0 .. c.dim / 256],
+                            x_src[t * c.dim ..][0..c.dim],
+                            w,
+                            c.eps,
+                        );
+                    }
+                }
+            },
+            .q8b => {
+                s.xn.have_q8b = true;
+                if (nt * c.dim >= 32768 and s.pool.nth > 1) {
+                    var job: NormJob = .{ .s = s, .x = x_src, .w = w, .eps = c.eps, .kind = .q8b, .chunks = .init(nt, 1) };
+                    s.pool.run(&job, normWorker);
+                } else {
+                    for (0..nt) |t| {
+                        fusedRmsnormQ8B(
+                            s.xn.f[t * c.dim ..][0..c.dim],
+                            s.xn.q8b[t * (c.dim / 32) ..][0 .. c.dim / 32],
+                            x_src[t * c.dim ..][0..c.dim],
+                            w,
+                            c.eps,
+                        );
+                    }
+                }
+            },
+            .f32 => {
+                if (nt * c.dim >= 32768 and s.pool.nth > 1) {
+                    var job: NormJob = .{ .s = s, .x = x_src, .w = w, .eps = c.eps, .kind = .f32, .chunks = .init(nt, 1) };
+                    s.pool.run(&job, normWorker);
+                } else {
+                    for (0..nt) |t| {
+                        rmsnorm(
+                            s.xn.f[t * c.dim ..][0..c.dim],
+                            x_src[t * c.dim ..][0..c.dim],
+                            w,
+                            c.eps,
+                        );
+                    }
+                }
+            },
+        }
+    }
+
     fn forwardBatch(s: *State, tokens: []const u32, n_logits: usize) void {
         const m = s.model;
         const c = &m.cfg;
@@ -1541,8 +2049,11 @@ pub const State = struct {
         s.ropeTables(pos0, nt);
 
         for (m.layers) |*L| {
-            for (0..nt) |t| rmsnorm(s.xn.f[t * c.dim ..][0..c.dim], s.x[t * c.dim ..][0..c.dim], L.attn_norm, c.eps);
-            s.xn.reset(nt);
+            const attn_kind = switch (L.mixer) {
+                .attention => |*A| quant.actKind(A.wq.typ),
+                .shortconv => |*C| quant.actKind(C.in_proj.typ),
+            };
+            s.fusedNorm(nt, s.x.ptr, L.attn_norm, attn_kind);
             // Without a post-norm the mixer output accumulates straight into x.
             const mix_direct = L.post_mix_norm == null;
             const mix_dst = if (mix_direct) s.x.ptr else s.tmp.ptr;
@@ -1552,10 +2063,8 @@ pub const State = struct {
             }
             if (L.post_mix_norm) |w| s.addNormed(w, nt);
 
-            for (0..nt) |t| rmsnorm(s.xn.f[t * c.dim ..][0..c.dim], s.x[t * c.dim ..][0..c.dim], L.ffn_norm, c.eps);
-            s.xn.reset(nt);
-            s.xn.prepare(quant.actKind(L.w_gate.typ), s.pool);
-            s.xn.prepare(quant.actKind(L.w_up.typ), s.pool);
+            const ffn_kind = quant.actKind(L.w_gate.typ);
+            s.fusedNorm(nt, s.x.ptr, L.ffn_norm, ffn_kind);
             const rc = rowsChunk(c.ffn_dim, s.pool.nth);
             var fj: FfnJob = .{ .gate = &L.w_gate, .up = &L.w_up, .act = &s.xn, .out = s.hb.f, .ntok = nt, .rows_chunk = rc, .gelu = c.gelu, .chunks = .init((c.ffn_dim + rc - 1) / rc, 1) };
             s.pool.run(&fj, ffnWorker);
@@ -1569,8 +2078,8 @@ pub const State = struct {
         if (n_logits > 0) {
             std.debug.assert(n_logits <= tokens.len and n_logits <= max_spec + 1);
             const start = tokens.len - n_logits;
-            for (0..n_logits) |t| rmsnorm(s.xn.f[t * c.dim ..][0..c.dim], s.x[(start + t) * c.dim ..][0..c.dim], m.out_norm, c.eps);
-            s.xn.reset(n_logits);
+            const out_kind = quant.actKind(m.output.typ);
+            s.fusedNorm(n_logits, s.x.ptr + start * c.dim, m.out_norm, out_kind);
             if (n_logits == 1 and m.output_coarse != null) {
                 s.outputCoarseToFine();
             } else {
@@ -1634,7 +2143,7 @@ test "tiled online-softmax attention matches naive reference" {
         const np = [3]usize{ npos, 17, 1 };
         var out: [3][hd]f32 = undefined;
         const scale: f32 = 0.125;
-        attendBlock(3, false, hd, @ptrCast(&kt), @ptrCast(&vr), .{ &q[0], &q[1], &q[2] }, lo, np, .{ &out[0], &out[1], &out[2] }, scale);
+        attendBlock(3, .f16, hd, @ptrCast(&kt), @ptrCast(&vr), .{ &q[0], &q[1], &q[2] }, lo, np, .{ &out[0], &out[1], &out[2] }, scale, 0, 0);
         for (0..3) |i| {
             var s: [npos]f64 = undefined;
             var mx: f64 = -std.math.inf(f64);
@@ -1710,7 +2219,7 @@ test "quantized tiled online-softmax attention matches dequantized reference" {
         const np = [3]usize{ npos, 17, 1 };
         var out: [3][hd]f32 = undefined;
         const scale: f32 = 0.125;
-        attendBlock(3, true, hd, &kt, &vr, .{ &q[0], &q[1], &q[2] }, lo, np, .{ &out[0], &out[1], &out[2] }, scale);
+        attendBlock(3, .q8_0, hd, &kt, &vr, .{ &q[0], &q[1], &q[2] }, lo, np, .{ &out[0], &out[1], &out[2] }, scale, 0, 0);
         for (0..3) |i| {
             var s: [npos]f64 = undefined;
             var mx: f64 = -std.math.inf(f64);
@@ -1730,6 +2239,425 @@ test "quantized tiled online-softmax attention matches dequantized reference" {
                 for (lo[i]..np[i]) |p| want += s[p] / sum * vf[p][d];
                 try std.testing.expectApproxEqAbs(want, out[i][d], 1e-4);
             }
+        }
+    }
+}
+
+test "q4_0 quantized tiled online-softmax attention matches dequantized reference" {
+    var prng = std.Random.DefaultPrng.init(42);
+    const r = prng.random();
+    inline for (.{ 64, 128 }) |hd| {
+        const npos = 53; // not a multiple of the tile size
+        const ntiles = (npos + kv_tile - 1) / kv_tile;
+        const nblocks = hd / 32;
+        const tile_bytes = hd * 9;
+        var kt: [ntiles * tile_bytes]u8 align(32) = undefined;
+        var vr: [ntiles * tile_bytes]u8 align(32) = undefined;
+        @memset(&kt, 0xFF); // stale garbage incl. NaN scales must stay masked
+        @memset(&vr, 0xFF);
+        var ksrc: [npos][hd]f32 = undefined;
+        var vsrc: [npos][hd]f32 = undefined;
+        for (&ksrc) |*row| for (row) |*x| {
+            x.* = r.floatNorm(f32);
+        };
+        for (&vsrc) |*row| for (row) |*x| {
+            x.* = r.floatNorm(f32);
+        };
+        // Quantize exactly like the forward-pass write path.
+        for (0..npos) |p| {
+            const tile = p / kv_tile;
+            const pl = p % kv_tile;
+            for (0..nblocks) |b| {
+                var q4_k: [32]u8 = undefined;
+                var sc_k: f16 = undefined;
+                quantBlock32_q4(ksrc[p][b * 32 ..][0..32], &q4_k, &sc_k);
+
+                const k_bp = kt[tile * tile_bytes + b * 288 ..].ptr;
+                if (pl == 0) @memset(k_bp[0..256], 0);
+                @as(*align(1) f16, @ptrCast(k_bp + 256 + pl * 2)).* = sc_k;
+                if (pl < 8) {
+                    inline for (0..32) |dp| {
+                        k_bp[dp * 8 + pl] = (k_bp[dp * 8 + pl] & 0xF0) | q4_k[dp];
+                    }
+                } else {
+                    inline for (0..32) |dp| {
+                        k_bp[dp * 8 + (pl - 8)] = (k_bp[dp * 8 + (pl - 8)] & 0x0F) | (q4_k[dp] << 4);
+                    }
+                }
+
+                var q4_v: [32]u8 = undefined;
+                var sc_v: f16 = undefined;
+                quantBlock32_q4(vsrc[p][b * 32 ..][0..32], &q4_v, &sc_v);
+
+                const vt = vr[tile * tile_bytes ..].ptr;
+                @as(*align(1) f16, @ptrCast(vt + 8 * hd + b * 32 + pl * 2)).* = sc_v;
+                const v_dst = vt + pl * (hd / 2) + b * 16;
+                const q_lo: @Vector(8, u8) = q4_v[0..8].*;
+                const q_hi: @Vector(8, u8) = q4_v[8..16].*;
+                const v0: [8]u8 = q_lo | (q_hi << @as(@Vector(8, u8), @splat(4)));
+                const q_lo2: @Vector(8, u8) = q4_v[16..24].*;
+                const q_hi2: @Vector(8, u8) = q4_v[24..32].*;
+                const v1: [8]u8 = q_lo2 | (q_hi2 << @as(@Vector(8, u8), @splat(4)));
+                @memcpy(v_dst[0..8], &v0);
+                @memcpy(v_dst[8..16], &v1);
+            }
+        }
+        // Reference over the values the kernel actually reads.
+        var kf: [npos][hd]f32 = undefined;
+        var vf: [npos][hd]f32 = undefined;
+        for (0..npos) |p| {
+            const tile = p / kv_tile;
+            const pl = p % kv_tile;
+            for (0..nblocks) |b| {
+                const k_bp = kt[tile * tile_bytes + b * 288 ..].ptr;
+                const ks: f32 = @as(*align(1) f16, @ptrCast(k_bp + 256 + pl * 2)).*;
+                for (0..32) |dp| {
+                    const u: u8 = if (pl < 8)
+                        (k_bp[dp * 8 + pl] & 0x0F)
+                    else
+                        ((k_bp[dp * 8 + (pl - 8)] >> 4) & 0x0F);
+                    const s: i8 = @as(i8, @bitCast(u ^ 8)) -% 8;
+                    kf[p][b * 32 + dp] = @as(f32, @floatFromInt(s)) * ks;
+                }
+
+                const vt = vr[tile * tile_bytes ..].ptr;
+                const vs: f32 = @as(*align(1) f16, @ptrCast(vt + 8 * hd + b * 32 + pl * 2)).*;
+                const row = vt + pl * (hd / 2) + b * 16;
+                for (0..8) |j| {
+                    const v_lo = row[j] & 0x0F;
+                    const v_hi = (row[j] >> 4) & 0x0F;
+                    const s0: i8 = @as(i8, @bitCast(v_lo ^ 8)) -% 8;
+                    const s1: i8 = @as(i8, @bitCast(v_hi ^ 8)) -% 8;
+                    vf[p][b * 32 + j] = @as(f32, @floatFromInt(s0)) * vs;
+                    vf[p][b * 32 + 8 + j] = @as(f32, @floatFromInt(s1)) * vs;
+                }
+                for (0..8) |j| {
+                    const v_lo2 = row[8 + j] & 0x0F;
+                    const v_hi2 = (row[8 + j] >> 4) & 0x0F;
+                    const s2: i8 = @as(i8, @bitCast(v_lo2 ^ 8)) -% 8;
+                    const s3: i8 = @as(i8, @bitCast(v_hi2 ^ 8)) -% 8;
+                    vf[p][b * 32 + 16 + j] = @as(f32, @floatFromInt(s2)) * vs;
+                    vf[p][b * 32 + 24 + j] = @as(f32, @floatFromInt(s3)) * vs;
+                }
+            }
+        }
+        var q: [3][hd]f32 = undefined;
+        for (&q) |*qq| for (qq) |*x| {
+            x.* = r.floatNorm(f32) * 2;
+        };
+        const lo = [3]usize{ 21, 0, 0 };
+        const np = [3]usize{ npos, 17, 1 };
+        var out: [3][hd]f32 = undefined;
+        const scale: f32 = 0.125;
+        attendBlock(3, .q4_0, hd, &kt, &vr, .{ &q[0], &q[1], &q[2] }, lo, np, .{ &out[0], &out[1], &out[2] }, scale, 0, 0);
+        for (0..3) |i| {
+            var s: [npos]f64 = undefined;
+            var mx: f64 = -std.math.inf(f64);
+            for (lo[i]..np[i]) |p| {
+                var dot: f64 = 0;
+                for (0..hd) |d| dot += @as(f64, q[i][d]) * kf[p][d];
+                s[p] = dot * scale;
+                mx = @max(mx, s[p]);
+            }
+            var sum: f64 = 0;
+            for (lo[i]..np[i]) |p| {
+                s[p] = @exp(s[p] - mx);
+                sum += s[p];
+            }
+            for (0..hd) |d| {
+                var want: f64 = 0;
+                for (lo[i]..np[i]) |p| want += s[p] / sum * vf[p][d];
+                try std.testing.expectApproxEqAbs(want, out[i][d], 1e-4);
+            }
+        }
+    }
+}
+
+test "tiled online-softmax attention with NQ=8 token tiling across sub-blocks" {
+    var prng = std.Random.DefaultPrng.init(777);
+    const r = prng.random();
+    const hd = 64;
+    const npos = 45;
+    const ntiles = (npos + kv_tile - 1) / kv_tile;
+    var kt: [ntiles * hd * kv_tile]f16 = undefined;
+    var vr: [ntiles * kv_tile * hd]f16 = undefined;
+    var kf: [npos][hd]f32 = undefined;
+    var vf: [npos][hd]f32 = undefined;
+    for (&kt) |*x| x.* = std.math.nan(f16);
+    for (0..npos) |p| for (0..hd) |d| {
+        const kk: f16 = @floatCast(r.floatNorm(f32));
+        const vv: f16 = @floatCast(r.floatNorm(f32));
+        kt[(p / kv_tile) * hd * kv_tile + d * kv_tile + p % kv_tile] = kk;
+        vr[p * hd + d] = vv;
+        kf[p][d] = kk;
+        vf[p][d] = vv;
+    };
+    var q: [8][hd]f32 = undefined;
+    for (&q) |*qq| for (qq) |*x| {
+        x.* = r.floatNorm(f32) * 2;
+    };
+    const lo = [8]usize{ 10, 0, 5, 0, 15, 0, 7, 0 };
+    const np = [8]usize{ npos, 25, 40, 16, npos, 10, 33, 4 };
+    var out: [8][hd]f32 = undefined;
+    const scale: f32 = 0.125;
+    var qp: [8][*]const f32 = undefined;
+    var outp: [8][*]f32 = undefined;
+    for (0..8) |i| {
+        qp[i] = &q[i];
+        outp[i] = &out[i];
+    }
+    attendBlock(8, .f16, hd, @ptrCast(&kt), @ptrCast(&vr), qp, lo, np, outp, scale, 0, 0);
+    for (0..8) |i| {
+        var s: [npos]f64 = undefined;
+        var mx: f64 = -std.math.inf(f64);
+        for (lo[i]..np[i]) |p| {
+            var dot: f64 = 0;
+            for (0..hd) |d| dot += @as(f64, q[i][d]) * kf[p][d];
+            s[p] = dot * scale;
+            mx = @max(mx, s[p]);
+        }
+        var sum: f64 = 0;
+        for (lo[i]..np[i]) |p| {
+            s[p] = @exp(s[p] - mx);
+            sum += s[p];
+        }
+        for (0..hd) |d| {
+            var want: f64 = 0;
+            for (lo[i]..np[i]) |p| want += s[p] / sum * vf[p][d];
+            try std.testing.expectApproxEqAbs(want, out[i][d], 1e-4);
+        }
+    }
+
+    // Also verify q4_0 with NQ=8
+    const nblocks = hd / 32;
+    const tile_bytes = hd * 9;
+    var kt_q4: [ntiles * tile_bytes]u8 align(32) = undefined;
+    var vr_q4: [ntiles * tile_bytes]u8 align(32) = undefined;
+    @memset(&kt_q4, 0xFF);
+    @memset(&vr_q4, 0xFF);
+    for (0..npos) |p| {
+        const tile = p / kv_tile;
+        const pl = p % kv_tile;
+        for (0..nblocks) |b| {
+            var q4_k: [32]u8 = undefined;
+            var sc_k: f16 = undefined;
+            quantBlock32_q4(kf[p][b * 32 ..][0..32], &q4_k, &sc_k);
+
+            const k_bp = kt_q4[tile * tile_bytes + b * 288 ..].ptr;
+            if (pl == 0) @memset(k_bp[0..256], 0);
+            @as(*align(1) f16, @ptrCast(k_bp + 256 + pl * 2)).* = sc_k;
+            if (pl < 8) {
+                inline for (0..32) |dp| {
+                    k_bp[dp * 8 + pl] = (k_bp[dp * 8 + pl] & 0xF0) | q4_k[dp];
+                }
+            } else {
+                inline for (0..32) |dp| {
+                    k_bp[dp * 8 + (pl - 8)] = (k_bp[dp * 8 + (pl - 8)] & 0x0F) | (q4_k[dp] << 4);
+                }
+            }
+
+            var q4_v: [32]u8 = undefined;
+            var sc_v: f16 = undefined;
+            quantBlock32_q4(vf[p][b * 32 ..][0..32], &q4_v, &sc_v);
+
+            const vt = vr_q4[tile * tile_bytes ..].ptr;
+            @as(*align(1) f16, @ptrCast(vt + 8 * hd + b * 32 + pl * 2)).* = sc_v;
+            const v_dst = vt + pl * (hd / 2) + b * 16;
+            const q_lo: @Vector(8, u8) = q4_v[0..8].*;
+            const q_hi: @Vector(8, u8) = q4_v[8..16].*;
+            const v0: [8]u8 = q_lo | (q_hi << @as(@Vector(8, u8), @splat(4)));
+            const q_lo2: @Vector(8, u8) = q4_v[16..24].*;
+            const q_hi2: @Vector(8, u8) = q4_v[24..32].*;
+            const v1: [8]u8 = q_lo2 | (q_hi2 << @as(@Vector(8, u8), @splat(4)));
+            @memcpy(v_dst[0..8], &v0);
+            @memcpy(v_dst[8..16], &v1);
+        }
+    }
+    var kf_q4: [npos][hd]f32 = undefined;
+    var vf_q4: [npos][hd]f32 = undefined;
+    for (0..npos) |p| {
+        const tile = p / kv_tile;
+        const pl = p % kv_tile;
+        for (0..nblocks) |b| {
+            const k_bp = kt_q4[tile * tile_bytes + b * 288 ..].ptr;
+            const ks: f32 = @as(*align(1) f16, @ptrCast(k_bp + 256 + pl * 2)).*;
+            for (0..32) |dp| {
+                const u: u8 = if (pl < 8)
+                    (k_bp[dp * 8 + pl] & 0x0F)
+                else
+                    ((k_bp[dp * 8 + (pl - 8)] >> 4) & 0x0F);
+                const s: i8 = @as(i8, @bitCast(u ^ 8)) -% 8;
+                kf_q4[p][b * 32 + dp] = @as(f32, @floatFromInt(s)) * ks;
+            }
+
+            const vt = vr_q4[tile * tile_bytes ..].ptr;
+            const vs: f32 = @as(*align(1) f16, @ptrCast(vt + 8 * hd + b * 32 + pl * 2)).*;
+            const row = vt + pl * (hd / 2) + b * 16;
+            for (0..8) |j| {
+                const v_lo = row[j] & 0x0F;
+                const v_hi = (row[j] >> 4) & 0x0F;
+                const s0: i8 = @as(i8, @bitCast(v_lo ^ 8)) -% 8;
+                const s1: i8 = @as(i8, @bitCast(v_hi ^ 8)) -% 8;
+                vf_q4[p][b * 32 + j] = @as(f32, @floatFromInt(s0)) * vs;
+                vf_q4[p][b * 32 + 8 + j] = @as(f32, @floatFromInt(s1)) * vs;
+            }
+            for (0..8) |j| {
+                const v_lo2 = row[8 + j] & 0x0F;
+                const v_hi2 = (row[8 + j] >> 4) & 0x0F;
+                const s2: i8 = @as(i8, @bitCast(v_lo2 ^ 8)) -% 8;
+                const s3: i8 = @as(i8, @bitCast(v_hi2 ^ 8)) -% 8;
+                vf_q4[p][b * 32 + 16 + j] = @as(f32, @floatFromInt(s2)) * vs;
+                vf_q4[p][b * 32 + 24 + j] = @as(f32, @floatFromInt(s3)) * vs;
+            }
+        }
+    }
+    var out_q4: [8][hd]f32 = undefined;
+    var outp_q4: [8][*]f32 = undefined;
+    for (0..8) |i| outp_q4[i] = &out_q4[i];
+    attendBlock(8, .q4_0, hd, &kt_q4, &vr_q4, qp, lo, np, outp_q4, scale, 0, 0);
+    for (0..8) |i| {
+        var s: [npos]f64 = undefined;
+        var mx: f64 = -std.math.inf(f64);
+        for (lo[i]..np[i]) |p| {
+            var dot: f64 = 0;
+            for (0..hd) |d| dot += @as(f64, q[i][d]) * kf_q4[p][d];
+            s[p] = dot * scale;
+            mx = @max(mx, s[p]);
+        }
+        var sum: f64 = 0;
+        for (lo[i]..np[i]) |p| {
+            s[p] = @exp(s[p] - mx);
+            sum += s[p];
+        }
+        for (0..hd) |d| {
+            var want: f64 = 0;
+            for (lo[i]..np[i]) |p| want += s[p] / sum * vf_q4[p][d];
+            try std.testing.expectApproxEqAbs(want, out_q4[i][d], 1e-4);
+        }
+    }
+}
+
+test "SWA ring buffer attention matches linear reference" {
+    var prng = std.Random.DefaultPrng.init(1234);
+    const r = prng.random();
+    const hd = 64;
+    const window = 32;
+    const w_tiles = (window + kv_tile - 1) / kv_tile + 1; // 3 tiles
+    const npos = 83; // spans multiple full wraps around 3 tiles (3 * 16 = 48 positions)
+
+    // f16 buffers
+    var kt: [w_tiles * hd * kv_tile]f16 = undefined;
+    var vr: [w_tiles * kv_tile * hd]f16 = undefined;
+    var k_ref: [npos][hd]f32 = undefined;
+    var v_ref: [npos][hd]f32 = undefined;
+
+    for (0..npos) |p| {
+        const tile = (p / kv_tile) % w_tiles;
+        const pl = p % kv_tile;
+        for (0..hd) |d| {
+            const kk: f16 = @floatCast(r.floatNorm(f32));
+            const vv: f16 = @floatCast(r.floatNorm(f32));
+            kt[tile * hd * kv_tile + d * kv_tile + pl] = kk;
+            vr[tile * kv_tile * hd + pl * hd + d] = vv;
+            k_ref[p][d] = kk;
+            v_ref[p][d] = vv;
+        }
+    }
+
+    // Queries at positions near end: 80, 81, 82
+    var q: [3][hd]f32 = undefined;
+    for (&q) |*qq| for (qq) |*x| {
+        x.* = r.floatNorm(f32) * 2;
+    };
+    const np = [3]usize{ 81, 82, 83 };
+    const lo = [3]usize{ 81 - window, 82 - window, 83 - window };
+    var out: [3][hd]f32 = undefined;
+    const scale: f32 = 0.125;
+    attendBlock(3, .f16, hd, @ptrCast(&kt), @ptrCast(&vr), .{ &q[0], &q[1], &q[2] }, lo, np, .{ &out[0], &out[1], &out[2] }, scale, window, w_tiles);
+
+    for (0..3) |i| {
+        var s: [npos]f64 = undefined;
+        var mx: f64 = -std.math.inf(f64);
+        for (lo[i]..np[i]) |p| {
+            var dot: f64 = 0;
+            for (0..hd) |d| dot += @as(f64, q[i][d]) * k_ref[p][d];
+            s[p] = dot * scale;
+            mx = @max(mx, s[p]);
+        }
+        var sum: f64 = 0;
+        for (lo[i]..np[i]) |p| {
+            s[p] = @exp(s[p] - mx);
+            sum += s[p];
+        }
+        for (0..hd) |d| {
+            var want: f64 = 0;
+            for (lo[i]..np[i]) |p| want += s[p] / sum * v_ref[p][d];
+            try std.testing.expectApproxEqAbs(want, out[i][d], 1e-4);
+        }
+    }
+
+    // Also test quantized mode in ring buffer
+    const nblocks = hd / 32;
+    const tile_bytes = hd * 17;
+    var kt_q: [w_tiles * tile_bytes]u8 align(32) = undefined;
+    var vr_q: [w_tiles * tile_bytes]u8 align(32) = undefined;
+    @memset(&kt_q, 0xFF);
+    @memset(&vr_q, 0xFF);
+
+    var ksrc: [npos][hd]f32 = undefined;
+    var vsrc: [npos][hd]f32 = undefined;
+    for (&ksrc) |*row| for (row) |*x| {
+        x.* = r.floatNorm(f32);
+    };
+    for (&vsrc) |*row| for (row) |*x| {
+        x.* = r.floatNorm(f32);
+    };
+
+    for (0..npos) |p| {
+        const tile = (p / kv_tile) % w_tiles;
+        const pl = p % kv_tile;
+        for (0..nblocks) |b| {
+            quantBlock32(ksrc[p][b * 32 ..][0..32], kt_q[tile * tile_bytes + b * 544 + pl ..].ptr, kv_tile, @ptrCast(&kt_q[tile * tile_bytes + b * 544 + 512 + pl * 2]));
+            quantBlock32(vsrc[p][b * 32 ..][0..32], vr_q[tile * tile_bytes + pl * hd + b * 32 ..].ptr, 1, @ptrCast(&vr_q[tile * tile_bytes + 16 * hd + b * 32 + pl * 2]));
+        }
+    }
+
+    var kf_q: [npos][hd]f32 = undefined;
+    var vf_q: [npos][hd]f32 = undefined;
+    for (lo[0]..np[2]) |p| {
+        const tile = (p / kv_tile) % w_tiles;
+        const pl = p % kv_tile;
+        for (0..nblocks) |b| {
+            const ks: f32 = @as(*align(1) f16, @ptrCast(&kt_q[tile * tile_bytes + b * 544 + 512 + pl * 2])).*;
+            const vs: f32 = @as(*align(1) f16, @ptrCast(&vr_q[tile * tile_bytes + 16 * hd + b * 32 + pl * 2])).*;
+            for (0..32) |dp| {
+                kf_q[p][b * 32 + dp] = @as(f32, @floatFromInt(@as(i8, @bitCast(kt_q[tile * tile_bytes + b * 544 + dp * 16 + pl])))) * ks;
+                vf_q[p][b * 32 + dp] = @as(f32, @floatFromInt(@as(i8, @bitCast(vr_q[tile * tile_bytes + pl * hd + b * 32 + dp])))) * vs;
+            }
+        }
+    }
+
+    var out_q: [3][hd]f32 = undefined;
+    attendBlock(3, .q8_0, hd, &kt_q, &vr_q, .{ &q[0], &q[1], &q[2] }, lo, np, .{ &out_q[0], &out_q[1], &out_q[2] }, scale, window, w_tiles);
+
+    for (0..3) |i| {
+        var s: [npos]f64 = undefined;
+        var mx: f64 = -std.math.inf(f64);
+        for (lo[i]..np[i]) |p| {
+            var dot: f64 = 0;
+            for (0..hd) |d| dot += @as(f64, q[i][d]) * kf_q[p][d];
+            s[p] = dot * scale;
+            mx = @max(mx, s[p]);
+        }
+        var sum: f64 = 0;
+        for (lo[i]..np[i]) |p| {
+            s[p] = @exp(s[p] - mx);
+            sum += s[p];
+        }
+        for (0..hd) |d| {
+            var want: f64 = 0;
+            for (lo[i]..np[i]) |p| want += s[p] / sum * vf_q[p][d];
+            try std.testing.expectApproxEqAbs(want, out_q[i][d], 1e-4);
         }
     }
 }

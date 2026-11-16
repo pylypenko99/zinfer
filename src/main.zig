@@ -30,6 +30,11 @@ const usage =
     \\  --repeat-penalty F    penalize the last 64 tokens, 1 = off (1.0)
     \\  --seed N              RNG seed (time)
     \\
+    \\prompt caching:
+    \\  --prompt-cache PATH   load and save prompt cache snapshot (KV cache)
+    \\  --prompt-cache-all    save generated tokens to cache as well
+    \\  --no-pin              disable CPU thread pinning / core affinity
+    \\
     \\speculative decoding:
     \\  --draft N             n-gram prompt lookup draft tokens, 0 = off (default 0, 3-5 recommended)
     \\  --draft-model PATH    small model as draft; --draft sets lookahead (default 3)
@@ -39,8 +44,8 @@ const usage =
     \\  --port N              server port (default 8080; implies --server)
     \\  --no-prune            keep full lm_head matmul (for A/B comparison)
     \\  --no-repack           keep GGUF row layout (per-row kernels; for A/B comparison)
-    \\  --cache f16|q8_0      K/V cache format; q8_0 halves cache RAM and
-    \\                        attention bandwidth (f16)
+    \\  --cache f16|q8_0|q4_0 K/V cache format; q8_0 halves cache RAM,
+    \\                        q4_0 reduces it by 3.6x (f16)
     \\  --bench PP,TG         benchmark prompt processing of PP tokens and generation of TG tokens
     \\  -v, --verbose         print model info
     \\
@@ -61,6 +66,8 @@ const Args = struct {
     model: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
     prompt_file: ?[]const u8 = null,
+    prompt_cache: ?[]const u8 = null,
+    prompt_cache_all: bool = false,
     system: ?[]const u8 = null,
     n_predict: usize = 256,
     chat: bool = false,
@@ -70,11 +77,12 @@ const Args = struct {
     draft: usize = 0,
     draft_model: ?[]const u8 = null,
     threads: usize = 0,
+    pin: bool = true,
     ctx: usize = 0,
     batch: usize = 64,
     sampling: SamplingArgs = .{},
     load: model_mod.LoadOptions = .{},
-    cache_q8: bool = false,
+    cache_type: model_mod.CacheType = .f16,
     bench: ?[2]usize = null,
     verbose: bool = false,
 };
@@ -120,12 +128,18 @@ fn parseArgs(argv: []const [:0]const u8) Args {
             a.prompt = r.str();
         } else if (r.is(&.{ "-f", "--file" })) {
             a.prompt_file = r.str();
+        } else if (r.is(&.{"--prompt-cache"})) {
+            a.prompt_cache = r.str();
+        } else if (r.is(&.{"--prompt-cache-all"})) {
+            a.prompt_cache_all = true;
         } else if (r.is(&.{ "-s", "--system" })) {
             a.system = r.str();
         } else if (r.is(&.{ "-n", "--predict" })) {
             a.n_predict = r.uint();
         } else if (r.is(&.{ "-t", "--threads" })) {
             a.threads = r.uint();
+        } else if (r.is(&.{"--no-pin"})) {
+            a.pin = false;
         } else if (r.is(&.{ "-c", "--ctx" })) {
             a.ctx = r.uint();
         } else if (r.is(&.{ "-b", "--batch" })) {
@@ -158,8 +172,12 @@ fn parseArgs(argv: []const [:0]const u8) Args {
         } else if (r.is(&.{"--cache"})) {
             const v = r.str();
             if (std.mem.eql(u8, v, "q8_0")) {
-                a.cache_q8 = true;
-            } else if (!std.mem.eql(u8, v, "f16")) fail("--cache expects f16 or q8_0, got '{s}'", .{v});
+                a.cache_type = .q8_0;
+            } else if (std.mem.eql(u8, v, "q4_0")) {
+                a.cache_type = .q4_0;
+            } else if (std.mem.eql(u8, v, "f16")) {
+                a.cache_type = .f16;
+            } else fail("--cache expects f16, q8_0, or q4_0, got '{s}'", .{v});
         } else if (r.is(&.{"--bench"})) {
             var it = std.mem.splitScalar(u8, r.str(), ',');
             const pp = std.fmt.parseInt(usize, it.next().?, 10) catch fail("--bench expects PP,TG", .{});
@@ -217,7 +235,7 @@ pub fn main(init: std.process.Init) !void {
     var args = parseArgs(argv);
 
     const nth = if (args.threads > 0) args.threads else pool_mod.defaultThreads(io);
-    const pool = try pool_mod.Pool.create(gpa, io, nth);
+    const pool = try pool_mod.Pool.create(gpa, io, nth, args.pin);
     defer pool.destroy(gpa);
     var timer: Timer = .start(io);
     const model = model_mod.Model.load(gpa, io, args.model.?, pool, args.load) catch |e| fail("failed to load model: {s}", .{@errorName(e)});
@@ -229,7 +247,7 @@ pub fn main(init: std.process.Init) !void {
     const default_ctx = @max(bench_need, 4096);
     const ctx = if (args.ctx > 0) args.ctx else @min(default_ctx, c.ctx_train);
 
-    var st = model_mod.State.init(gpa, model, pool, ctx, @min(args.batch, ctx), args.cache_q8) catch |e| fail("failed to init state: {s}", .{@errorName(e)});
+    var st = model_mod.State.init(gpa, model, pool, ctx, @min(args.batch, ctx), args.cache_type) catch |e| fail("failed to init state: {s}", .{@errorName(e)});
     defer st.deinit();
     const time_seed: u64 = @truncate(@as(u96, @bitCast(std.Io.Clock.real.now(io).nanoseconds)));
     const sp = samplingParams(args.sampling, &model.file, time_seed);
@@ -253,18 +271,31 @@ pub fn main(init: std.process.Init) !void {
         // Draft tokens are fed one at a time; short-conv state can only be
         // rewound within one batch, so conv drafts are not supported.
         if (dm.n_conv_layers > 0) fail("draft model must not have short-conv layers", .{});
-        draft_st = model_mod.State.init(gpa, dm, pool, ctx, @min(args.batch, ctx), args.cache_q8) catch |e| fail("failed to init draft state: {s}", .{@errorName(e)});
+        draft_st = model_mod.State.init(gpa, dm, pool, ctx, @min(args.batch, ctx), args.cache_type) catch |e| fail("failed to init draft state: {s}", .{@errorName(e)});
         draft_smp = try sampler_mod.Sampler.init(gpa, dm.cfg.vocab, sp);
         if (args.verbose) std.debug.print("draft: {s} (arch={s} layers={d} dim={d} vocab={d})\n", .{ std.fs.path.stem(dpath), @tagName(dm.cfg.arch), dm.cfg.n_layers, dm.cfg.dim, dm.cfg.vocab });
     }
 
     if (args.verbose or args.bench != null) {
         const kv_mb = @as(f64, @floatFromInt(st.k_cache.len + st.v_cache.len)) / (1 << 20);
-        std.debug.print("arch={s} layers={d} dim={d} heads={d}/{d} head_dim={d} ffn={d} vocab={d} ctx={d} (KV {d:.1} MB {s}) threads={d} ({d:.0} ms load)\n", .{
-            @tagName(c.arch),                            c.n_layers, c.dim, c.n_heads, c.n_kv_heads, c.head_dim, c.ffn_dim, c.vocab, ctx, kv_mb,
-            if (st.kv_q8) "q8_0" else "f16", nth,
-            @as(f64, @floatFromInt(timer.read())) / 1e6,
+        const cache_name = switch (st.cache_type) {
+            .f16 => "f16",
+            .q8_0 => "q8_0",
+            .q4_0 => "q4_0",
+        };
+        std.debug.print("arch={s} layers={d} dim={d} heads={d}/{d} head_dim={d} ffn={d} vocab={d} ctx={d} (KV {d:.1} MB {s}) threads={d}", .{
+            @tagName(c.arch), c.n_layers, c.dim, c.n_heads, c.n_kv_heads, c.head_dim, c.ffn_dim, c.vocab, ctx, kv_mb,
+            cache_name,       nth,
         });
+        if (args.pin) {
+            std.debug.print(" (pinned to CPUs: ", .{});
+            for (pool.cpu_map, 0..) |cpu, i| {
+                if (i > 0) std.debug.print(",", .{});
+                std.debug.print("{d}", .{cpu});
+            }
+            std.debug.print(")", .{});
+        }
+        std.debug.print(" ({d:.0} ms load)\n", .{@as(f64, @floatFromInt(timer.read())) / 1e6});
         const l0 = &model.layers[0];
         std.debug.print("layers: {d} attention + {d} short-conv | weights: ffn_up={s} ffn_down={s} output={s} layout={s}\n", .{
             model.n_attn_layers,                                                                    model.n_conv_layers, @tagName(l0.w_up.typ), @tagName(l0.w_down.typ), @tagName(model.output.typ),
@@ -312,12 +343,83 @@ pub fn main(init: std.process.Init) !void {
         defer chat.deinit();
         var first = true;
         var pending: ?u32 = null;
-        std.debug.print("chat template: {s}. Empty line or Ctrl-D quits.\n", .{@tagName(tpl)});
+
+        if (args.prompt_cache) |cp| {
+            const exists = blk: {
+                const f = std.Io.Dir.cwd().openFile(io, cp, .{}) catch break :blk false;
+                f.close(io);
+                break :blk true;
+            };
+            if (exists) {
+                gen.loadCache(cp) catch |e| fail("failed to load prompt cache '{s}': {s}", .{ cp, @errorName(e) });
+                first = false;
+                if (args.verbose) {
+                    std.debug.print("loaded chat cache '{s}' ({d} tokens, pos {d})\n", .{ cp, gen.cached.items.len, st.pos });
+                }
+            }
+        }
+
+        std.debug.print("chat template: {s}. Empty line or Ctrl-D quits. Type /help for commands.\n", .{@tagName(tpl)});
         while (true) {
             std.debug.print("\n> ", .{});
             const line = (stdin.interface.takeDelimiter('\n') catch null) orelse break;
             const msg = std.mem.trim(u8, line, " \r\t");
             if (msg.len == 0) break;
+
+            if (std.mem.startsWith(u8, msg, "/")) {
+                var it = std.mem.tokenizeScalar(u8, msg, ' ');
+                const cmd = it.next() orelse "";
+                if (std.mem.eql(u8, cmd, "/save")) {
+                    const path = it.next() orelse args.prompt_cache orelse {
+                        std.debug.print("usage: /save <path>\n", .{});
+                        continue;
+                    };
+                    gen.saveCache(path) catch |e| {
+                        std.debug.print("error saving cache to '{s}': {s}\n", .{ path, @errorName(e) });
+                        continue;
+                    };
+                    std.debug.print("saved cache to '{s}' ({d} tokens, pos {d})\n", .{ path, gen.cached.items.len, st.pos });
+                    continue;
+                } else if (std.mem.eql(u8, cmd, "/load")) {
+                    const path = it.next() orelse args.prompt_cache orelse {
+                        std.debug.print("usage: /load <path>\n", .{});
+                        continue;
+                    };
+                    gen.loadCache(path) catch |e| {
+                        std.debug.print("error loading cache from '{s}': {s}\n", .{ path, @errorName(e) });
+                        continue;
+                    };
+                    first = false;
+                    pending = null;
+                    std.debug.print("loaded cache from '{s}' ({d} tokens, pos {d})\n", .{ path, gen.cached.items.len, st.pos });
+                    continue;
+                } else if (std.mem.eql(u8, cmd, "/reset") or std.mem.eql(u8, cmd, "/clear")) {
+                    gen.reset();
+                    first = true;
+                    pending = null;
+                    std.debug.print("context cleared.\n", .{});
+                    continue;
+                } else if (std.mem.eql(u8, cmd, "/stats")) {
+                    gen.report();
+                    std.debug.print("cached tokens: {d}, pos: {d}/{d}\n", .{ gen.cached.items.len, st.pos, st.ctx });
+                    continue;
+                } else if (std.mem.eql(u8, cmd, "/help")) {
+                    std.debug.print(
+                        \\Commands:
+                        \\  /save [path]   Save current KV cache and token history to file
+                        \\  /load [path]   Load KV cache and token history from file
+                        \\  /reset, /clear Reset context and start a new conversation
+                        \\  /stats         Display generation timing and memory statistics
+                        \\  /help          Show this help message
+                        \\
+                    , .{});
+                    continue;
+                } else {
+                    std.debug.print("unknown command '{s}'. Type /help for available commands.\n", .{cmd});
+                    continue;
+                }
+            }
+
             text.clearRetainingCapacity();
             tokens.clearRetainingCapacity();
             if (pending) |p| {
@@ -332,15 +434,40 @@ pub fn main(init: std.process.Init) !void {
             try chat.assistantHeader(has_think, args.no_think);
             try tok.encode(gpa, text.items, first, true, &tokens);
             first = false;
-            pending = gen.run(tokens.items, args.n_predict, out) catch |e| switch (e) {
-                error.ContextFull => {
-                    std.debug.print("\n[context full]\n", .{});
-                    break;
-                },
-                else => return e,
+            pending = gen.run(tokens.items, args.n_predict, out) catch |e| blk: {
+                if (e != error.ContextFull) return e;
+                std.debug.print("\n[context full: pos {d}/{d}. Attempting context shift...]\n", .{ st.pos, st.ctx });
+                if (gen.cached.items.len > 256) {
+                    const keep_head = @min(gen.cached.items.len / 4, 128);
+                    const drop_count = (gen.cached.items.len - keep_head) / 2;
+                    const tail_start = keep_head + drop_count;
+                    var shifted: std.ArrayList(u32) = .empty;
+                    defer shifted.deinit(gpa);
+                    try shifted.appendSlice(gpa, gen.cached.items[0..keep_head]);
+                    try shifted.appendSlice(gpa, gen.cached.items[tail_start..]);
+                    try shifted.appendSlice(gpa, tokens.items);
+                    gen.reset();
+                    break :blk gen.run(shifted.items, args.n_predict, out) catch |e2| {
+                        std.debug.print("\n[context shift failed: {s}. Use /reset or /clear to restart]\n", .{@errorName(e2)});
+                        continue;
+                    };
+                } else {
+                    std.debug.print("\n[context full. Use /reset or /clear to restart]\n", .{});
+                    continue;
+                }
             };
             try out.emit("\n");
         }
+
+        if (args.prompt_cache) |cp| {
+            if (args.prompt_cache_all) {
+                gen.saveCache(cp) catch |e| std.debug.print("failed to save cache to '{s}': {s}\n", .{ cp, @errorName(e) });
+                if (args.verbose) {
+                    std.debug.print("saved chat cache to '{s}' ({d} tokens, pos {d})\n", .{ cp, gen.cached.items.len, st.pos });
+                }
+            }
+        }
+
         std.debug.print("\n\n", .{});
         gen.report();
         return;
@@ -354,8 +481,33 @@ pub fn main(init: std.process.Init) !void {
     try tok.encode(gpa, prompt, true, true, &tokens);
     if (args.verbose) std.debug.print("prompt tokens: {any}\n", .{tokens.items});
     if (tokens.items.len == 0) fail("empty prompt", .{});
+    if (args.prompt_cache) |cp| {
+        const exists = blk: {
+            const f = std.Io.Dir.cwd().openFile(io, cp, .{}) catch break :blk false;
+            f.close(io);
+            break :blk true;
+        };
+        if (exists) {
+            gen.loadCache(cp) catch |e| fail("failed to load prompt cache '{s}': {s}", .{ cp, @errorName(e) });
+            if (args.verbose) {
+                std.debug.print("loaded prompt cache '{s}' ({d} tokens, pos {d})\n", .{ cp, gen.cached.items.len, st.pos });
+            }
+        } else if (!args.prompt_cache_all) {
+            gen.prompt_cache_save = cp;
+        }
+    }
+
     try out.emit(prompt);
-    _ = try gen.run(tokens.items, args.n_predict, out);
+    _ = try gen.runPrompt(tokens.items, args.n_predict, out);
+
+    if (args.prompt_cache) |cp| {
+        if (args.prompt_cache_all) {
+            gen.saveCache(cp) catch |e| fail("failed to save prompt cache '{s}': {s}", .{ cp, @errorName(e) });
+            if (args.verbose) {
+                std.debug.print("saved prompt cache '{s}' ({d} tokens, pos {d})\n", .{ cp, gen.cached.items.len, st.pos });
+            }
+        }
+    }
     std.debug.print("\n\n", .{});
     gen.report();
 }

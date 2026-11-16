@@ -3,14 +3,118 @@
 //! Workers spin between dispatches so back-to-back ops in a forward pass cost
 //! no syscalls; after a short idle period they park on a futex.
 const std = @import("std");
+const builtin = @import("builtin");
 const Atomic = std.atomic.Value;
 
 const spin_limit = 1 << 16;
+pub const max_discovered_cpus = 256;
 
 const Job = struct {
     ctx: *anyopaque,
     func: *const fn (ctx: *anyopaque, tid: usize, nth: usize) void,
 };
+
+pub const CpuTopology = struct {
+    cpus: [max_discovered_cpus]usize = undefined,
+    count: usize = 0,
+    physical_count: usize = 0,
+};
+
+/// Discovers CPU topology on Linux via sysfs, prioritizing distinct physical cores
+/// before filling with SMT/hyperthreading siblings.
+pub fn discoverTopology(io: std.Io) CpuTopology {
+    var topo: CpuTopology = .{};
+    const logical = std.Thread.getCpuCount() catch 4;
+    const n = @min(logical, max_discovered_cpus);
+
+    if (builtin.os.tag != .linux) {
+        for (0..n) |i| topo.cpus[i] = i;
+        topo.count = n;
+        topo.physical_count = n;
+        return topo;
+    }
+
+    var primary: [max_discovered_cpus]usize = undefined;
+    var primary_len: usize = 0;
+    var secondary: [max_discovered_cpus]usize = undefined;
+    var secondary_len: usize = 0;
+
+    var seen_cores: [max_discovered_cpus]u32 = undefined;
+    var seen_len: usize = 0;
+
+    for (0..n) |cpu| {
+        var path_buf: [64]u8 = undefined;
+        const core_path = std.fmt.bufPrint(&path_buf, "/sys/devices/system/cpu/cpu{d}/topology/core_id", .{cpu}) catch continue;
+        var buf: [16]u8 = undefined;
+        const core_str = std.Io.Dir.cwd().readFile(io, core_path, &buf) catch {
+            primary[primary_len] = cpu;
+            primary_len += 1;
+            continue;
+        };
+        const core_id = std.fmt.parseInt(u16, std.mem.trim(u8, core_str, " \r\n\t"), 10) catch {
+            primary[primary_len] = cpu;
+            primary_len += 1;
+            continue;
+        };
+
+        const pkg_path = std.fmt.bufPrint(&path_buf, "/sys/devices/system/cpu/cpu{d}/topology/physical_package_id", .{cpu}) catch continue;
+        const pkg_str = std.Io.Dir.cwd().readFile(io, pkg_path, &buf) catch "0";
+        const pkg_id = std.fmt.parseInt(u16, std.mem.trim(u8, pkg_str, " \r\n\t"), 10) catch 0;
+
+        const key: u32 = (@as(u32, pkg_id) << 16) | @as(u32, core_id);
+
+        var is_seen = false;
+        for (seen_cores[0..seen_len]) |k| {
+            if (k == key) {
+                is_seen = true;
+                break;
+            }
+        }
+
+        if (!is_seen) {
+            seen_cores[seen_len] = key;
+            seen_len += 1;
+            primary[primary_len] = cpu;
+            primary_len += 1;
+        } else {
+            secondary[secondary_len] = cpu;
+            secondary_len += 1;
+        }
+    }
+
+    if (primary_len == 0) {
+        for (0..n) |i| topo.cpus[i] = i;
+        topo.count = n;
+        topo.physical_count = n;
+        return topo;
+    }
+
+    topo.physical_count = primary_len;
+    var total: usize = 0;
+    for (primary[0..primary_len]) |c| {
+        topo.cpus[total] = c;
+        total += 1;
+    }
+    for (secondary[0..secondary_len]) |c| {
+        topo.cpus[total] = c;
+        total += 1;
+    }
+    topo.count = total;
+    return topo;
+}
+
+pub fn pinCurrentThread(cpu: usize) void {
+    if (builtin.os.tag != .linux) return;
+    var set: std.os.linux.cpu_set_t = undefined;
+    @memset(&set, 0);
+    const bits_per_word = @sizeOf(usize) * 8;
+    const word_idx = cpu / bits_per_word;
+    const bit_idx = cpu % bits_per_word;
+    if (word_idx < set.len) {
+        set[word_idx] |= (@as(usize, 1) << @intCast(bit_idx));
+        std.os.linux.sched_setaffinity(0, &set) catch {};
+    }
+}
 
 pub const Pool = struct {
     io: std.Io,
@@ -21,18 +125,36 @@ pub const Pool = struct {
     done: Atomic(u32) = .init(0),
     sleepers: Atomic(u32) = .init(0),
     quit: bool = false,
+    cpu_map: []usize,
 
-    pub fn create(gpa: std.mem.Allocator, io: std.Io, nth: usize) !*Pool {
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, nth: usize, pin: bool) !*Pool {
         const self = try gpa.create(Pool);
         errdefer gpa.destroy(self);
-        self.* = .{ .io = io, .threads = try gpa.alloc(std.Thread, nth - 1), .nth = nth };
+        self.* = .{
+            .io = io,
+            .threads = try gpa.alloc(std.Thread, nth - 1),
+            .nth = nth,
+            .cpu_map = try gpa.alloc(usize, nth),
+        };
+        errdefer gpa.free(self.threads);
+        errdefer gpa.free(self.cpu_map);
+
+        const topo = discoverTopology(io);
+        for (0..nth) |i| {
+            self.cpu_map[i] = if (topo.count > 0) topo.cpus[i % topo.count] else i;
+        }
+
+        if (pin) pinCurrentThread(self.cpu_map[0]);
+
         var spawned: usize = 0;
         errdefer {
             self.shutdown(spawned);
             gpa.free(self.threads);
+            gpa.free(self.cpu_map);
         }
         while (spawned < nth - 1) : (spawned += 1) {
-            self.threads[spawned] = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, worker, .{ self, spawned + 1 });
+            const tid = spawned + 1;
+            self.threads[spawned] = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, worker, .{ self, tid, pin });
         }
         return self;
     }
@@ -47,10 +169,12 @@ pub const Pool = struct {
     pub fn destroy(self: *Pool, gpa: std.mem.Allocator) void {
         self.shutdown(self.threads.len);
         gpa.free(self.threads);
+        gpa.free(self.cpu_map);
         gpa.destroy(self);
     }
 
-    fn worker(self: *Pool, tid: usize) void {
+    fn worker(self: *Pool, tid: usize, pin: bool) void {
+        if (pin) pinCurrentThread(self.cpu_map[tid]);
         var seen: u32 = 0;
         while (true) {
             var spins: u32 = 0;
@@ -107,11 +231,54 @@ pub const Chunks = struct {
     }
 };
 
-/// Number of physical cores (Linux SMT-aware), falling back to logical count.
+/// Number of physical cores (Linux topology-aware), falling back to logical count.
 pub fn defaultThreads(io: std.Io) usize {
-    const logical = std.Thread.getCpuCount() catch 4;
-    var buf: [8]u8 = undefined;
-    const smt = std.Io.Dir.cwd().readFile(io, "/sys/devices/system/cpu/smt/active", &buf) catch return logical;
-    if (smt.len > 0 and smt[0] == '1' and logical >= 2) return logical / 2;
-    return logical;
+    const topo = discoverTopology(io);
+    return if (topo.physical_count > 0) topo.physical_count else std.Thread.getCpuCount() catch 4;
+}
+
+test "discoverTopology" {
+    const topo = discoverTopology(std.testing.io);
+    try std.testing.expect(topo.count >= 1);
+    try std.testing.expect(topo.physical_count >= 1);
+    try std.testing.expect(topo.physical_count <= topo.count);
+
+    // Verify all CPUs in the topology are unique
+    for (0..topo.count) |i| {
+        for (i + 1..topo.count) |j| {
+            try std.testing.expect(topo.cpus[i] != topo.cpus[j]);
+        }
+    }
+}
+
+test "pinCurrentThread" {
+    if (builtin.os.tag == .linux) {
+        pinCurrentThread(0);
+        var set: std.os.linux.cpu_set_t = undefined;
+        @memset(&set, 0);
+        const rc = std.os.linux.sched_getaffinity(0, @sizeOf(std.os.linux.cpu_set_t), &set);
+        try std.testing.expectEqual(@as(usize, 0), rc);
+        try std.testing.expect((set[0] & 1) != 0);
+    }
+}
+
+test "Pool execution and pinning" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const pool = try Pool.create(gpa, io, 2, true);
+    defer pool.destroy(gpa);
+
+    var res = [_]usize{ 0, 0 };
+    const JobCtx = struct {
+        r: *[2]usize,
+    };
+    var job_ctx = JobCtx{ .r = &res };
+    pool.run(&job_ctx, struct {
+        fn f(ctx: *JobCtx, tid: usize, _: usize) void {
+            ctx.r[tid] = tid + 10;
+        }
+    }.f);
+
+    try std.testing.expectEqual(@as(usize, 10), res[0]);
+    try std.testing.expectEqual(@as(usize, 11), res[1]);
 }
