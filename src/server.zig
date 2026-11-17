@@ -368,7 +368,12 @@ fn handleChatCompletion(
     // Apply request-level sampling parameters with restoration on exit
     const orig_params = g.smp.p;
     defer g.smp.p = orig_params;
+    const orig_draft_k = g.draft_k;
+    defer g.draft_k = orig_draft_k;
 
+    if (root.object.get("draft") orelse root.object.get("lookup")) |dv| {
+        if (dv == .integer and dv.integer >= 0) g.draft_k = @intCast(dv.integer);
+    }
     if (root.object.get("temperature")) |tv| {
         if (tv == .float) g.smp.p.temp = @floatCast(tv.float) else if (tv == .integer) g.smp.p.temp = @floatFromInt(tv.integer);
     }
@@ -395,6 +400,15 @@ fn handleChatCompletion(
     }
     if (root.object.get("dry_range")) |dr| {
         if (dr == .integer and dr.integer >= 0) g.smp.p.dry_range = @intCast(dr.integer);
+    }
+    if (root.object.get("xtc_probability") orelse root.object.get("xtc_p")) |xp| {
+        if (xp == .float) g.smp.p.xtc_probability = @floatCast(xp.float) else if (xp == .integer) g.smp.p.xtc_probability = @floatFromInt(xp.integer);
+    }
+    if (root.object.get("xtc_threshold") orelse root.object.get("xtc_t")) |xt| {
+        if (xt == .float) g.smp.p.xtc_threshold = @floatCast(xt.float) else if (xt == .integer) g.smp.p.xtc_threshold = @floatFromInt(xt.integer);
+    }
+    if (root.object.get("xtc_min_keep")) |mk| {
+        if (mk == .integer and mk.integer >= 1) g.smp.p.xtc_min_keep = @intCast(mk.integer);
     }
     if (root.object.get("seed")) |sd| {
         if (sd == .integer and sd.integer >= 0) g.smp.rng = .init(@intCast(sd.integer));

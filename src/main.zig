@@ -34,6 +34,9 @@ const usage =
     \\  --dry-base F          DRY exponential penalty base (default: 1.75)
     \\  --dry-allowed-length N minimum matching sequence length before DRY penalty (default: 2)
     \\  --dry-range N         DRY lookback context length in tokens (default: 1024)
+    \\  --xtc-probability F   XTC chance to exclude top choices, 0 = off (default: 0.0, 0.5 recommended)
+    \\  --xtc-threshold F     XTC minimum token probability threshold to be considered (default: 0.1, <= 0.5)
+    \\  --xtc-min-keep N      XTC minimum tokens to keep after exclusion (default: 1)
     \\  --seed N              RNG seed (time)
     \\
     \\prompt caching:
@@ -42,7 +45,7 @@ const usage =
     \\  --no-pin              disable CPU thread pinning / core affinity
     \\
     \\speculative decoding:
-    \\  --draft N             n-gram prompt lookup draft tokens, 0 = off (default 0, 3-5 recommended)
+    \\  --draft, --lookup N   n-gram prompt lookup draft tokens, 0 = off (default 0, 3-5 recommended)
     \\  --draft-model PATH    small model as draft; --draft sets lookahead (default 3)
     \\                        (draft must share the target's tokenizer)
     \\  --no-adaptive-draft   disable real-time dynamic draft length adaptation
@@ -71,6 +74,9 @@ const SamplingArgs = struct {
     dry_base: ?f32 = null,
     dry_allowed_length: ?usize = null,
     dry_range: ?usize = null,
+    xtc_probability: ?f32 = null,
+    xtc_threshold: ?f32 = null,
+    xtc_min_keep: ?usize = null,
     seed: ?u64 = null,
 };
 
@@ -181,9 +187,15 @@ fn parseArgs(argv: []const [:0]const u8) Args {
             a.sampling.dry_allowed_length = r.uint();
         } else if (r.is(&.{"--dry-range"})) {
             a.sampling.dry_range = r.uint();
+        } else if (r.is(&.{ "--xtc-probability", "--xtc-p" })) {
+            a.sampling.xtc_probability = r.float();
+        } else if (r.is(&.{ "--xtc-threshold", "--xtc-t" })) {
+            a.sampling.xtc_threshold = r.float();
+        } else if (r.is(&.{"--xtc-min-keep"})) {
+            a.sampling.xtc_min_keep = r.uint();
         } else if (r.is(&.{"--seed"})) {
             a.sampling.seed = r.uint();
-        } else if (r.is(&.{"--draft"})) {
+        } else if (r.is(&.{ "--draft", "--lookup" })) {
             a.draft = r.uint();
         } else if (r.is(&.{"--draft-model"})) {
             a.draft_model = r.str();
@@ -256,6 +268,9 @@ fn samplingParams(cli: SamplingArgs, f: *const gguf.File, default_seed: u64) sam
         .dry_base = cli.dry_base orelse d.dry_base,
         .dry_allowed_length = cli.dry_allowed_length orelse d.dry_allowed_length,
         .dry_range = cli.dry_range orelse d.dry_range,
+        .xtc_probability = cli.xtc_probability orelse meta.float(f, "general.sampling.xtc_probability") orelse d.xtc_probability,
+        .xtc_threshold = cli.xtc_threshold orelse meta.float(f, "general.sampling.xtc_threshold") orelse d.xtc_threshold,
+        .xtc_min_keep = cli.xtc_min_keep orelse meta.uint(f, "general.sampling.xtc_min_keep") orelse d.xtc_min_keep,
         .seed = cli.seed orelse default_seed,
     };
 }
@@ -379,6 +394,9 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("sampling: temp={d} top_k={d} top_p={d} min_p={d} repeat_penalty={d}", .{ sp.temp, sp.top_k, sp.top_p, sp.min_p, sp.repeat_penalty });
         if (sp.dry_multiplier > 0) {
             std.debug.print(" dry={d:.2}x{d:.2}^{d}", .{ sp.dry_multiplier, sp.dry_base, sp.dry_allowed_length });
+        }
+        if (sp.xtc_probability > 0) {
+            std.debug.print(" xtc=p:{d:.2},t:{d:.2}", .{ sp.xtc_probability, sp.xtc_threshold });
         }
         std.debug.print("\n", .{});
     }

@@ -17,6 +17,13 @@ pub const Params = struct {
     dry_allowed_length: usize = 2,
     /// Lookback context length in tokens for repetition detection.
     dry_range: usize = 1024,
+
+    /// XTC (Exclude Top Choices) chance to exclude top-choice tokens (0 = off, 0.1-0.5 recommended).
+    xtc_probability: f32 = 0.0,
+    /// XTC minimum probability threshold for tokens to be eligible for exclusion (default: 0.1, <= 0.5).
+    xtc_threshold: f32 = 0.1,
+    /// XTC minimum number of tokens to keep after exclusion (default: 1).
+    xtc_min_keep: usize = 1,
 };
 
 /// Tokens considered by the repetition penalty.
@@ -27,7 +34,7 @@ pub const max_breakers = 16;
 const Cand = struct { id: u32, v: f32 };
 
 /// Filter chain in llama.cpp's default order: repetition penalty, DRY penalty,
-/// top-k, top-p, min-p (on untempered probabilities), then temperature.
+/// top-k, top-p, min-p, temperature, then XTC.
 pub const Sampler = struct {
     p: Params,
     rng: std.Random.DefaultPrng,
@@ -233,8 +240,35 @@ pub const Sampler = struct {
             e.v = @exp((e.v - mx) * inv_t);
             total += e.v;
         }
+
+        // XTC (Exclude Top Choices): if top token(s) have >= threshold probability,
+        // prune the top choices with chance `xtc_probability`, encouraging creative
+        // and natural phrasing without degrading coherence.
+        var start_idx: usize = 0;
+        if (s.p.xtc_probability > 0.0 and s.p.xtc_threshold <= 0.5 and keep >= 2 and total > 0.0) {
+            const chance = s.rng.random().float(f32);
+            if (chance <= s.p.xtc_probability) {
+                const inv_tot = 1.0 / total;
+                var pos_last: usize = 0;
+                for (c[0..keep], 0..) |e, i| {
+                    const prob = e.v * inv_tot;
+                    if (prob >= s.p.xtc_threshold) {
+                        pos_last = i;
+                    } else {
+                        break;
+                    }
+                }
+                const min_keep = @max(1, s.p.xtc_min_keep);
+                if (keep - pos_last >= min_keep and pos_last > 0) {
+                    start_idx = pos_last;
+                    total = 0;
+                    for (c[start_idx..keep]) |e| total += e.v;
+                }
+            }
+        }
+
         var r = s.rng.random().float(f32) * total;
-        for (c[0..keep]) |e| {
+        for (c[start_idx..keep]) |e| {
             r -= e.v;
             if (r <= 0) return .{ .tok = e.id, .margin = margin };
         }
@@ -636,4 +670,79 @@ test "DRY sampler penalty and sequence breaker" {
     smp.applyDry(&logits3);
     // Token 4 is a breaker, so it should NOT be penalized
     try std.testing.expectEqual(@as(f32, 10.0), logits3[4]);
+}
+
+test "min_p sampler prunes low probability candidates" {
+    const gpa = std.testing.allocator;
+    var smp = try Sampler.init(gpa, 10, .{
+        .temp = 1.0,
+        .top_k = 10,
+        .top_p = 1.0,
+        .min_p = 0.10, // prunes candidates with p < 0.10 * p_max
+        .repeat_penalty = 1.0,
+    });
+    defer smp.deinit(gpa);
+
+    // Token 0: logit 10.0 (p_rel = exp(0) = 1.0)
+    // Token 1: logit 9.0  (p_rel = exp(-1) = ~0.368 > 0.10 -> kept)
+    // Token 2: logit 6.0  (p_rel = exp(-4) = ~0.018 < 0.10 -> pruned)
+    // Token 3: logit 1.0  (p_rel = exp(-9) < 0.10 -> pruned)
+    var logits: [10]f32 = @splat(-50.0);
+    logits[0] = 10.0;
+    logits[1] = 9.0;
+    logits[2] = 6.0;
+    logits[3] = 1.0;
+
+    // Sample 50 times: only token 0 or 1 should EVER be selected.
+    for (0..50) |_| {
+        var copy = logits;
+        const tok = smp.sample(&copy);
+        try std.testing.expect(tok == 0 or tok == 1);
+    }
+}
+
+test "XTC sampler excludes top choice when viable alternatives exist" {
+    const gpa = std.testing.allocator;
+    var smp = try Sampler.init(gpa, 10, .{
+        .temp = 1.0,
+        .top_k = 10,
+        .top_p = 1.0,
+        .min_p = 0.0,
+        .xtc_probability = 1.0, // 100% trigger chance
+        .xtc_threshold = 0.15,
+        .xtc_min_keep = 1,
+    });
+    defer smp.deinit(gpa);
+
+    // Case 1: Multiple tokens exceed xtc_threshold:
+    // Token 0: logit 10.0 (top choice ~60% probability)
+    // Token 1: logit 9.3  (second choice ~30% probability >= 0.15)
+    // Token 2: logit 7.0  (third choice ~3% probability < 0.15)
+    var logits: [10]f32 = @splat(-50.0);
+    logits[0] = 10.0;
+    logits[1] = 9.3;
+    logits[2] = 7.0;
+
+    // With xtc_probability = 1.0, token 0 MUST be excluded!
+    for (0..30) |_| {
+        var copy = logits;
+        const tok = smp.sample(&copy);
+        // Token 0 must NOT be sampled; token 1 or 2 should be sampled
+        try std.testing.expect(tok != 0);
+        try std.testing.expect(tok == 1 or tok == 2);
+    }
+
+    // Case 2: No viable alternative >= xtc_threshold (coherence safeguard):
+    // Token 0: logit 10.0 (~95% probability)
+    // Token 1: logit 6.0  (~1.8% probability < 0.15)
+    var logits_clear: [10]f32 = @splat(-50.0);
+    logits_clear[0] = 10.0;
+    logits_clear[1] = 6.0;
+
+    // XTC must NOT trigger because pos_last == 0 (no alternative >= 0.15)
+    for (0..30) |_| {
+        var copy = logits_clear;
+        const tok = smp.sample(&copy);
+        try std.testing.expectEqual(@as(u32, 0), tok);
+    }
 }
