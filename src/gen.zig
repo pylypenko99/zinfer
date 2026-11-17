@@ -177,6 +177,7 @@ pub const Gen = struct {
             .f16 => c.head_dim * 32,
             .q8_0 => c.head_dim * 17,
             .q4_0 => c.head_dim * 9,
+            .q2_0 => c.head_dim * 5,
         };
         for (st.model.layers) |*L| {
             switch (L.mixer) {
@@ -251,6 +252,7 @@ pub const Gen = struct {
             .f16 => c.head_dim * 32,
             .q8_0 => c.head_dim * 17,
             .q4_0 => c.head_dim * 9,
+            .q2_0 => c.head_dim * 5,
         };
         const pos: usize = @intCast(hdr.pos);
         for (st.model.layers) |*L| {
