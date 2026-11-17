@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.17.1
+
+      - name: Build zinfer (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Run Test Suite
+        run: zig test -OReleaseFast -mcpu=native src/tests.zig
