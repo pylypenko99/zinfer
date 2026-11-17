@@ -179,7 +179,7 @@ fn parseArgs(argv: []const [:0]const u8) Args {
             a.json = true;
         } else if (r.is(&.{"--port"})) {
             a.server = true;
-            a.port = @intCast(r.uint());
+            a.port = std.math.cast(u16, r.uint()) orelse fail("port out of range (1-65535)", .{});
         } else if (r.is(&.{"--no-prune"})) {
             a.load.prune_vocab = false;
         } else if (r.is(&.{"--no-repack"})) {

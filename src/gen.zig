@@ -660,6 +660,9 @@ test "reusablePrefix" {
     var g: Gen = undefined;
     var fake_st: model_mod.State = undefined;
     fake_st.conv_state = &.{};
+    var fake_model: model_mod.Model = undefined;
+    fake_model.cfg.swa_window = 0;
+    fake_st.model = &fake_model;
     g.st = &fake_st;
     g.cached = .empty;
     var list: std.ArrayList(u32) = .empty;
