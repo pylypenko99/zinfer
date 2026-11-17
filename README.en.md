@@ -11,7 +11,7 @@
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/Dependencies-0%20(no%20libc)-brightgreen)](#architecture)
 [![Speedup](https://img.shields.io/badge/vs%20llama.cpp-+20%E2%80%9350%25-success)](#performance--benchmarks)
-[![Tests](https://img.shields.io/badge/Tests-29%2F29%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-31%2F31%20passing-brightgreen)](#testing)
 
 [**English**](README.en.md) · [**Українська**](README.md) · [**Scientific Roadmap**](ROADMAP.md)
 
@@ -94,7 +94,10 @@ cd zinfer
 # Build optimized binary (auto-detects AVX2 / AVX-512 / FMA)
 zig build -Doptimize=ReleaseFast
 
-# Run test suite (27 unit tests)
+# Cross-compile for Windows (standalone .exe, zero dependencies)
+zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast -Dcpu=x86_64_v3
+
+# Run test suite (31 unit tests)
 zig test -OReleaseFast -mcpu=native src/tests.zig
 ```
 

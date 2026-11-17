@@ -11,7 +11,7 @@
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/Dependencies-0%20(no%20libc)-brightgreen)](#архітектура)
 [![Speedup](https://img.shields.io/badge/vs%20llama.cpp-+20%E2%80%9350%25-success)](#швидкість-і-бенчмарки)
-[![Tests](https://img.shields.io/badge/Tests-29%2F29%20passing-brightgreen)](#тестування)
+[![Tests](https://img.shields.io/badge/Tests-31%2F31%20passing-brightgreen)](#тестування)
 
 [**Українська**](README.md) · [**English**](README.en.md) · [**Науковий роудмап**](ROADMAP.md)
 
@@ -94,7 +94,10 @@ cd zinfer
 # Збірка максимальної швидкодії (автовизначення AVX2 / AVX-512 / FMA)
 zig build -Doptimize=ReleaseFast
 
-# Запуск набору 27 автоматичних юніт-тестів
+# Крос-компіляція під Windows (автономний .exe без зовнішніх бібліотек)
+zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast -Dcpu=x86_64_v3
+
+# Запуск набору 31 автоматичного юніт-тесту
 zig test -OReleaseFast -mcpu=native src/tests.zig
 ```
 
