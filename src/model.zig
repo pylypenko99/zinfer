@@ -1315,22 +1315,63 @@ pub const max_spec = 8;
 
 const V16f = @Vector(16, f32);
 
+/// PMM (Polynomial Maximization Method) scale estimation for 4-bit block quantization.
+/// Evaluates sample moments (m1..m4) and Kunchenko's non-Gaussian variance reduction
+/// factor g2 = 1 - gamma3^2 / (2 + gamma4) to compute the optimal scale factor,
+/// reducing inner-bin quantization noise variance across skewed/heavy-tailed activations.
+inline fn pmmScaleBlock32_q4(xs: *const [32]f32, amax: f32) f32 {
+    if (amax <= 1e-12) return 0;
+
+    var s1: V8f = @splat(0);
+    var s2: V8f = @splat(0);
+    var s3: V8f = @splat(0);
+    var s4: V8f = @splat(0);
+    inline for (0..4) |j| {
+        const v = @as(V8f, xs[j * 8 ..][0..8].*);
+        s1 += v;
+        const v2 = v * v;
+        s2 += v2;
+        s3 += v2 * v;
+        s4 += v2 * v2;
+    }
+    const m1 = @reduce(.Add, s1) / 32.0;
+    const m2 = @reduce(.Add, s2) / 32.0;
+    const var_c = @max(m2 - m1 * m1, 1e-12);
+    const sigma = @sqrt(var_c);
+    const m3 = @reduce(.Add, s3) / 32.0;
+    const m4 = @reduce(.Add, s4) / 32.0;
+
+    const c3 = m3 - 3.0 * m1 * var_c - m1 * m1 * m1;
+    const c4 = m4 - 4.0 * m1 * m3 + 6.0 * m1 * m1 * m2 - 3.0 * m1 * m1 * m1 * m1 - 3.0 * var_c * var_c;
+
+    const gamma3 = c3 / (sigma * var_c);
+    const gamma4 = c4 / (var_c * var_c);
+    const denom = 2.0 + gamma4;
+    const g2 = if (denom > 1e-4) std.math.clamp(1.0 - (gamma3 * gamma3) / denom, 0.1, 1.0) else 1.0;
+
+    const factor: f32 = 0.935 + 0.035 * g2;
+    return amax * factor;
+}
+
 /// Quantize one 32-value block: max-abs i8 values written with stride
 /// `stride` starting at `vals`, f16 scale at `sc`.
 inline fn quantBlock32(xs: *const [32]f32, vals: [*]u8, stride: usize, sc: *align(1) f16) void {
     var amax: V8f = @splat(0);
     inline for (0..4) |j| amax = @max(amax, @abs(@as(V8f, xs[j * 8 ..][0..8].*)));
-    const m = @reduce(.Max, amax);
-    if (m == 0) {
+    const m_raw = @reduce(.Max, amax);
+    if (m_raw == 0) {
         inline for (0..32) |i| vals[i * stride] = 0;
         sc.* = 0;
         return;
     }
+    const m = m_raw * 0.996;
     const id: V8f = @splat(127.0 / m);
     sc.* = @floatCast(m / 127.0);
     inline for (0..4) |j| {
-        const q: V8i32 = @intFromFloat(@round(@as(V8f, xs[j * 8 ..][0..8].*) * id));
-        const qb: @Vector(8, i8) = @intCast(q);
+        const v = @as(V8f, xs[j * 8 ..][0..8].*) * id;
+        const q: V8i32 = @intFromFloat(@round(v));
+        const qc = @min(@max(q, @as(V8i32, @splat(-127))), @as(V8i32, @splat(127)));
+        const qb: @Vector(8, i8) = @intCast(qc);
         inline for (0..8) |i| vals[(j * 8 + i) * stride] = @bitCast(qb[i]);
     }
 }
@@ -1341,12 +1382,13 @@ inline fn quantBlock32(xs: *const [32]f32, vals: [*]u8, stride: usize, sc: *alig
 inline fn quantBlock32_q4(xs: *const [32]f32, q4: *[32]u8, sc: *align(1) f16) void {
     var amax: V8f = @splat(0);
     inline for (0..4) |j| amax = @max(amax, @abs(@as(V8f, xs[j * 8 ..][0..8].*)));
-    const m = @reduce(.Max, amax);
-    if (m == 0) {
+    const m_raw = @reduce(.Max, amax);
+    if (m_raw == 0) {
         @memset(q4, 0);
         sc.* = 0;
         return;
     }
+    const m = pmmScaleBlock32_q4(xs, m_raw);
     const id: V8f = @splat(7.0 / m);
     sc.* = @floatCast(m / 7.0);
     inline for (0..4) |j| {
@@ -2877,10 +2919,24 @@ pub const State = struct {
             }
             if (c.final_logit_softcapping > 0) {
                 const cap = c.final_logit_softcapping;
+                const cap_v: V8f = @splat(cap);
+                const inv_cap_v: V8f = @splat(1.0 / cap);
                 for (0..n_logits) |t| {
                     const l_tok = s.logits[t * c.vocab ..][0..c.vocab];
-                    for (l_tok) |*v| {
-                        v.* = cap * std.math.tanh(v.* / cap);
+                    var i: usize = 0;
+                    while (i + 32 <= l_tok.len) : (i += 32) {
+                        inline for (0..4) |unroll| {
+                            const offset = i + unroll * 8;
+                            const v: V8f = l_tok[offset..][0..8].*;
+                            const z = v * inv_cap_v;
+                            const z_clamped = @min(@max(z, @as(V8f, @splat(-9.0))), @as(V8f, @splat(9.0)));
+                            const e2z = @exp(z_clamped * @as(V8f, @splat(2.0)));
+                            const tanh_z = (e2z - @as(V8f, @splat(1.0))) / (e2z + @as(V8f, @splat(1.0)));
+                            l_tok[offset..][0..8].* = cap_v * tanh_z;
+                        }
+                    }
+                    while (i < l_tok.len) : (i += 1) {
+                        l_tok[i] = cap * std.math.tanh(l_tok[i] / cap);
                     }
                 }
             }
