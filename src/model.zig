@@ -18,7 +18,7 @@ const GgmlType = gguf.GgmlType;
 const Allocator = std.mem.Allocator;
 
 pub const Arch = enum { llama, qwen2, qwen3, lfm2, lfm3, gemma3, gemma4, qwen2moe, mixtral, deepseek2 };
-pub const CacheType = enum(u32) { f16 = 0, q8_0 = 1, q4_0 = 2, q2_0 = 3 };
+pub const CacheType = enum(u32) { f16 = 0, q8_0 = 1, q4_0 = 2, q2_0 = 3, q2_k = 4 };
 pub const max_layers = 256;
 pub const max_active_experts = 256;
 
@@ -1371,8 +1371,8 @@ inline fn fwhtSimd(x: []f32) void {
 
 /// PMM (Polynomial Maximization Method) scale estimation for 4-bit block quantization.
 /// Evaluates sample moments (m1..m4) and Kunchenko's non-Gaussian variance reduction
-/// factor g2 = 1 - gamma3^2 / (2 + gamma4) to compute the optimal scale factor,
-/// reducing inner-bin quantization noise variance across skewed/heavy-tailed activations.
+/// factor g2 = 1 - gamma3^2 / (2 + gamma4) with asymmetric shift \hat{\theta} = m1 + h2 * (m2c - c2)
+/// where h2 = -c3 / (c4 + 2*c2^2), adapting the clipping boundary to skewed activation distributions.
 inline fn pmmScaleBlock32_q4(xs: *const [32]f32, amax: f32) f32 {
     if (amax <= 1e-12) return 0;
 
@@ -1403,7 +1403,58 @@ inline fn pmmScaleBlock32_q4(xs: *const [32]f32, amax: f32) f32 {
     const denom = 2.0 + gamma4;
     const g2 = if (denom > 1e-4) std.math.clamp(1.0 - (gamma3 * gamma3) / denom, 0.1, 1.0) else 1.0;
 
-    const factor: f32 = 0.935 + 0.035 * g2;
+    // Asymmetric shift estimator \hat{\theta} = m1 + h2 * var_c with h2 = -c3 / (c4 + 2*c2^2)
+    const h2_denom = c4 + 2.0 * var_c * var_c;
+    const h2 = if (h2_denom > 1e-12) -c3 / h2_denom else 0.0;
+    const theta_shift = m1 + h2 * var_c;
+    const eta = @abs(theta_shift) / sigma;
+    const asym_penalty = std.math.clamp(0.035 * eta, 0.0, 0.05);
+
+    const factor: f32 = std.math.clamp(0.935 + 0.035 * g2 - asym_penalty, 0.88, 0.98);
+    return amax * factor;
+}
+
+/// PMM scale estimation for 2-bit block quantization (q2_0 / q2_k).
+/// 2-bit quantization has only 4 levels (-3, -1, 1, 3); adapting the scale
+/// to sample variance, kurtosis, and asymmetric shift prevents single outliers
+/// from compressing all inner representations.
+inline fn pmmScaleBlock32_q2(xs: *const [32]f32, amax: f32) f32 {
+    if (amax <= 1e-12) return 0;
+
+    var s1: V8f = @splat(0);
+    var s2: V8f = @splat(0);
+    var s3: V8f = @splat(0);
+    var s4: V8f = @splat(0);
+    inline for (0..4) |j| {
+        const v = @as(V8f, xs[j * 8 ..][0..8].*);
+        s1 += v;
+        const v2 = v * v;
+        s2 += v2;
+        s3 += v2 * v;
+        s4 += v2 * v2;
+    }
+    const m1 = @reduce(.Add, s1) / 32.0;
+    const m2 = @reduce(.Add, s2) / 32.0;
+    const var_c = @max(m2 - m1 * m1, 1e-12);
+    const sigma = @sqrt(var_c);
+    const m3 = @reduce(.Add, s3) / 32.0;
+    const m4 = @reduce(.Add, s4) / 32.0;
+
+    const c3 = m3 - 3.0 * m1 * var_c - m1 * m1 * m1;
+    const c4 = m4 - 4.0 * m1 * m3 + 6.0 * m1 * m1 * m2 - 3.0 * m1 * m1 * m1 * m1 - 3.0 * var_c * var_c;
+
+    const gamma3 = c3 / (sigma * var_c);
+    const gamma4 = c4 / (var_c * var_c);
+    const denom = 2.0 + gamma4;
+    const g2 = if (denom > 1e-4) std.math.clamp(1.0 - (gamma3 * gamma3) / denom, 0.1, 1.0) else 1.0;
+
+    const h2_denom = c4 + 2.0 * var_c * var_c;
+    const h2 = if (h2_denom > 1e-12) -c3 / h2_denom else 0.0;
+    const theta_shift = m1 + h2 * var_c;
+    const eta = @abs(theta_shift) / sigma;
+    const asym_penalty = std.math.clamp(0.05 * eta, 0.0, 0.07);
+
+    const factor: f32 = std.math.clamp(0.830 + 0.050 * g2 - asym_penalty, 0.75, 0.92);
     return amax * factor;
 }
 
@@ -1467,7 +1518,7 @@ inline fn quantBlock32_q2(xs: *const [32]f32, q2: *[32]u8, sc: *align(1) f16) vo
         sc.* = 0;
         return;
     }
-    const m = m_raw * 0.95;
+    const m = pmmScaleBlock32_q2(xs, m_raw);
     const s = m / 3.0;
     sc.* = @floatCast(s);
     const id: V8f = @splat(1.0 / s);
@@ -1501,10 +1552,17 @@ fn attendBlockChunk(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt
     // q8_0 tile: hd/32 blocks of [32*16 i8 + 16 f16 scales] = hd*17 bytes.
     // q4_0 tile: hd/32 blocks of [32*8 u8 nibbles + 16 f16 scales] = hd*9 bytes.
     // q2_0 tile: hd/32 blocks of [32*4 u8 pairs + 16 f16 scales] = hd*5 bytes.
-    const tile_bytes: usize = switch (CACHE) {
+    // q2_k tile: K in q2_0 (hd*5 bytes), V in q4_0 (hd*9 bytes).
+    const k_tile_bytes: usize = switch (CACHE) {
         .f16 => hd * 32,
         .q8_0 => hd * 17,
         .q4_0 => hd * 9,
+        .q2_0, .q2_k => hd * 5,
+    };
+    const v_tile_bytes: usize = switch (CACHE) {
+        .f16 => hd * 32,
+        .q8_0 => hd * 17,
+        .q4_0, .q2_k => hd * 9,
         .q2_0 => hd * 5,
     };
     const nblocks = hd / 32;
@@ -1525,11 +1583,11 @@ fn attendBlockChunk(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt
 
     for (j_start..j_end) |j| {
         const tile_idx = if (window > 0) j % w_tiles else j;
-        const tile = kt + tile_idx * tile_bytes;
+        const tile = kt + tile_idx * k_tile_bytes;
         if (j + 1 < j_end) {
             const next_idx = if (window > 0) (j + 1) % w_tiles else (j + 1);
-            const nk = kt + next_idx * tile_bytes;
-            const nv = vr + next_idx * tile_bytes;
+            const nk = kt + next_idx * k_tile_bytes;
+            const nv = vr + next_idx * v_tile_bytes;
             inline for (0..8) |cl| {
                 @prefetch(nk + cl * 64, .{ .rw = .read, .locality = 3, .cache = .data });
                 @prefetch(nv + cl * 64, .{ .rw = .read, .locality = 3, .cache = .data });
@@ -1585,7 +1643,7 @@ fn attendBlockChunk(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt
                     }
                 }
             },
-            .q2_0 => {
+            .q2_0, .q2_k => {
                 comptime var qs: usize = 0;
                 inline while (qs < NQ) : (qs += 4) {
                     const q_sub = comptime @min(4, NQ - qs);
@@ -1732,8 +1790,8 @@ fn attendBlockChunk(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt
         // o += p . V for this tile, 8 or 16 output dims at a time kept in registers.
         const nvalid = @min(kv_tile, maxnp - base);
         switch (CACHE) {
-            .q4_0 => {
-                const vt = vr + tile_idx * tile_bytes;
+            .q4_0, .q2_k => {
+                const vt = vr + tile_idx * v_tile_bytes;
                 comptime var qs: usize = 0;
                 inline while (qs < NQ) : (qs += 4) {
                     const q_sub = comptime @min(4, NQ - qs);
@@ -1781,7 +1839,7 @@ fn attendBlockChunk(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt
                 }
             },
             .q2_0 => {
-                const vt = vr + tile_idx * tile_bytes;
+                const vt = vr + tile_idx * v_tile_bytes;
                 comptime var qs: usize = 0;
                 inline while (qs < NQ) : (qs += 4) {
                     const q_sub = comptime @min(4, NQ - qs);
@@ -1841,7 +1899,7 @@ fn attendBlockChunk(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt
             .q8_0 => {
                 // Fold each block's per-position scales into the softmax weights
                 // once; the inner loop then accumulates plain i8 values.
-                const vt = vr + tile_idx * tile_bytes;
+                const vt = vr + tile_idx * v_tile_bytes;
                 comptime var qs: usize = 0;
                 inline while (qs < NQ) : (qs += 4) {
                     const q_sub = comptime @min(4, NQ - qs);
@@ -1883,7 +1941,7 @@ fn attendBlockChunk(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt
                 }
             },
             .f16 => {
-                const vt: [*]const f16 = @ptrCast(@alignCast(vr + tile_idx * tile_bytes));
+                const vt: [*]const f16 = @ptrCast(@alignCast(vr + tile_idx * v_tile_bytes));
                 comptime var qs: usize = 0;
                 inline while (qs < NQ) : (qs += 4) {
                     const q_sub = comptime @min(4, NQ - qs);
@@ -2001,7 +2059,7 @@ fn attnWorker(job: *AttnJob, _: usize, _: usize) void {
         const first = qb * bq;
         const nq = @min(bq, nq_total - first);
         const kt = st.k_cache.ptr + st.cacheIndex(job.slot, kh);
-        const vr = st.v_cache.ptr + st.cacheIndex(job.slot, kh);
+        const vr = st.v_cache.ptr + st.vCacheIndex(job.slot, kh);
 
         const t_start = if (is_flash) job.tile_start + c_idx * job.chunk_tiles else 0;
         const t_end = if (is_flash) t_start + job.chunk_tiles else std.math.maxInt(usize);
@@ -2031,6 +2089,7 @@ fn attnWorker(job: *AttnJob, _: usize, _: usize) void {
                         .q8_0 => attendBlockChunk(n, .q8_0, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles, t_start, t_end, &ps),
                         .q4_0 => attendBlockChunk(n, .q4_0, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles, t_start, t_end, &ps),
                         .q2_0 => attendBlockChunk(n, .q2_0, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles, t_start, t_end, &ps),
+                        .q2_k => attendBlockChunk(n, .q2_k, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles, t_start, t_end, &ps),
                     }
                     inline for (0..n) |i| {
                         const h = kh * g + (first + i) % g;
@@ -2043,6 +2102,7 @@ fn attnWorker(job: *AttnJob, _: usize, _: usize) void {
                         .q8_0 => attendBlockChunk(n, .q8_0, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles, 0, std.math.maxInt(usize), null),
                         .q4_0 => attendBlockChunk(n, .q4_0, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles, 0, std.math.maxInt(usize), null),
                         .q2_0 => attendBlockChunk(n, .q2_0, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles, 0, std.math.maxInt(usize), null),
+                        .q2_k => attendBlockChunk(n, .q2_k, hd, kt, vr, qp, lo, np, op, scale, job.window, job.w_tiles, 0, std.math.maxInt(usize), null),
                     }
                 }
             },
@@ -2139,6 +2199,8 @@ pub const State = struct {
     slot_offsets: []usize,
     /// Bytes of k_cache / v_cache per KV head for each attention layer slot.
     slot_strides: []usize,
+    v_slot_offsets: []usize,
+    v_slot_strides: []usize,
     /// Number of 16-token tiles allocated per KV head for each attention layer slot.
     slot_tiles: []usize,
     /// K/V cache format: f16, q8_0, or q4_0.
@@ -2233,36 +2295,51 @@ pub const State = struct {
         errdefer gpa.free(s.slot_offsets);
         s.slot_strides = try gpa.alloc(usize, model.n_attn_layers);
         errdefer gpa.free(s.slot_strides);
+        s.v_slot_offsets = try gpa.alloc(usize, model.n_attn_layers);
+        errdefer gpa.free(s.v_slot_offsets);
+        s.v_slot_strides = try gpa.alloc(usize, model.n_attn_layers);
+        errdefer gpa.free(s.v_slot_strides);
         s.slot_tiles = try gpa.alloc(usize, model.n_attn_layers);
         errdefer gpa.free(s.slot_tiles);
 
-        var total_bytes: usize = 0;
+        var total_k_bytes: usize = 0;
+        var total_v_bytes: usize = 0;
         for (model.layers) |*L| {
             switch (L.mixer) {
                 .attention => |*A| {
                     if (A.has_kv) {
                         const is_swa = A.swa and c.swa_window > 0;
                         const tiles = if (is_swa) (c.swa_window + kv_tile - 1) / kv_tile + 1 else s.ctx_pad / kv_tile;
-                        const tile_bytes: usize = switch (cache_type) {
+                        const k_tile_bytes: usize = switch (cache_type) {
                             .f16 => A.head_dim * 32,
                             .q8_0 => A.head_dim * 17,
                             .q4_0 => A.head_dim * 9,
+                            .q2_0, .q2_k => A.head_dim * 5,
+                        };
+                        const v_tile_bytes: usize = switch (cache_type) {
+                            .f16 => A.head_dim * 32,
+                            .q8_0 => A.head_dim * 17,
+                            .q4_0, .q2_k => A.head_dim * 9,
                             .q2_0 => A.head_dim * 5,
                         };
-                        const head_bytes = tiles * tile_bytes;
+                        const k_head_bytes = tiles * k_tile_bytes;
+                        const v_head_bytes = tiles * v_tile_bytes;
                         s.slot_tiles[A.kv_slot] = tiles;
-                        s.slot_strides[A.kv_slot] = head_bytes;
-                        s.slot_offsets[A.kv_slot] = total_bytes;
-                        total_bytes += c.n_kv_heads * head_bytes;
+                        s.slot_strides[A.kv_slot] = k_head_bytes;
+                        s.slot_offsets[A.kv_slot] = total_k_bytes;
+                        s.v_slot_strides[A.kv_slot] = v_head_bytes;
+                        s.v_slot_offsets[A.kv_slot] = total_v_bytes;
+                        total_k_bytes += c.n_kv_heads * k_head_bytes;
+                        total_v_bytes += c.n_kv_heads * v_head_bytes;
                     }
                 },
                 .shortconv => {},
             }
         }
 
-        s.k_cache = try gpa.alignedAlloc(u8, .@"32", total_bytes);
+        s.k_cache = try gpa.alignedAlloc(u8, .@"32", total_k_bytes);
         errdefer gpa.free(s.k_cache);
-        s.v_cache = try gpa.alignedAlloc(u8, .@"32", total_bytes);
+        s.v_cache = try gpa.alignedAlloc(u8, .@"32", total_v_bytes);
         if (model.output_coarse != null) {
             const n_groups = c.vocab / 8;
             s.coarse_scores = try gpa.alloc(f32, n_groups);
@@ -2285,6 +2362,8 @@ pub const State = struct {
         inline for (.{ "x", "q", "k", "v", "logits", "rope_cs", "rope_cs_swa", "tmp", "gate", "conv_in", "conv_hist", "conv_state", "conv_checkpoint", "flash_o", "flash_m", "flash_l", "router_logits", "moe_out", "inp_per_layer", "ple_proj", "ple_buf" }) |name| gpa.free(@field(s, name));
         gpa.free(s.slot_offsets);
         gpa.free(s.slot_strides);
+        gpa.free(s.v_slot_offsets);
+        gpa.free(s.v_slot_strides);
         gpa.free(s.slot_tiles);
         gpa.free(s.k_cache);
         gpa.free(s.v_cache);
@@ -2335,9 +2414,14 @@ pub const State = struct {
         @memcpy(s.conv_state, conv);
     }
 
-    /// Start of one (attention layer, kv head) region in k_cache / v_cache.
+    /// Start of one (attention layer, kv head) region in k_cache.
     pub inline fn cacheIndex(s: *const State, slot: usize, kh: usize) usize {
         return s.slot_offsets[slot] + kh * s.slot_strides[slot];
+    }
+
+    /// Start of one (attention layer, kv head) region in v_cache.
+    pub inline fn vCacheIndex(s: *const State, slot: usize, kh: usize) usize {
+        return s.v_slot_offsets[slot] + kh * s.v_slot_strides[slot];
     }
 
     fn matmulOffset(s: *State, outs: []const MatOut, act: *Act, tok_offset: usize, ntok: usize) void {
@@ -2442,7 +2526,7 @@ pub const State = struct {
                 while (h < q.len) : (h += hd) rmsnorm(q[h..][0..hd], q[h..][0..hd], w, c.eps);
             }
             s.rope(q, t, A.swa, hd, A.n_rot);
-            if ((s.cache_type == .q4_0 or s.cache_type == .q2_0) and (hd & (hd - 1)) == 0) {
+            if ((s.cache_type == .q4_0 or s.cache_type == .q2_0 or s.cache_type == .q2_k) and (hd & (hd - 1)) == 0) {
                 var h: usize = 0;
                 while (h < q.len) : (h += hd) fwhtSimd(q[h..][0..hd]);
             }
@@ -2461,7 +2545,7 @@ pub const State = struct {
                     while (h < k.len) : (h += hd) rmsnorm(k[h..][0..hd], k[h..][0..hd], w, c.eps);
                 }
                 s.rope(k, t, A.swa, hd, A.n_rot);
-                if ((s.cache_type == .q4_0 or s.cache_type == .q2_0) and (hd & (hd - 1)) == 0) {
+                if ((s.cache_type == .q4_0 or s.cache_type == .q2_0 or s.cache_type == .q2_k) and (hd & (hd - 1)) == 0) {
                     var kh: usize = 0;
                     while (kh < k.len) : (kh += hd) fwhtSimd(k[kh..][0..hd]);
                 }
@@ -2470,18 +2554,25 @@ pub const State = struct {
                 const p = pos0 + t;
                 const tile = if (is_swa) (p / kv_tile) % w_tiles else p / kv_tile;
                 const pl = p % kv_tile;
-                const tb: usize = switch (s.cache_type) {
+                const tb_k: usize = switch (s.cache_type) {
                     .f16 => hd * 32,
                     .q8_0 => hd * 17,
                     .q4_0 => hd * 9,
+                    .q2_0, .q2_k => hd * 5,
+                };
+                const tb_v: usize = switch (s.cache_type) {
+                    .f16 => hd * 32,
+                    .q8_0 => hd * 17,
+                    .q4_0, .q2_k => hd * 9,
                     .q2_0 => hd * 5,
                 };
                 for (0..A.n_kv_heads) |kh| {
-                    const base = s.cacheIndex(A.kv_slot, kh);
+                    const base_k = s.cacheIndex(A.kv_slot, kh);
+                    const base_v = s.vCacheIndex(A.kv_slot, kh);
                     switch (s.cache_type) {
                         .q2_0 => {
-                            const kt = s.k_cache.ptr + base + tile * tb;
-                            const vt = s.v_cache.ptr + base + tile * tb;
+                            const kt = s.k_cache.ptr + base_k + tile * tb_k;
+                            const vt = s.v_cache.ptr + base_v + tile * tb_v;
                             const kq = k[kh * hd ..][0..hd];
                             const vq = v[kh * hd ..][0..hd];
                             const byte_idx = pl % 4;
@@ -2515,9 +2606,47 @@ pub const State = struct {
                                 @memcpy(v_dst[0..8], &v_packed);
                             }
                         },
+                        .q2_k => {
+                            const kt = s.k_cache.ptr + base_k + tile * tb_k;
+                            const vt = s.v_cache.ptr + base_v + tile * tb_v;
+                            const kq = k[kh * hd ..][0..hd];
+                            const vq = v[kh * hd ..][0..hd];
+                            const byte_idx = pl % 4;
+                            const shift: u3 = @intCast((pl / 4) * 2);
+                            const mask = ~(@as(u8, 0x03) << shift);
+
+                            var b: usize = 0;
+                            while (b < hd / 32) : (b += 1) {
+                                var q2_k: [32]u8 = undefined;
+                                var sc_k: f16 = undefined;
+                                quantBlock32_q2(kq[b * 32 ..][0..32], &q2_k, &sc_k);
+
+                                const k_bp = kt + b * 160;
+                                if (pl == 0) @memset(k_bp[0..128], 0);
+                                @as(*align(1) f16, @ptrCast(k_bp + 128 + pl * 2)).* = sc_k;
+                                inline for (0..32) |dp| {
+                                    k_bp[dp * 4 + byte_idx] = (k_bp[dp * 4 + byte_idx] & mask) | (q2_k[dp] << shift);
+                                }
+
+                                var q4_v: [32]u8 = undefined;
+                                var sc_v: f16 = undefined;
+                                quantBlock32_q4(vq[b * 32 ..][0..32], &q4_v, &sc_v);
+
+                                @as(*align(1) f16, @ptrCast(vt + 8 * hd + b * 32 + pl * 2)).* = sc_v;
+                                const v_dst = vt + pl * (hd / 2) + b * 16;
+                                const q_lo: @Vector(8, u8) = q4_v[0..8].*;
+                                const q_hi: @Vector(8, u8) = q4_v[8..16].*;
+                                const v0: [8]u8 = q_lo | (q_hi << @as(@Vector(8, u8), @splat(4)));
+                                const q_lo2: @Vector(8, u8) = q4_v[16..24].*;
+                                const q_hi2: @Vector(8, u8) = q4_v[24..32].*;
+                                const v1: [8]u8 = q_lo2 | (q_hi2 << @as(@Vector(8, u8), @splat(4)));
+                                @memcpy(v_dst[0..8], &v0);
+                                @memcpy(v_dst[8..16], &v1);
+                            }
+                        },
                         .q4_0 => {
-                            const kt = s.k_cache.ptr + base + tile * tb;
-                            const vt = s.v_cache.ptr + base + tile * tb;
+                            const kt = s.k_cache.ptr + base_k + tile * tb_k;
+                            const vt = s.v_cache.ptr + base_v + tile * tb_v;
                             const kq = k[kh * hd ..][0..hd];
                             const vq = v[kh * hd ..][0..hd];
                             var b: usize = 0;
@@ -2556,8 +2685,8 @@ pub const State = struct {
                             }
                         },
                         .q8_0 => {
-                            const kt = s.k_cache.ptr + base + tile * tb;
-                            const vt = s.v_cache.ptr + base + tile * tb;
+                            const kt = s.k_cache.ptr + base_k + tile * tb_k;
+                            const vt = s.v_cache.ptr + base_v + tile * tb_v;
                             const kq = k[kh * hd ..][0..hd];
                             const vq = v[kh * hd ..][0..hd];
                             var b: usize = 0;
@@ -2567,8 +2696,8 @@ pub const State = struct {
                             }
                         },
                         .f16 => {
-                            const kt: [*]f16 = @ptrCast(@alignCast(s.k_cache.ptr + base + tile * tb + pl * 2));
-                            const vr: [*]f16 = @ptrCast(@alignCast(s.v_cache.ptr + base + tile * tb + pl * hd * 2));
+                            const kt: [*]f16 = @ptrCast(@alignCast(s.k_cache.ptr + base_k + tile * tb_k + pl * 2));
+                            const vr: [*]f16 = @ptrCast(@alignCast(s.v_cache.ptr + base_v + tile * tb_v + pl * hd * 2));
                             for (0..hd) |d| {
                                 kt[d * kv_tile] = @floatCast(k[kh * hd + d]);
                                 vr[d] = @floatCast(v[kh * hd + d]);
@@ -3883,17 +4012,23 @@ test "FlashDecoding chunked attention matches unchunked reference across cache f
     const ntiles = (npos + kv_tile - 1) / kv_tile;
 
     // Test across all cache types
-    inline for (.{ CacheType.f16, CacheType.q8_0, CacheType.q4_0, CacheType.q2_0 }) |cache_type| {
-        const tile_bytes: usize = switch (cache_type) {
+    inline for (.{ CacheType.f16, CacheType.q8_0, CacheType.q4_0, CacheType.q2_0, CacheType.q2_k }) |cache_type| {
+        const k_tile_bytes: usize = switch (cache_type) {
             .f16 => hd * 32,
             .q8_0 => hd * 17,
             .q4_0 => hd * 9,
+            .q2_0, .q2_k => hd * 5,
+        };
+        const v_tile_bytes: usize = switch (cache_type) {
+            .f16 => hd * 32,
+            .q8_0 => hd * 17,
+            .q4_0, .q2_k => hd * 9,
             .q2_0 => hd * 5,
         };
         var kt_buf: [ntiles * (hd * 32)]u8 align(32) = undefined;
         var vr_buf: [ntiles * (hd * 32)]u8 align(32) = undefined;
-        const kt = kt_buf[0 .. ntiles * tile_bytes];
-        const vr = vr_buf[0 .. ntiles * tile_bytes];
+        const kt = kt_buf[0 .. ntiles * k_tile_bytes];
+        const vr = vr_buf[0 .. ntiles * v_tile_bytes];
         @memset(kt, 0);
         @memset(vr, 0);
 
@@ -3925,8 +4060,8 @@ test "FlashDecoding chunked attention matches unchunked reference across cache f
                     const tile = p / kv_tile;
                     const pl = p % kv_tile;
                     for (0..nblocks) |b| {
-                        quantBlock32(ksrc[p][b * 32 ..][0..32], kt.ptr + tile * tile_bytes + b * 544 + pl, kv_tile, @ptrCast(kt.ptr + tile * tile_bytes + b * 544 + 512 + pl * 2));
-                        quantBlock32(vsrc[p][b * 32 ..][0..32], vr.ptr + tile * tile_bytes + pl * hd + b * 32, 1, @ptrCast(vr.ptr + tile * tile_bytes + 16 * hd + b * 32 + pl * 2));
+                        quantBlock32(ksrc[p][b * 32 ..][0..32], kt.ptr + tile * k_tile_bytes + b * 544 + pl, kv_tile, @ptrCast(kt.ptr + tile * k_tile_bytes + b * 544 + 512 + pl * 2));
+                        quantBlock32(vsrc[p][b * 32 ..][0..32], vr.ptr + tile * v_tile_bytes + pl * hd + b * 32, 1, @ptrCast(vr.ptr + tile * v_tile_bytes + 16 * hd + b * 32 + pl * 2));
                     }
                 }
             },
@@ -3939,7 +4074,7 @@ test "FlashDecoding chunked attention matches unchunked reference across cache f
                         var sc_k: f16 = undefined;
                         quantBlock32_q4(ksrc[p][b * 32 ..][0..32], &q4_k, &sc_k);
 
-                        const k_bp = kt.ptr + tile * tile_bytes + b * 288;
+                        const k_bp = kt.ptr + tile * k_tile_bytes + b * 288;
                         if (pl == 0) @memset(k_bp[0..256], 0);
                         @as(*align(1) f16, @ptrCast(k_bp + 256 + pl * 2)).* = sc_k;
                         if (pl < 8) {
@@ -3956,7 +4091,7 @@ test "FlashDecoding chunked attention matches unchunked reference across cache f
                         var sc_v: f16 = undefined;
                         quantBlock32_q4(vsrc[p][b * 32 ..][0..32], &q4_v, &sc_v);
 
-                        const vt = vr.ptr + tile * tile_bytes;
+                        const vt = vr.ptr + tile * v_tile_bytes;
                         @as(*align(1) f16, @ptrCast(vt + 8 * hd + b * 32 + pl * 2)).* = sc_v;
                         const v_dst = vt + pl * (hd / 2) + b * 16;
                         const q_lo: @Vector(8, u8) = q4_v[0..8].*;
@@ -3983,7 +4118,7 @@ test "FlashDecoding chunked attention matches unchunked reference across cache f
                         var sc_k: f16 = undefined;
                         quantBlock32_q2(ksrc[p][b * 32 ..][0..32], &q2_k, &sc_k);
 
-                        const k_bp = kt.ptr + tile * tile_bytes + b * 160;
+                        const k_bp = kt.ptr + tile * k_tile_bytes + b * 160;
                         if (pl == 0) @memset(k_bp[0..128], 0);
                         @as(*align(1) f16, @ptrCast(k_bp + 128 + pl * 2)).* = sc_k;
                         inline for (0..32) |dp| {
@@ -3994,7 +4129,7 @@ test "FlashDecoding chunked attention matches unchunked reference across cache f
                         var sc_v: f16 = undefined;
                         quantBlock32_q2(vsrc[p][b * 32 ..][0..32], &q2_v, &sc_v);
 
-                        const vt = vr.ptr + tile * tile_bytes;
+                        const vt = vr.ptr + tile * v_tile_bytes;
                         @as(*align(1) f16, @ptrCast(vt + 4 * hd + b * 32 + pl * 2)).* = sc_v;
                         const v_dst = vt + pl * (hd / 4) + b * 8;
                         const d0: @Vector(8, u8) = q2_v[0..8].*;
@@ -4003,6 +4138,44 @@ test "FlashDecoding chunked attention matches unchunked reference across cache f
                         const d3: @Vector(8, u8) = q2_v[24..32].*;
                         const v_packed: [8]u8 = d0 | (d1 << @as(@Vector(8, u8), @splat(2))) | (d2 << @as(@Vector(8, u8), @splat(4))) | (d3 << @as(@Vector(8, u8), @splat(6)));
                         @memcpy(v_dst[0..8], &v_packed);
+                    }
+                }
+            },
+            .q2_k => {
+                for (0..npos) |p| {
+                    const tile = p / kv_tile;
+                    const pl = p % kv_tile;
+                    const byte_idx = pl % 4;
+                    const shift: u3 = @intCast((pl / 4) * 2);
+                    const mask = ~(@as(u8, 0x03) << shift);
+
+                    for (0..nblocks) |b| {
+                        var q2_k: [32]u8 = undefined;
+                        var sc_k: f16 = undefined;
+                        quantBlock32_q2(ksrc[p][b * 32 ..][0..32], &q2_k, &sc_k);
+
+                        const k_bp = kt.ptr + tile * k_tile_bytes + b * 160;
+                        if (pl == 0) @memset(k_bp[0..128], 0);
+                        @as(*align(1) f16, @ptrCast(k_bp + 128 + pl * 2)).* = sc_k;
+                        inline for (0..32) |dp| {
+                            k_bp[dp * 4 + byte_idx] = (k_bp[dp * 4 + byte_idx] & mask) | (q2_k[dp] << shift);
+                        }
+
+                        var q4_v: [32]u8 = undefined;
+                        var sc_v: f16 = undefined;
+                        quantBlock32_q4(vsrc[p][b * 32 ..][0..32], &q4_v, &sc_v);
+
+                        const vt = vr.ptr + tile * v_tile_bytes;
+                        @as(*align(1) f16, @ptrCast(vt + 8 * hd + b * 32 + pl * 2)).* = sc_v;
+                        const v_dst = vt + pl * (hd / 2) + b * 16;
+                        const q_lo: @Vector(8, u8) = q4_v[0..8].*;
+                        const q_hi: @Vector(8, u8) = q4_v[8..16].*;
+                        const v0: [8]u8 = q_lo | (q_hi << @as(@Vector(8, u8), @splat(4)));
+                        const q_lo2: @Vector(8, u8) = q4_v[16..24].*;
+                        const q_hi2: @Vector(8, u8) = q4_v[24..32].*;
+                        const v1: [8]u8 = q_lo2 | (q_hi2 << @as(@Vector(8, u8), @splat(4)));
+                        @memcpy(v_dst[0..8], &v0);
+                        @memcpy(v_dst[8..16], &v1);
                     }
                 }
             },
@@ -4118,4 +4291,47 @@ test "MoE top-K routing and expert execution matches mathematical reference" {
     try std.testing.expect(w0 + w1 >= 0.9999 and w0 + w1 <= 1.0001);
     try std.testing.expect(w0 >= w1);
     try std.testing.expect(top_idx[0] != top_idx[1]);
+}
+
+test "PMM adaptive scale and asymmetric shift estimator on symmetric vs skewed data" {
+    // 1. Symmetric zero-centered data
+    var sym_xs: [32]f32 = undefined;
+    for (0..16) |i| {
+        const val: f32 = @as(f32, @floatFromInt(i + 1)) * 0.1;
+        sym_xs[i] = val;
+        sym_xs[i + 16] = -val;
+    }
+    const sym_amax: f32 = 1.6;
+    const s_q4 = pmmScaleBlock32_q4(&sym_xs, sym_amax);
+    const s_q2 = pmmScaleBlock32_q2(&sym_xs, sym_amax);
+    try std.testing.expect(s_q4 > 1.45 and s_q4 <= sym_amax);
+    try std.testing.expect(s_q2 > 1.25 and s_q2 <= sym_amax);
+
+    // 2. Skewed data with strong positive outlier and shifted mean
+    var skewed_xs: [32]f32 = undefined;
+    for (0..31) |i| {
+        skewed_xs[i] = @as(f32, @floatFromInt(i % 5)) * 0.2 - 0.2; // mostly in [-0.2, 0.6]
+    }
+    skewed_xs[31] = 6.0; // severe outlier causing high positive skewness
+    const skew_amax: f32 = 6.0;
+
+    const skew_s_q4 = pmmScaleBlock32_q4(&skewed_xs, skew_amax);
+    const skew_s_q2 = pmmScaleBlock32_q2(&skewed_xs, skew_amax);
+
+    // Asymmetric penalty should tighten the clipping factor relative to symmetric factor
+    const ratio_q4 = skew_s_q4 / skew_amax;
+    const ratio_q2 = skew_s_q2 / skew_amax;
+    try std.testing.expect(ratio_q4 < 0.95);
+    try std.testing.expect(ratio_q2 < 0.85);
+
+    // Test quantBlock32_q2 and quantBlock32_q4 roundtrips
+    var q2: [32]u8 = undefined;
+    var sc_q2: f16 = undefined;
+    quantBlock32_q2(&skewed_xs, &q2, &sc_q2);
+    try std.testing.expect(sc_q2 > 0);
+
+    var q4: [32]u8 = undefined;
+    var sc_q4: f16 = undefined;
+    quantBlock32_q4(&skewed_xs, &q4, &sc_q4);
+    try std.testing.expect(sc_q4 > 0);
 }

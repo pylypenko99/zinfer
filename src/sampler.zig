@@ -120,85 +120,169 @@ pub const Sampler = struct {
     }
 };
 
-/// Speculative Prompt Lookup Decoding (n-gram candidate draft).
-/// Searches the context history for matching n-grams and proposes following tokens.
-pub const PromptLookup = struct {
-    pub fn find(history: []const u32, max_k: usize, out: []u32) usize {
-        if (history.len < 4 or max_k == 0) return 0;
-        const k = @min(max_k, out.len);
+/// Speculative Prompt Lookup Decoding (Tree of Hypotheses & n-gram candidate draft).
+/// Searches the context history for matching n-grams, builds candidate hypothesis branches,
+/// and ranks candidates based on n-gram order, occurrence frequency, and recency.
+pub const max_tree_branches: usize = 4;
+pub const max_branch_len: usize = 8;
 
-        // 1. Try 4-gram match first (highest confidence)
+pub const CandidateBranch = struct {
+    tokens: [max_branch_len]u32,
+    len: usize,
+    score: u32,
+    freq: u16,
+};
+
+pub const CandidateTree = struct {
+    branches: [max_tree_branches]CandidateBranch,
+    count: usize,
+
+    pub fn init() CandidateTree {
+        return .{
+            .branches = undefined,
+            .count = 0,
+        };
+    }
+
+    pub fn best(self: *const CandidateTree) ?*const CandidateBranch {
+        if (self.count == 0) return null;
+        var best_idx: usize = 0;
+        var best_score: u32 = self.branches[0].score;
+        for (self.branches[1..self.count], 1..) |*b, i| {
+            if (b.score > best_score) {
+                best_score = b.score;
+                best_idx = i;
+            }
+        }
+        return &self.branches[best_idx];
+    }
+
+    pub fn findAlternative(self: *const CandidateTree, first_tok: u32) ?*const CandidateBranch {
+        for (self.branches[0..self.count]) |*b| {
+            if (b.len > 1 and b.tokens[0] == first_tok) return b;
+        }
+        return null;
+    }
+};
+
+pub const PromptLookup = struct {
+    fn addOrUpdateBranch(tree: *CandidateTree, tokens: []const u32, base_score: u32, recency: u32) void {
+        if (tokens.len == 0) return;
+        const len = @min(tokens.len, max_branch_len);
+        for (tree.branches[0..tree.count]) |*b| {
+            const common = @min(b.len, len);
+            if (std.mem.eql(u32, b.tokens[0..common], tokens[0..common])) {
+                b.freq += 1;
+                b.score += 25;
+                if (len > b.len) {
+                    @memcpy(b.tokens[b.len..len], tokens[b.len..len]);
+                    b.len = len;
+                }
+                return;
+            }
+        }
+        if (tree.count < max_tree_branches) {
+            var b = &tree.branches[tree.count];
+            @memcpy(b.tokens[0..len], tokens[0..len]);
+            b.len = len;
+            b.freq = 1;
+            b.score = base_score + recency;
+            tree.count += 1;
+        }
+    }
+
+    pub fn buildTree(history: []const u32, max_k: usize, tree: *CandidateTree) void {
+        tree.count = 0;
+        if (history.len < 2 or max_k == 0) return;
+
+        // 1. Try 4-gram match across all historical occurrences
         if (history.len >= 8) {
             const target = history[history.len - 4 ..][0..4];
             const search_len = history.len - 4;
             var idx: usize = search_len - 4 + 1;
-            while (idx > 0) {
+            var matches: usize = 0;
+            while (idx > 0 and matches < 8) {
                 idx -= 1;
                 if (std.mem.eql(u32, history[idx .. idx + 4], target)) {
+                    matches += 1;
                     const start = idx + 4;
-                    const avail = @min(k, search_len - start);
+                    const avail = @min(max_k, search_len - start);
                     if (avail > 0) {
-                        @memcpy(out[0..avail], history[start .. start + avail]);
-                        return avail;
+                        const recency: u32 = @intCast(@min(20, (idx * 20) / (search_len + 1)));
+                        addOrUpdateBranch(tree, history[start .. start + avail], 100, recency);
                     }
                 }
             }
         }
 
-        // 2. Try 3-gram match
-        if (history.len >= 6) {
+        // 2. Try 3-gram match if fewer than 2 distinct candidate branches found
+        if (tree.count < 2 and history.len >= 6) {
             const target = history[history.len - 3 ..][0..3];
             const search_len = history.len - 3;
             var idx: usize = search_len - 3 + 1;
-            while (idx > 0) {
+            var matches: usize = 0;
+            while (idx > 0 and matches < 8) {
                 idx -= 1;
                 if (std.mem.eql(u32, history[idx .. idx + 3], target)) {
+                    matches += 1;
                     const start = idx + 3;
-                    const avail = @min(k, search_len - start);
+                    const avail = @min(max_k, search_len - start);
                     if (avail > 0) {
-                        @memcpy(out[0..avail], history[start .. start + avail]);
-                        return avail;
+                        const recency: u32 = @intCast(@min(20, (idx * 20) / (search_len + 1)));
+                        addOrUpdateBranch(tree, history[start .. start + avail], 60, recency);
                     }
                 }
             }
         }
 
-        // 3. Try 2-gram match (draft at most 2 tokens to avoid false divergence)
-        if (history.len >= 4) {
+        // 3. Try 2-gram match (draft at most 2 tokens)
+        if (tree.count < 2 and history.len >= 4) {
             const target = history[history.len - 2 ..][0..2];
             const search_len = history.len - 2;
             var idx: usize = search_len - 2 + 1;
-            while (idx > 0) {
+            var matches: usize = 0;
+            while (idx > 0 and matches < 8) {
                 idx -= 1;
                 if (std.mem.eql(u32, history[idx .. idx + 2], target)) {
+                    matches += 1;
                     const start = idx + 2;
-                    const avail = @min(@min(k, 2), search_len - start);
+                    const avail = @min(@min(max_k, 2), search_len - start);
                     if (avail > 0) {
-                        @memcpy(out[0..avail], history[start .. start + avail]);
-                        return avail;
+                        const recency: u32 = @intCast(@min(20, (idx * 20) / (search_len + 1)));
+                        addOrUpdateBranch(tree, history[start .. start + avail], 30, recency);
                     }
                 }
             }
         }
 
-        // 4. Try 1-gram Markov follower match (most recent transition from history[len - 1])
-        if (history.len >= 2 and k >= 1) {
+        // 4. Try 1-gram Markov follower match if no branches yet
+        if (tree.count == 0 and history.len >= 2) {
             const last_tok = history[history.len - 1];
             const search_len = history.len - 1;
             var idx: usize = search_len;
-            while (idx > 0) {
+            var matches: usize = 0;
+            while (idx > 0 and matches < 8) {
                 idx -= 1;
                 if (history[idx] == last_tok and idx + 1 < search_len) {
-                    out[0] = history[idx + 1];
-                    if (k >= 2 and idx + 2 < search_len) {
-                        out[1] = history[idx + 2];
-                        return 2;
+                    matches += 1;
+                    const avail = @min(@min(max_k, 2), search_len - (idx + 1));
+                    if (avail > 0) {
+                        const recency: u32 = @intCast(@min(20, (idx * 20) / (search_len + 1)));
+                        addOrUpdateBranch(tree, history[idx + 1 .. idx + 1 + avail], 10, recency);
                     }
-                    return 1;
                 }
             }
         }
+    }
 
+    pub fn find(history: []const u32, max_k: usize, out: []u32) usize {
+        var tree = CandidateTree.init();
+        buildTree(history, max_k, &tree);
+        if (tree.best()) |b| {
+            const avail = @min(b.len, out.len);
+            @memcpy(out[0..avail], b.tokens[0..avail]);
+            return avail;
+        }
         return 0;
     }
 };
@@ -219,6 +303,32 @@ test "PromptLookup finds continuation of matching 3-gram and 2-gram" {
     const n4 = PromptLookup.find(&hist4, 3, &draft);
     try std.testing.expectEqual(3, n4);
     try std.testing.expectEqualSlices(u32, &.{ 50, 60, 70 }, draft[0..3]);
+}
+
+test "PromptLookup buildTree finds multiple candidate branches and ranks frequency" {
+    // Pattern [1, 2]:
+    // branch [8, 9] occurs once
+    // branch [3, 4] occurs twice
+    const hist = [_]u32{
+        1, 2, 8, 9,
+        100, 200,
+        1, 2, 3, 4,
+        300, 400,
+        1, 2, 3, 4,
+        500,
+        1, 2,
+    };
+    var tree = CandidateTree.init();
+    PromptLookup.buildTree(&hist, 4, &tree);
+    try std.testing.expect(tree.count >= 2);
+    const best = tree.best().?;
+    // [3, 4] occurs twice -> higher score than [8, 9]
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4 }, best.tokens[0..best.len]);
+
+    // Alternative branch starting with 8 is found
+    const alt = tree.findAlternative(8);
+    try std.testing.expect(alt != null);
+    try std.testing.expectEqualSlices(u32, &.{ 8, 9 }, alt.?.tokens[0..alt.?.len]);
 }
 
 const V8f = @Vector(8, f32);

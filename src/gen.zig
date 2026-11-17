@@ -173,10 +173,16 @@ pub const Gen = struct {
             try writer.interface.writeAll(slice);
         }
 
-        const tb: usize = switch (st.cache_type) {
+        const tb_k: usize = switch (st.cache_type) {
             .f16 => c.head_dim * 32,
             .q8_0 => c.head_dim * 17,
             .q4_0 => c.head_dim * 9,
+            .q2_0, .q2_k => c.head_dim * 5,
+        };
+        const tb_v: usize = switch (st.cache_type) {
+            .f16 => c.head_dim * 32,
+            .q8_0 => c.head_dim * 17,
+            .q4_0, .q2_k => c.head_dim * 9,
             .q2_0 => c.head_dim * 5,
         };
         for (st.model.layers) |*L| {
@@ -185,11 +191,13 @@ pub const Gen = struct {
                     const is_swa = A.swa and c.swa_window > 0;
                     const max_tiles = st.slot_tiles[A.kv_slot];
                     const tiles = if (st.pos == 0) 0 else if (is_swa) @min(max_tiles, (st.pos + model_mod.kv_tile - 1) / model_mod.kv_tile) else (st.pos + model_mod.kv_tile - 1) / model_mod.kv_tile;
-                    const bytes_per_head = tiles * tb;
+                    const k_bytes_per_head = tiles * tb_k;
+                    const v_bytes_per_head = tiles * tb_v;
                     for (0..A.n_kv_heads) |kh| {
-                        const base = st.cacheIndex(A.kv_slot, kh);
-                        const k_slice = st.k_cache[base .. base + bytes_per_head];
-                        const v_slice = st.v_cache[base .. base + bytes_per_head];
+                        const base_k = st.cacheIndex(A.kv_slot, kh);
+                        const base_v = st.vCacheIndex(A.kv_slot, kh);
+                        const k_slice = st.k_cache[base_k .. base_k + k_bytes_per_head];
+                        const v_slice = st.v_cache[base_v .. base_v + v_bytes_per_head];
                         hasher.update(k_slice);
                         try writer.interface.writeAll(k_slice);
                         hasher.update(v_slice);
@@ -248,10 +256,16 @@ pub const Gen = struct {
             hasher.update(slice);
         }
 
-        const tb: usize = switch (st.cache_type) {
+        const tb_k: usize = switch (st.cache_type) {
             .f16 => c.head_dim * 32,
             .q8_0 => c.head_dim * 17,
             .q4_0 => c.head_dim * 9,
+            .q2_0, .q2_k => c.head_dim * 5,
+        };
+        const tb_v: usize = switch (st.cache_type) {
+            .f16 => c.head_dim * 32,
+            .q8_0 => c.head_dim * 17,
+            .q4_0, .q2_k => c.head_dim * 9,
             .q2_0 => c.head_dim * 5,
         };
         const pos: usize = @intCast(hdr.pos);
@@ -261,11 +275,13 @@ pub const Gen = struct {
                     const is_swa = A.swa and c.swa_window > 0;
                     const max_tiles = st.slot_tiles[A.kv_slot];
                     const tiles = if (pos == 0) 0 else if (is_swa) @min(max_tiles, (pos + model_mod.kv_tile - 1) / model_mod.kv_tile) else (pos + model_mod.kv_tile - 1) / model_mod.kv_tile;
-                    const bytes_per_head = tiles * tb;
+                    const k_bytes_per_head = tiles * tb_k;
+                    const v_bytes_per_head = tiles * tb_v;
                     for (0..A.n_kv_heads) |kh| {
-                        const base = st.cacheIndex(A.kv_slot, kh);
-                        const k_slice = st.k_cache[base .. base + bytes_per_head];
-                        const v_slice = st.v_cache[base .. base + bytes_per_head];
+                        const base_k = st.cacheIndex(A.kv_slot, kh);
+                        const base_v = st.vCacheIndex(A.kv_slot, kh);
+                        const k_slice = st.k_cache[base_k .. base_k + k_bytes_per_head];
+                        const v_slice = st.v_cache[base_v .. base_v + v_bytes_per_head];
                         try reader.interface.readSliceAll(k_slice);
                         hasher.update(k_slice);
                         try reader.interface.readSliceAll(v_slice);
@@ -430,6 +446,9 @@ pub const Gen = struct {
         var draft_buf: [max_spec_draft]u32 = undefined;
         var cand_buf: [model_mod.max_spec]u32 = undefined;
         var adaptive: AdaptiveDraft = .init(g.draft_k);
+        var cand_tree: sampler_mod.CandidateTree = .init();
+        var tree_pending_len: usize = 0;
+        var tree_pending_buf: [sampler_mod.max_branch_len]u32 = undefined;
 
         while (n_run < n and g.st.pos < g.st.ctx) {
             const current_max_k = if (g.draft_adaptive) adaptive.nextDraft() else g.draft_k;
@@ -454,8 +473,20 @@ pub const Gen = struct {
                     }
                     break :blk produced;
                 }
-                if (g.st.pos + max_draft + 2 <= g.st.ctx)
-                    break :blk sampler_mod.PromptLookup.find(history.items, max_draft, &draft_buf);
+                if (g.st.pos + max_draft + 2 <= g.st.ctx) {
+                    if (tree_pending_len > 0) {
+                        const avail = @min(tree_pending_len, max_draft);
+                        @memcpy(draft_buf[0..avail], tree_pending_buf[0..avail]);
+                        tree_pending_len = 0;
+                        break :blk avail;
+                    }
+                    sampler_mod.PromptLookup.buildTree(history.items, max_draft, &cand_tree);
+                    if (cand_tree.best()) |b| {
+                        const avail = @min(b.len, max_draft);
+                        @memcpy(draft_buf[0..avail], b.tokens[0..avail]);
+                        break :blk avail;
+                    }
+                }
                 break :blk 0;
             };
 
@@ -498,6 +529,15 @@ pub const Gen = struct {
                         g.stats.n_accepted += 1;
                     } else {
                         next_cur = pred;
+                        // Tree speculation: if target model diverged to an alternative hypothesis,
+                        // seed the next round's draft from that hypothesis branch.
+                        if (cand_tree.findAlternative(pred)) |alt| {
+                            if (alt.len > 1) {
+                                const tail_len = @min(alt.len - 1, max_spec_draft);
+                                @memcpy(tree_pending_buf[0..tail_len], alt.tokens[1 .. 1 + tail_len]);
+                                tree_pending_len = tail_len;
+                            }
+                        }
                         break;
                     }
                 }
@@ -662,6 +702,8 @@ test "saveCache and loadCache roundtrip" {
     st.slot_tiles = &slot_tiles;
     st.slot_strides = &slot_strides;
     st.slot_offsets = &slot_offsets;
+    st.v_slot_strides = &slot_strides;
+    st.v_slot_offsets = &slot_offsets;
 
     const cache_bytes = 16 * 32 * 32;
     var k_cache: [cache_bytes]u8 align(32) = undefined;
@@ -708,6 +750,8 @@ test "saveCache and loadCache roundtrip" {
     st2.slot_tiles = &slot_tiles;
     st2.slot_strides = &slot_strides;
     st2.slot_offsets = &slot_offsets;
+    st2.v_slot_strides = &slot_strides;
+    st2.v_slot_offsets = &slot_offsets;
 
     var k_cache2: [cache_bytes]u8 align(32) = undefined;
     var v_cache2: [cache_bytes]u8 align(32) = undefined;

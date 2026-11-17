@@ -45,8 +45,8 @@ const usage =
     \\  --port N              server port (default 8080; implies --server)
     \\  --no-prune            keep full lm_head matmul (for A/B comparison)
     \\  --no-repack           keep GGUF row layout (per-row kernels; for A/B comparison)
-    \\  --cache f16|q8_0|q4_0|q2_0 K/V cache format; q4_0 reduces cache RAM by 3.6x,
-    \\                        q2_0 reduces it by 6.4x (f16)
+    \\  --cache f16|q8_0|q4_0|q2_0|q2_k K/V cache format; q4_0 (3.6x),
+    \\                        q2_k (4.6x hybrid 2b K / 4b V), q2_0 (6.4x)
     \\  --bench PP,TG         benchmark prompt processing of PP tokens and generation of TG tokens
     \\  -v, --verbose         print model info
     \\
@@ -183,9 +183,11 @@ fn parseArgs(argv: []const [:0]const u8) Args {
                 a.cache_type = .q4_0;
             } else if (std.mem.eql(u8, v, "q2_0") or std.mem.eql(u8, v, "q2")) {
                 a.cache_type = .q2_0;
+            } else if (std.mem.eql(u8, v, "q2_k") or std.mem.eql(u8, v, "q2k")) {
+                a.cache_type = .q2_k;
             } else if (std.mem.eql(u8, v, "f16")) {
                 a.cache_type = .f16;
-            } else fail("--cache expects f16, q8_0, q4_0, or q2_0, got '{s}'", .{v});
+            } else fail("--cache expects f16, q8_0, q4_0, q2_0, or q2_k, got '{s}'", .{v});
         } else if (r.is(&.{"--bench"})) {
             var it = std.mem.splitScalar(u8, r.str(), ',');
             const pp = std.fmt.parseInt(usize, it.next().?, 10) catch fail("--bench expects PP,TG", .{});
@@ -291,6 +293,7 @@ pub fn main(init: std.process.Init) !void {
             .q8_0 => "q8_0",
             .q4_0 => "q4_0",
             .q2_0 => "q2_0",
+            .q2_k => "q2_k",
         };
         std.debug.print("arch={s} layers={d} dim={d} heads={d}/{d} head_dim={d} ffn={d} vocab={d} ctx={d} (KV {d:.1} MB {s}) threads={d}", .{
             @tagName(c.arch), c.n_layers, c.dim, c.n_heads, c.n_kv_heads, c.head_dim, c.ffn_dim, c.vocab, ctx, kv_mb,
