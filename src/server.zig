@@ -109,10 +109,16 @@ fn handleConnection(
     var writer = stream.writer(io, &out_buf);
 
     // Extract HTTP method and path
-    const space1 = std.mem.indexOfScalar(u8, req, ' ') orelse return;
+    const space1 = std.mem.indexOfScalar(u8, req, ' ') orelse {
+        try sendHttpError(&writer.interface, 400, "malformed request line");
+        return;
+    };
     const method = req[0..space1];
     const rest = req[space1 + 1 ..];
-    const space2 = std.mem.indexOfScalar(u8, rest, ' ') orelse return;
+    const space2 = std.mem.indexOfScalar(u8, rest, ' ') orelse {
+        try sendHttpError(&writer.interface, 400, "malformed request line");
+        return;
+    };
     const path = rest[0..space2];
 
     // Handle OPTIONS (CORS preflight)
