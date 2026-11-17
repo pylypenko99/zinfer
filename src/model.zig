@@ -19,6 +19,8 @@ const Allocator = std.mem.Allocator;
 
 pub const Arch = enum { llama, qwen2, qwen3, lfm2, lfm3, gemma3, gemma4, qwen2moe, mixtral, deepseek2 };
 pub const CacheType = enum(u32) { f16 = 0, q8_0 = 1, q4_0 = 2 };
+pub const max_layers = 256;
+pub const max_active_experts = 256;
 
 pub const Config = struct {
     arch: Arch,
@@ -567,8 +569,9 @@ pub const Model = struct {
             self.per_layer_proj_norm = try self.vector(gpa, "per_layer_proj_norm.weight", c.n_embd_per_layer);
         }
         self.layers = try gpa.alloc(Layer, c.n_layers);
-        var nb: [96]u8 = undefined;
-        var kv_source: [64]usize = undefined;
+        if (c.n_layers > max_layers) return error.InvalidConfig;
+        var nb: [256]u8 = undefined;
+        var kv_source: [max_layers]usize = undefined;
         for (0..c.n_layers) |i| kv_source[i] = i;
         if (c.shared_kv_layers > 0 and c.n_layers > c.shared_kv_layers) {
             const first_shared = c.n_layers - c.shared_kv_layers;
@@ -586,7 +589,7 @@ pub const Model = struct {
                 kv_source[i] = src;
             }
         }
-        var layer_kv_slots: [64]usize = undefined;
+        var layer_kv_slots: [max_layers]usize = undefined;
         for (self.layers, 0..) |*L, i| {
             const n = struct {
                 fn f(buf: []u8, l: usize, comptime s: []const u8) []const u8 {
@@ -2707,9 +2710,10 @@ pub const State = struct {
         // Clear moe_out buffer for the batch
         @memset(s.moe_out[0 .. nt * dim], 0);
 
-        // Top-K routing buffers (supports up to 64 active experts per token)
-        var top_idx: [64]usize = undefined;
-        var top_val: [64]f32 = undefined;
+        // Top-K routing buffers (supports up to max_active_experts active experts per token)
+        if (k_exp > max_active_experts) return;
+        var top_idx: [max_active_experts]usize = undefined;
+        var top_val: [max_active_experts]f32 = undefined;
 
         for (0..nt) |t| {
             const logits = s.router_logits[t * n_exp ..][0..n_exp];

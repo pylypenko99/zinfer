@@ -458,18 +458,24 @@ pub fn main(init: std.process.Init) !void {
             pending = gen.run(tokens.items, args.n_predict, out) catch |e| blk: {
                 if (e != error.ContextFull) return e;
                 std.debug.print("\n[context full: pos {d}/{d}. Attempting context shift...]\n", .{ st.pos, st.ctx });
-                if (gen.cached.items.len > 256) {
-                    const keep_head = @min(gen.cached.items.len / 4, 128);
-                    const drop_count = (gen.cached.items.len - keep_head) / 2;
-                    const tail_start = keep_head + drop_count;
+                if (gen.cached.items.len > 64) {
+                    // StreamingLLM: preserve initial 4 attention sink tokens to anchor softmax,
+                    // plus a contiguous tail of recent conversation tokens.
+                    const sink_count: usize = @min(4, gen.cached.items.len);
+                    const needed = tokens.items.len + sink_count;
+                    const max_tail = if (st.ctx * 3 / 4 > needed) (st.ctx * 3 / 4) - needed else st.ctx / 2;
+                    const avail = gen.cached.items.len - sink_count;
+                    const tail_len = @min(avail, max_tail);
+                    const tail_start = gen.cached.items.len - tail_len;
+
                     var shifted: std.ArrayList(u32) = .empty;
                     defer shifted.deinit(gpa);
-                    try shifted.appendSlice(gpa, gen.cached.items[0..keep_head]);
+                    try shifted.appendSlice(gpa, gen.cached.items[0..sink_count]);
                     try shifted.appendSlice(gpa, gen.cached.items[tail_start..]);
                     try shifted.appendSlice(gpa, tokens.items);
                     gen.reset();
                     break :blk gen.run(shifted.items, args.n_predict, out) catch |e2| {
-                        std.debug.print("\n[context shift failed: {s}. Use /reset or /clear to restart]\n", .{@errorName(e2)});
+                        std.debug.print("\n[StreamingLLM context shift failed: {s}. Use /reset or /clear to restart]\n", .{@errorName(e2)});
                         continue;
                     };
                 } else {

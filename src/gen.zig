@@ -158,13 +158,19 @@ pub const Gen = struct {
             .n_tokens = @intCast(g.cached.items.len),
             .conv_len = @intCast(st.conv_state.len),
         };
+        var hasher = std.hash.XxHash64.init(0);
+        hasher.update(std.mem.asBytes(&hdr));
         try writer.interface.writeAll(std.mem.asBytes(&hdr));
 
         if (g.cached.items.len > 0) {
-            try writer.interface.writeAll(std.mem.sliceAsBytes(g.cached.items));
+            const slice = std.mem.sliceAsBytes(g.cached.items);
+            hasher.update(slice);
+            try writer.interface.writeAll(slice);
         }
         if (st.conv_state.len > 0) {
-            try writer.interface.writeAll(std.mem.sliceAsBytes(st.conv_state));
+            const slice = std.mem.sliceAsBytes(st.conv_state);
+            hasher.update(slice);
+            try writer.interface.writeAll(slice);
         }
 
         const tb: usize = switch (st.cache_type) {
@@ -181,13 +187,19 @@ pub const Gen = struct {
                     const bytes_per_head = tiles * tb;
                     for (0..A.n_kv_heads) |kh| {
                         const base = st.cacheIndex(A.kv_slot, kh);
-                        try writer.interface.writeAll(st.k_cache[base .. base + bytes_per_head]);
-                        try writer.interface.writeAll(st.v_cache[base .. base + bytes_per_head]);
+                        const k_slice = st.k_cache[base .. base + bytes_per_head];
+                        const v_slice = st.v_cache[base .. base + bytes_per_head];
+                        hasher.update(k_slice);
+                        try writer.interface.writeAll(k_slice);
+                        hasher.update(v_slice);
+                        try writer.interface.writeAll(v_slice);
                     }
                 },
                 .shortconv => {},
             }
         }
+        const checksum = hasher.final();
+        try writer.interface.writeAll(std.mem.asBytes(&checksum));
         try writer.interface.flush();
     }
 
@@ -201,6 +213,9 @@ pub const Gen = struct {
         try reader.interface.readSliceAll(std.mem.asBytes(&hdr));
 
         if (!std.mem.eql(u8, &hdr.magic, "ZINFCACH") or hdr.version != 1) return error.InvalidCache;
+
+        var hasher = std.hash.XxHash64.init(0);
+        hasher.update(std.mem.asBytes(&hdr));
 
         const st = g.st;
         const c = &st.model.cfg;
@@ -221,11 +236,15 @@ pub const Gen = struct {
         g.reset();
         try g.cached.resize(g.gpa, @intCast(hdr.n_tokens));
         if (hdr.n_tokens > 0) {
-            try reader.interface.readSliceAll(std.mem.sliceAsBytes(g.cached.items));
+            const slice = std.mem.sliceAsBytes(g.cached.items);
+            try reader.interface.readSliceAll(slice);
+            hasher.update(slice);
         }
         if (hdr.conv_len > 0) {
             if (hdr.conv_len != st.conv_state.len) return error.IncompatibleCache;
-            try reader.interface.readSliceAll(std.mem.sliceAsBytes(st.conv_state));
+            const slice = std.mem.sliceAsBytes(st.conv_state);
+            try reader.interface.readSliceAll(slice);
+            hasher.update(slice);
         }
 
         const tb: usize = switch (st.cache_type) {
@@ -243,13 +262,28 @@ pub const Gen = struct {
                     const bytes_per_head = tiles * tb;
                     for (0..A.n_kv_heads) |kh| {
                         const base = st.cacheIndex(A.kv_slot, kh);
-                        try reader.interface.readSliceAll(st.k_cache[base .. base + bytes_per_head]);
-                        try reader.interface.readSliceAll(st.v_cache[base .. base + bytes_per_head]);
+                        const k_slice = st.k_cache[base .. base + bytes_per_head];
+                        const v_slice = st.v_cache[base .. base + bytes_per_head];
+                        try reader.interface.readSliceAll(k_slice);
+                        hasher.update(k_slice);
+                        try reader.interface.readSliceAll(v_slice);
+                        hasher.update(v_slice);
                     }
                 },
                 .shortconv => {},
             }
         }
+
+        var stored_checksum: u64 = undefined;
+        reader.interface.readSliceAll(std.mem.asBytes(&stored_checksum)) catch |e| switch (e) {
+            error.EndOfStream => {
+                st.pos = pos;
+                if (g.draft_st) |d| d.reset();
+                return;
+            },
+            else => return e,
+        };
+        if (stored_checksum != hasher.final()) return error.InvalidCacheChecksum;
         st.pos = pos;
         if (g.draft_st) |d| d.reset();
     }
