@@ -546,7 +546,7 @@ pub const Model = struct {
 
     fn optScalar(self: *Model, name: []const u8) ?f32 {
         const ti = self.file.tensors.get(name) orelse return null;
-        if (ti.typ != .f32 or ti.nelems() != 1 or ti.data.len < 4) return null;
+        if (ti.typ != .f32 or ti.nelems() != @as(?u64, 1) or ti.data.len < 4) return null;
         return @bitCast(std.mem.readInt(u32, ti.data[0..4], .little));
     }
 

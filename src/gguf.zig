@@ -122,9 +122,10 @@ pub const TensorInfo = struct {
     offset: u64,
     data: []const u8 = &.{},
 
-    pub fn nelems(t: TensorInfo) u64 {
+    /// Element count; null if the product overflows u64 (malformed file).
+    pub fn nelems(t: TensorInfo) ?u64 {
         var n: u64 = 1;
-        for (t.dims[0..t.n_dims]) |d| n *= d;
+        for (t.dims[0..t.n_dims]) |d| n = std.math.mul(u64, n, d) catch return null;
         return n;
     }
 };
@@ -179,7 +180,7 @@ pub const File = struct {
         }
 
         fn string(c: *Cursor) ![]const u8 {
-            return c.bytes(@intCast(try c.int(u64)));
+            return c.bytes(std.math.cast(usize, try c.int(u64)) orelse return error.InvalidGguf);
         }
 
         fn value(c: *Cursor, t: ValueType) !Value {
@@ -198,10 +199,10 @@ pub const File = struct {
                 .string => .{ .string = try c.string() },
                 .array => blk: {
                     const et: ValueType = @fromBackingInt(@intCast(try c.int(u32)));
-                    const n: usize = @intCast(try c.int(u64));
+                    const n: usize = std.math.cast(usize, try c.int(u64)) orelse return error.InvalidGguf;
                     const start = c.pos;
                     if (et.fixedSize()) |sz| {
-                        _ = try c.bytes(n * sz);
+                        _ = try c.bytes(std.math.mul(usize, n, sz) catch return error.InvalidGguf);
                     } else if (et == .string) {
                         for (0..n) |_| _ = try c.string();
                     } else return error.UnsupportedGgufArray;
@@ -243,11 +244,13 @@ pub const File = struct {
         var it = self.tensors.valueIterator();
         while (it.next()) |ti| {
             const l = ti.typ.layout() orelse continue; // reported at use site
-            const n: usize = @intCast(ti.nelems());
-            const nbytes = n / l.block * l.bytes;
-            const start = self.data_offset + @as(usize, @intCast(ti.offset));
-            if (start + nbytes > self.map.len) return error.TensorOutOfBounds;
-            ti.data = self.map[start..][0..nbytes];
+            const elems = ti.nelems() orelse return error.InvalidGguf;
+            const n: usize = std.math.cast(usize, elems) orelse return error.InvalidGguf;
+            const nbytes = std.math.mul(usize, n / l.block, l.bytes) catch return error.InvalidGguf;
+            const start = std.math.add(usize, self.data_offset, std.math.cast(usize, ti.offset) orelse return error.InvalidGguf) catch return error.InvalidGguf;
+            const end = std.math.add(usize, start, nbytes) catch return error.InvalidGguf;
+            if (end > self.map.len) return error.TensorOutOfBounds;
+            ti.data = self.map[start..end];
         }
     }
 
@@ -298,3 +301,25 @@ pub const File = struct {
         return self.map[self.data_offset..];
     }
 };
+
+test "tensor dims overflowing u64 are rejected" {
+    const gpa = std.testing.allocator;
+    var buf: [256]u8 align(std.heap.page_size_min) = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeAll("GGUF");
+    try w.writeInt(u32, 3, .little); // version
+    try w.writeInt(u64, 1, .little); // n_tensors
+    try w.writeInt(u64, 0, .little); // n_kv
+    try w.writeInt(u64, 4, .little); // name length
+    try w.writeAll("boom");
+    try w.writeInt(u32, 2, .little); // n_dims
+    try w.writeInt(u64, 1 << 33, .little);
+    try w.writeInt(u64, 1 << 33, .little);
+    try w.writeInt(u32, @intFromEnum(GgmlType.f32), .little);
+    try w.writeInt(u64, 0, .little); // offset
+    const bytes: []align(std.heap.page_size_min) const u8 = buf[0..w.end];
+
+    var f: File = .{ .map = bytes };
+    defer f.deinit(gpa);
+    try std.testing.expectError(error.InvalidGguf, f.parse(gpa));
+}

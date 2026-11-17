@@ -130,11 +130,13 @@ fn handleConnection(
 
     // 1. GET /v1/models or /models
     if (std.mem.eql(u8, method, "GET") and (std.mem.eql(u8, path, "/v1/models") or std.mem.eql(u8, path, "/models"))) {
-        const json_fmt =
-            \\{{"object":"list","data":[{{"id":"{s}","object":"model","created":1700000000,"owned_by":"zinfer","meta":{{"n_ctx":{d},"n_ctx_train":{d}}}}}]}}
-        ;
+        const json_prefix = "{\"object\":\"list\",\"data\":[{\"id\":\"";
         var body_buf: [1024]u8 = undefined;
-        const body = try std.fmt.bufPrint(&body_buf, json_fmt, .{ cfg.model_id, g.st.ctx, g.st.model.cfg.ctx_train });
+        var body_w: Io.Writer = .fixed(&body_buf);
+        try body_w.writeAll(json_prefix);
+        try writeJsonEscaped(&body_w, cfg.model_id);
+        try body_w.print("\",\"object\":\"model\",\"created\":1700000000,\"owned_by\":\"zinfer\",\"meta\":{{\"n_ctx\":{d},\"n_ctx_train\":{d}}}}}]}}", .{ g.st.ctx, g.st.model.cfg.ctx_train });
+        const body = body_w.buffered();
 
         try writer.interface.print(
             "HTTP/1.1 200 OK\r\n" ++
@@ -412,6 +414,10 @@ fn handleChatCompletion(
     if (root.object.get("messages")) |msgs_val| {
         if (msgs_val != .array) {
             try sendHttpError(w, 400, "field 'messages' must be an array");
+            return;
+        }
+        if (msgs_val.array.items.len == 0) {
+            try sendHttpError(w, 400, "field 'messages' must not be empty");
             return;
         }
         var text_buf: std.ArrayList(u8) = .empty;
