@@ -49,10 +49,10 @@ pub const Sampler = struct {
         }
     }
 
-    /// Pick the next token; `logits` is modified in place by the penalty.
-    pub fn sample(s: *Sampler, logits: []f32) u32 {
+    /// Pick the next token with its confidence margin; `logits` is modified in place by the penalty.
+    pub fn sampleWithMargin(s: *Sampler, logits: []f32) SampleResult {
         s.applyPenalty(logits);
-        if (s.p.temp <= 0) return argmax(logits);
+        if (s.p.temp <= 0) return argmaxWithMargin(logits);
 
         // Top-k via a small sorted buffer (descending).
         var n: usize = 0;
@@ -72,6 +72,7 @@ pub const Sampler = struct {
         }
         const c = s.cand[0..n];
         const mx = c[0].v;
+        const margin: f32 = if (n >= 2) mx - c[1].v else 10.0;
 
         // top-p, then min-p, on untempered probabilities (relative to the top one).
         var keep = n;
@@ -104,9 +105,14 @@ pub const Sampler = struct {
         var r = s.rng.random().float(f32) * total;
         for (c[0..keep]) |e| {
             r -= e.v;
-            if (r <= 0) return e.id;
+            if (r <= 0) return .{ .tok = e.id, .margin = margin };
         }
-        return c[keep - 1].id;
+        return .{ .tok = c[keep - 1].id, .margin = margin };
+    }
+
+    /// Pick the next token; `logits` is modified in place by the penalty.
+    pub fn sample(s: *Sampler, logits: []f32) u32 {
+        return s.sampleWithMargin(logits).tok;
     }
 
     fn gt(_: void, a: Cand, b: Cand) bool {
@@ -200,14 +206,30 @@ test "PromptLookup finds continuation of matching 3-gram and 2-gram" {
 const V8f = @Vector(8, f32);
 const V8u = @Vector(8, u32);
 
-pub fn argmax(x: []const f32) u32 {
-    if (x.len == 0) return 0;
+pub const SampleResult = struct {
+    tok: u32,
+    margin: f32,
+};
+
+pub fn argmaxWithMargin(x: []const f32) SampleResult {
+    if (x.len == 0) return .{ .tok = 0, .margin = 0 };
+    if (x.len == 1) return .{ .tok = 0, .margin = 10.0 };
     if (x.len < 16) {
         var best: usize = 0;
-        for (x, 0..) |v, i| if (v > x[best]) {
-            best = i;
-        };
-        return @intCast(best);
+        var second: usize = 1;
+        if (x[1] > x[0]) {
+            best = 1;
+            second = 0;
+        }
+        for (x[2..], 2..) |v, i| {
+            if (v > x[best]) {
+                second = best;
+                best = i;
+            } else if (v > x[second]) {
+                second = i;
+            }
+        }
+        return .{ .tok = @intCast(best), .margin = x[best] - x[second] };
     }
 
     var max0: V8f = x[0..8].*;
@@ -232,27 +254,45 @@ pub fn argmax(x: []const f32) u32 {
         idx1 = @select(u32, m1, cur_idx1, idx1);
     }
 
-    const m = max1 > max0;
-    const max_v = @select(f32, m, max1, max0);
-    const idx_v = @select(u32, m, idx1, idx0);
+    var best_val: f32 = -std.math.inf(f32);
+    var second_val: f32 = -std.math.inf(f32);
+    var best_idx: u32 = 0;
 
-    var best_val = max_v[0];
-    var best_idx = idx_v[0];
-    inline for (1..8) |j| {
-        if (max_v[j] > best_val) {
-            best_val = max_v[j];
-            best_idx = idx_v[j];
+    inline for (0..8) |j| {
+        const v0 = max0[j];
+        if (v0 > best_val) {
+            second_val = best_val;
+            best_val = v0;
+            best_idx = idx0[j];
+        } else if (v0 > second_val) {
+            second_val = v0;
+        }
+        const v1 = max1[j];
+        if (v1 > best_val) {
+            second_val = best_val;
+            best_val = v1;
+            best_idx = idx1[j];
+        } else if (v1 > second_val) {
+            second_val = v1;
         }
     }
 
     while (i < x.len) : (i += 1) {
         if (x[i] > best_val) {
+            second_val = best_val;
             best_val = x[i];
             best_idx = @intCast(i);
+        } else if (x[i] > second_val) {
+            second_val = x[i];
         }
     }
 
-    return best_idx;
+    const margin = if (second_val > -std.math.inf(f32)) best_val - second_val else 10.0;
+    return .{ .tok = best_idx, .margin = margin };
+}
+
+pub fn argmax(x: []const f32) u32 {
+    return argmaxWithMargin(x).tok;
 }
 
 test "argmax correctness" {

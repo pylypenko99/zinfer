@@ -299,25 +299,44 @@ pub const Gen = struct {
         min_k: usize = 1,
         consecutive_rejections: usize = 0,
         cooldown_steps: usize = 0,
+        last_margin: f32 = 2.0,
 
         pub fn init(max_k: usize) AdaptiveDraft {
             return .{
                 .cur_k = @min(max_k, 3),
                 .max_k = max_k,
+                .last_margin = 2.0,
             };
         }
 
-        /// Returns target draft length for this round (0 = skip drafting).
+        pub fn recordMargin(self: *AdaptiveDraft, margin: f32) void {
+            self.last_margin = margin;
+        }
+
+        /// Returns target draft length for this round based on both acceptance history
+        /// and real-time entropy margin of the logits.
         pub fn nextDraft(self: *AdaptiveDraft) usize {
             if (self.cooldown_steps > 0) {
                 self.cooldown_steps -= 1;
                 return 0;
             }
-            return self.cur_k;
+            // Entropy-adaptive scaling:
+            // High margin (low entropy): model is very confident, expand lookahead up to max_k.
+            // Low margin (high entropy): model is uncertain, contract to avoid wasted speculation.
+            var target_k = self.cur_k;
+            if (self.last_margin >= 3.0) {
+                target_k = @min(self.max_k, @max(self.cur_k, 4));
+            } else if (self.last_margin >= 1.8) {
+                target_k = @min(self.max_k, @max(self.cur_k, 2));
+            } else if (self.last_margin < 0.9) {
+                target_k = @min(target_k, 1);
+            }
+            return target_k;
         }
 
         /// Feedback update after verification round.
-        pub fn update(self: *AdaptiveDraft, accepted: usize, drafted: usize) void {
+        pub fn update(self: *AdaptiveDraft, accepted: usize, drafted: usize, margin: ?f32) void {
+            if (margin) |m| self.last_margin = m;
             if (drafted == 0) return;
 
             if (accepted == drafted) {
@@ -411,7 +430,9 @@ pub const Gen = struct {
                 if (d) |dst| {
                     if (dst.pos < g.st.pos) _ = try dst.forwardN(&.{cur_tok}, 0);
                 }
-                const next_tok = g.smp.sample(l);
+                const res = g.smp.sampleWithMargin(l);
+                const next_tok = res.tok;
+                if (g.draft_adaptive) adaptive.recordMargin(res.margin);
                 if (g.tok.isEog(next_tok)) {
                     g.stats.t_gen_ns += timer.lap();
                     return next_tok;
@@ -429,10 +450,13 @@ pub const Gen = struct {
 
                 var accepted_count: usize = 0;
                 var next_cur: ?u32 = null;
+                var last_margin: f32 = 2.0;
 
                 while (accepted_count < k) : (accepted_count += 1) {
                     const l = all_logits[accepted_count * vocab ..][0..vocab];
-                    const pred = g.smp.sample(l);
+                    const res = g.smp.sampleWithMargin(l);
+                    const pred = res.tok;
+                    last_margin = res.margin;
                     if (pred == draft_buf[accepted_count] and !g.tok.isEog(pred) and n_run < n) {
                         try g.take(sink, history, pred, &n_run);
                         g.stats.n_accepted += 1;
@@ -442,12 +466,14 @@ pub const Gen = struct {
                     }
                 }
 
-                if (g.draft_adaptive) adaptive.update(accepted_count, k);
-
                 if (next_cur == null) {
                     const l = all_logits[k * vocab ..][0..vocab];
-                    next_cur = g.smp.sample(l);
+                    const res = g.smp.sampleWithMargin(l);
+                    next_cur = res.tok;
+                    last_margin = res.margin;
                 }
+
+                if (g.draft_adaptive) adaptive.update(accepted_count, k, last_margin);
 
                 const kept_in_cache = 1 + accepted_count;
                 g.st.rewind(kept_in_cache, total_cand);
@@ -695,27 +721,27 @@ test "AdaptiveDraft feedback control" {
     try std.testing.expectEqual(@as(usize, 3), ad.nextDraft());
 
     // Perfect round: 3/3 accepted -> grows to 4
-    ad.update(3, 3);
+    ad.update(3, 3, 2.5);
     try std.testing.expectEqual(@as(usize, 4), ad.nextDraft());
 
     // Perfect round: 4/4 accepted -> grows to 5 (max)
-    ad.update(4, 4);
+    ad.update(4, 4, 2.5);
     try std.testing.expectEqual(@as(usize, 5), ad.nextDraft());
 
     // Partial success: 3/5 accepted -> stays 5
-    ad.update(3, 5);
+    ad.update(3, 5, 2.5);
     try std.testing.expectEqual(@as(usize, 5), ad.nextDraft());
 
     // Low acceptance: 1/5 accepted (< 5/2) -> drops to 4
-    ad.update(1, 5);
+    ad.update(1, 5, 2.5);
     try std.testing.expectEqual(@as(usize, 4), ad.nextDraft());
 
     // 0 accepted -> drops to 3
-    ad.update(0, 4);
+    ad.update(0, 4, 2.5);
     try std.testing.expectEqual(@as(usize, 3), ad.nextDraft());
 
     // 0 accepted second time in a row -> triggers cooldown for 2 steps!
-    ad.update(0, 3);
+    ad.update(0, 3, 2.5);
     try std.testing.expectEqual(@as(usize, 0), ad.nextDraft()); // cooldown step 1
     try std.testing.expectEqual(@as(usize, 0), ad.nextDraft()); // cooldown step 2
     try std.testing.expectEqual(@as(usize, 2), ad.nextDraft()); // resumes with cautious probe k=2
