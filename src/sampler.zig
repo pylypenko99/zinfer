@@ -157,6 +157,28 @@ pub const CandidateTree = struct {
         return &self.branches[best_idx];
     }
 
+    pub fn secondBest(self: *const CandidateTree) ?*const CandidateBranch {
+        if (self.count < 2) return null;
+        var best_idx: usize = 0;
+        var best_score: u32 = self.branches[0].score;
+        for (self.branches[1..self.count], 1..) |*b, i| {
+            if (b.score > best_score) {
+                best_score = b.score;
+                best_idx = i;
+            }
+        }
+        var sec_idx: ?usize = null;
+        var sec_score: u32 = 0;
+        for (self.branches[0..self.count], 0..) |*b, i| {
+            if (i == best_idx) continue;
+            if (sec_idx == null or b.score > sec_score) {
+                sec_score = b.score;
+                sec_idx = i;
+            }
+        }
+        return if (sec_idx) |idx| &self.branches[idx] else null;
+    }
+
     pub fn findAlternative(self: *const CandidateTree, first_tok: u32) ?*const CandidateBranch {
         for (self.branches[0..self.count]) |*b| {
             if (b.len > 1 and b.tokens[0] == first_tok) return b;
@@ -329,6 +351,9 @@ test "PromptLookup buildTree finds multiple candidate branches and ranks frequen
     const alt = tree.findAlternative(8);
     try std.testing.expect(alt != null);
     try std.testing.expectEqualSlices(u32, &.{ 8, 9 }, alt.?.tokens[0..alt.?.len]);
+
+    const sec = tree.secondBest().?;
+    try std.testing.expectEqualSlices(u32, &.{ 8, 9 }, sec.tokens[0..sec.len]);
 }
 
 const V8f = @Vector(8, f32);

@@ -8,5 +8,6 @@ test {
     _ = @import("tokenizer.zig");
     _ = @import("sampler.zig");
     _ = @import("gen.zig");
+    _ = @import("grammar.zig");
     _ = @import("pool.zig");
 }

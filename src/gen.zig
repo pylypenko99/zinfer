@@ -4,6 +4,7 @@ const std = @import("std");
 const model_mod = @import("model.zig");
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const sampler_mod = @import("sampler.zig");
+pub const grammar_mod = @import("grammar.zig");
 
 /// Monotonic stopwatch on the Io awake clock.
 pub const Timer = struct {
@@ -50,6 +51,8 @@ pub const Gen = struct {
     /// Draft model state and sampler; between rounds its cache mirrors `st`.
     draft_st: ?*model_mod.State = null,
     draft_smp: ?*sampler_mod.Sampler = null,
+    /// Grammar / JSON schema constrained decoding validator.
+    json_validator: ?grammar_mod.JsonValidator = null,
     stats: Stats = .{},
     /// Tokens in the target cache, in order (`st.pos` of them).
     cached: std.ArrayList(u32) = .empty,
@@ -435,6 +438,9 @@ pub const Gen = struct {
 
         // Tokens emitted by this call: `n` limits every call on its own.
         var n_run: usize = 0;
+        if (g.json_validator) |*jv| {
+            jv.applyMask(logits, g.tok, g.tok.eos);
+        }
         var cur_tok = g.smp.sample(logits);
         if (g.tok.isEog(cur_tok)) {
             g.stats.t_gen_ns += timer.lap();
@@ -497,6 +503,9 @@ pub const Gen = struct {
                 if (d) |dst| {
                     if (dst.pos < g.st.pos) _ = try dst.forwardN(&.{cur_tok}, 0);
                 }
+                if (g.json_validator) |*jv| {
+                    jv.applyMask(l, g.tok, g.tok.eos);
+                }
                 const res = g.smp.sampleWithMargin(l);
                 const next_tok = res.tok;
                 if (g.draft_adaptive) adaptive.recordMargin(res.margin);
@@ -521,6 +530,9 @@ pub const Gen = struct {
 
                 while (accepted_count < k) : (accepted_count += 1) {
                     const l = all_logits[accepted_count * vocab ..][0..vocab];
+                    if (g.json_validator) |*jv| {
+                        jv.applyMask(l, g.tok, g.tok.eos);
+                    }
                     const res = g.smp.sampleWithMargin(l);
                     const pred = res.tok;
                     last_margin = res.margin;
@@ -544,6 +556,9 @@ pub const Gen = struct {
 
                 if (next_cur == null) {
                     const l = all_logits[k * vocab ..][0..vocab];
+                    if (g.json_validator) |*jv| {
+                        jv.applyMask(l, g.tok, g.tok.eos);
+                    }
                     const res = g.smp.sampleWithMargin(l);
                     next_cur = res.tok;
                     last_margin = res.margin;
@@ -579,8 +594,12 @@ pub const Gen = struct {
 
     /// Emit a sampled token and add it to the context history.
     fn take(g: *Gen, sink: anytype, history: *std.ArrayList(u32), t: u32, n_run: *usize) !void {
-        try sink.emit(g.tok.piece(t));
+        const piece = g.tok.piece(t);
+        try sink.emit(piece);
         g.smp.accept(t);
+        if (g.json_validator) |*jv| {
+            _ = jv.consume(piece);
+        }
         try history.append(g.gpa, t);
         n_run.* += 1;
         g.stats.n_gen += 1;

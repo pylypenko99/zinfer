@@ -43,6 +43,7 @@ const usage =
     \\
     \\  --server              run OpenAI / llama.cpp-compatible HTTP server
     \\  --port N              server port (default 8080; implies --server)
+    \\  --json                enforce valid JSON object output (grammar-constrained decoding)
     \\  --no-prune            keep full lm_head matmul (for A/B comparison)
     \\  --no-repack           keep GGUF row layout (per-row kernels; for A/B comparison)
     \\  --cache f16|q8_0|q4_0|q2_0|q2_k K/V cache format; q4_0 (3.6x),
@@ -73,6 +74,7 @@ const Args = struct {
     n_predict: usize = 256,
     chat: bool = false,
     no_think: bool = false,
+    json: bool = false,
     server: bool = false,
     port: u16 = 8080,
     draft: usize = 0,
@@ -168,6 +170,8 @@ fn parseArgs(argv: []const [:0]const u8) Args {
             a.draft_adaptive = true;
         } else if (r.is(&.{"--server"})) {
             a.server = true;
+        } else if (r.is(&.{"--json"})) {
+            a.json = true;
         } else if (r.is(&.{"--port"})) {
             a.server = true;
             a.port = @intCast(r.uint());
@@ -344,6 +348,8 @@ pub fn main(init: std.process.Init) !void {
         .draft_smp = if (draft_smp) |*d| d else null,
     };
     defer gen.deinit();
+
+    if (args.json) gen.json_validator = gen_mod.grammar_mod.JsonValidator.initObjectOnly();
 
     if (args.bench) |b| return bench(gpa, io, &st, b[0], b[1]);
     if (args.server) {

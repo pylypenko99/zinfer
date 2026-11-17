@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Zig 0.17.1
+        run: |
+          curl -sSL "https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz" -o /tmp/zig.tar.xz
+          tar -xf /tmp/zig.tar.xz -C /tmp
+          echo "/tmp/zig-x86_64-linux-0.17.1" >> $GITHUB_PATH
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Build AVX2 binary (x86_64-v3)
+        run: |
+          zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v3
+          mkdir -p release-assets
+          cp zig-out/bin/zinfer release-assets/zinfer-linux-x86_64-avx2
+
+      - name: Build AVX-512 binary (x86_64-v4)
+        run: |
+          zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v4
+          cp zig-out/bin/zinfer release-assets/zinfer-linux-x86_64-avx512
+
+      - name: Build Native binary
+        run: |
+          zig build -Doptimize=ReleaseFast -Dcpu=native
+          cp zig-out/bin/zinfer release-assets/zinfer-linux-x86_64-native
+
+      - name: Generate SHA256 Checksums
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cd ..
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true

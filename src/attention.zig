@@ -1714,3 +1714,86 @@ test "PMM adaptive scale and asymmetric shift estimator on symmetric vs skewed d
     quantBlock32_q4(&skewed_xs, &q4, &sc_q4);
     try std.testing.expect(sc_q4 > 0);
 }
+
+/// DeepSeek Multi-Head Latent Attention (MLA) decoupled keys & latent projection.
+pub const MlaParams = struct {
+    kv_lora_rank: usize = 512,      // d_c
+    qk_rope_head_dim: usize = 64,   // d_R
+    qk_nope_head_dim: usize = 128,  // d_nope
+    v_head_dim: usize = 128,        // d_v
+    n_heads: usize = 16,
+};
+
+/// Projects and splits input into latent KV vector c_kv [kv_lora_rank] and decoupled position key k_rope [qk_rope_head_dim].
+pub fn mlaSplitKv(
+    raw_kv: []const f32,
+    c_kv: []f32,
+    k_rope: []f32,
+    params: MlaParams,
+) void {
+    const dc = params.kv_lora_rank;
+    const dr = params.qk_rope_head_dim;
+    @memcpy(c_kv[0..dc], raw_kv[0..dc]);
+    @memcpy(k_rope[0..dr], raw_kv[dc .. dc + dr]);
+}
+
+/// Computes MLA attention score combining content dot-product and decoupled RoPE dot-product:
+/// score = <q_nope, k_nope> + <q_rope, k_rope>
+pub fn mlaScore(
+    q_nope: []const f32,
+    k_nope: []const f32,
+    q_rope: []const f32,
+    k_rope: []const f32,
+) f32 {
+    var score: f32 = 0.0;
+    var i: usize = 0;
+    while (i + 8 <= q_nope.len) : (i += 8) {
+        const qv: V8f = q_nope[i..][0..8].*;
+        const kv: V8f = k_nope[i..][0..8].*;
+        score += @reduce(.Add, qv * kv);
+    }
+    while (i < q_nope.len) : (i += 1) {
+        score += q_nope[i] * k_nope[i];
+    }
+    var j: usize = 0;
+    while (j + 8 <= q_rope.len) : (j += 8) {
+        const qv: V8f = q_rope[j..][0..8].*;
+        const kv: V8f = k_rope[j..][0..8].*;
+        score += @reduce(.Add, qv * kv);
+    }
+    while (j < q_rope.len) : (j += 1) {
+        score += q_rope[j] * k_rope[j];
+    }
+    return score;
+}
+
+test "DeepSeek MLA split and score computation" {
+    const params = MlaParams{
+        .kv_lora_rank = 16,
+        .qk_rope_head_dim = 8,
+        .qk_nope_head_dim = 16,
+        .v_head_dim = 16,
+        .n_heads = 2,
+    };
+    var raw: [24]f32 = undefined;
+    for (0..24) |i| raw[i] = @floatFromInt(i + 1);
+
+    var c_kv: [16]f32 = undefined;
+    var k_rope: [8]f32 = undefined;
+    mlaSplitKv(&raw, &c_kv, &k_rope, params);
+    try std.testing.expectEqual(1.0, c_kv[0]);
+    try std.testing.expectEqual(16.0, c_kv[15]);
+    try std.testing.expectEqual(17.0, k_rope[0]);
+    try std.testing.expectEqual(24.0, k_rope[7]);
+
+    var q_nope: [16]f32 = undefined;
+    var q_rope: [8]f32 = undefined;
+    @memset(&q_nope, 1.0);
+    @memset(&q_rope, 0.5);
+
+    const s = mlaScore(&q_nope, &c_kv, &q_rope, &k_rope);
+    // <1.0, 1..16> = 136.0
+    // <0.5, 17..24> = 0.5 * 164 = 82.0
+    // Total = 136 + 82 = 218.0
+    try std.testing.expectApproxEqAbs(@as(f32, 218.0), s, 1e-4);
+}

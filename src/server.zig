@@ -276,6 +276,23 @@ fn handleChatCompletion(
         if (mt == .integer and mt.integer > 0) max_tokens = @intCast(mt.integer);
     }
 
+    var json_mode = false;
+    if (root.object.get("response_format")) |rf| {
+        if (rf == .object) {
+            if (rf.object.get("type")) |t_val| {
+                if (t_val == .string and (std.mem.eql(u8, t_val.string, "json_object") or std.mem.eql(u8, t_val.string, "json_schema"))) {
+                    json_mode = true;
+                }
+            }
+        }
+    }
+    if (json_mode) {
+        g.json_validator = gen_mod.grammar_mod.JsonValidator.initObjectOnly();
+    } else {
+        g.json_validator = null;
+    }
+    defer g.json_validator = null;
+
     // Get messages (or "input" for Responses API)
     const msgs_val = root.object.get("messages") orelse root.object.get("input") orelse return;
     if (msgs_val != .array) return;

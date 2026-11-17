@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/Dependencies-0%20(no%20libc)-brightgreen)](#architecture)
 [![Speedup](https://img.shields.io/badge/vs%20llama.cpp-+20%E2%80%9350%25-success)](#performance--benchmarks)
-[![Tests](https://img.shields.io/badge/Tests-27%2F27%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-29%2F29%20passing-brightgreen)](#testing)
 
 [**English**](README.en.md) · [**Українська**](README.md) · [**Scientific Roadmap**](ROADMAP.md)
 
