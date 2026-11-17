@@ -1459,6 +1459,8 @@ fn attendBlockChunk(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt
                         const sv: V16f = @floatCast(@as(@Vector(16, f16), ksc[0..kv_tile].*));
                         const sv0: V8f = @as([16]f32, sv)[0..8].*;
                         const sv1: V8f = @as([16]f32, sv)[8..16].*;
+                        var b_s0: [q_sub]V8f = @splat(@splat(0));
+                        var b_s1: [q_sub]V8f = @splat(@splat(0));
                         inline for (0..32) |dp| {
                             const d = b * 32 + dp;
                             const raw8: [8]u8 = bp[dp * 8 ..][0..8].*;
@@ -1469,14 +1471,16 @@ fn attendBlockChunk(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt
                             const s1: @Vector(8, i8) = @as(@Vector(8, i8), @bitCast(hi_u ^ @as(@Vector(8, u8), @splat(0x08)))) -% @as(@Vector(8, i8), @splat(8));
                             const kf0: V8f = @floatFromInt(s0);
                             const kf1: V8f = @floatFromInt(s1);
-                            const kd0 = kf0 * sv0;
-                            const kd1 = kf1 * sv1;
                             inline for (0..q_sub) |qi_idx| {
                                 const i = qs + qi_idx;
                                 const qi: V8f = @splat(q[i][d]);
-                                s0_acc[qi_idx] = @mulAdd(V8f, qi, kd0, s0_acc[qi_idx]);
-                                s1_acc[qi_idx] = @mulAdd(V8f, qi, kd1, s1_acc[qi_idx]);
+                                b_s0[qi_idx] = @mulAdd(V8f, qi, kf0, b_s0[qi_idx]);
+                                b_s1[qi_idx] = @mulAdd(V8f, qi, kf1, b_s1[qi_idx]);
                             }
+                        }
+                        inline for (0..q_sub) |qi_idx| {
+                            s0_acc[qi_idx] = @mulAdd(V8f, b_s0[qi_idx], sv0, s0_acc[qi_idx]);
+                            s1_acc[qi_idx] = @mulAdd(V8f, b_s1[qi_idx], sv1, s1_acc[qi_idx]);
                         }
                         bp += 288;
                     }
@@ -1499,14 +1503,17 @@ fn attendBlockChunk(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt
                     while (b < nblocks) : (b += 1) {
                         const ksc: [*]const f16 = @ptrCast(@alignCast(bp + 512));
                         const sv: V16f = @floatCast(@as(@Vector(16, f16), ksc[0..kv_tile].*));
+                        var b_acc: [q_sub]V16f = @splat(@splat(0));
                         inline for (0..32) |dp| {
                             const d = b * 32 + dp;
                             const kf: V16f = @floatFromInt(@as(@Vector(16, i8), @bitCast(@as(@Vector(16, u8), bp[dp * 16 ..][0..16].*))));
-                            const k_dequant = kf * sv;
                             inline for (0..q_sub) |qi_idx| {
                                 const i = qs + qi_idx;
-                                s_sub[qi_idx] = @mulAdd(V16f, @splat(q[i][d]), k_dequant, s_sub[qi_idx]);
+                                b_acc[qi_idx] = @mulAdd(V16f, @splat(q[i][d]), kf, b_acc[qi_idx]);
                             }
+                        }
+                        inline for (0..q_sub) |qi_idx| {
+                            s_sub[qi_idx] = @mulAdd(V16f, b_acc[qi_idx], sv, s_sub[qi_idx]);
                         }
                         bp += 544;
                     }
