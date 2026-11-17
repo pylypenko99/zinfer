@@ -12,9 +12,12 @@ pub const Template = enum {
     /// <start_of_turn>role ... <end_of_turn>: assistant turns are "model" and
     /// a system message becomes a prefix of the next turn.
     gemma,
+    /// <|turn>role ... <turn|>: Gemma 4 format.
+    gemma4,
     plain,
 
     pub fn detect(tok: *const Tokenizer) Template {
+        if (tok.tokenId("<|turn>") != null and tok.tokenId("<turn|>") != null) return .gemma4;
         if (tok.tokenId("<|start_header_id|>") != null and tok.tokenId("<|eot_id|>") != null) return .llama3;
         if (tok.tokenId("<|im_start|>") != null and tok.tokenId("<|im_end|>") != null)
             return if (tok.tokenId("<|startoftext|>") != null) .lfm else .chatml;
@@ -26,7 +29,7 @@ pub const Template = enum {
     /// generated end-of-turn token is fed back without.
     pub fn turnSeparator(tpl: Template) []const u8 {
         return switch (tpl) {
-            .chatml, .lfm, .gemma => "\n",
+            .chatml, .lfm, .gemma, .gemma4 => "\n",
             .llama3, .plain => "",
         };
     }
@@ -63,14 +66,16 @@ pub const Writer = struct {
         switch (w.tpl) {
             .llama3 => try w.buf.print(w.gpa, "<|start_header_id|>{s}<|end_header_id|>\n\n{s}<|eot_id|>", .{ role, msg }),
             .chatml, .lfm => try w.buf.print(w.gpa, "<|im_start|>{s}\n{s}<|im_end|>\n", .{ role, msg }),
-            .gemma => {
+            .gemma, .gemma4 => {
                 if (std.mem.eql(u8, role, "system")) {
                     w.system.clearRetainingCapacity();
                     try w.system.print(w.gpa, "{s}\n\n", .{msg});
                     return;
                 }
                 const r = if (std.mem.eql(u8, role, "assistant")) "model" else role;
-                try w.buf.print(w.gpa, "<start_of_turn>{s}\n{s}{s}<end_of_turn>\n", .{ r, w.system.items, std.mem.trim(u8, msg, &std.ascii.whitespace) });
+                const open_tag = if (w.tpl == .gemma4) "<|turn>" else "<start_of_turn>";
+                const close_tag = if (w.tpl == .gemma4) "<turn|>" else "<end_of_turn>";
+                try w.buf.print(w.gpa, "{s}{s}\n{s}{s}{s}\n", .{ open_tag, r, w.system.items, std.mem.trim(u8, msg, &std.ascii.whitespace), close_tag });
                 w.system.clearRetainingCapacity();
             },
             .plain => try w.buf.print(w.gpa, "{s}: {s}\n", .{ role, msg }),
@@ -84,6 +89,7 @@ pub const Writer = struct {
             .llama3 => "<|start_header_id|>assistant<|end_header_id|>\n\n",
             .chatml, .lfm => "<|im_start|>assistant\n",
             .gemma => "<start_of_turn>model\n",
+            .gemma4 => "<|turn>model\n",
             .plain => "assistant:",
         });
         if (!has_think) return;

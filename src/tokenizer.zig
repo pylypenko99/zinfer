@@ -24,6 +24,7 @@ const Merge = struct { rank: u32, id: u32 };
 
 pub const Tokenizer = struct {
     kind: Kind,
+    is_gemma4: bool = false,
     pre: Pre = .llama3,
     ignore_merges: bool = false,
     vocab: []const []const u8,
@@ -47,7 +48,8 @@ pub const Tokenizer = struct {
 
     pub fn init(gpa: Allocator, f: *const gguf.File) !Tokenizer {
         const model = f.getString("tokenizer.ggml.model") orelse return error.MissingTokenizer;
-        const kind: Kind = if (std.mem.eql(u8, model, "gpt2"))
+        const is_gemma4 = std.mem.eql(u8, model, "gemma4");
+        const kind: Kind = if (std.mem.eql(u8, model, "gpt2") or is_gemma4)
             .bpe
         else if (std.mem.eql(u8, model, "llama"))
             .spm
@@ -72,6 +74,7 @@ pub const Tokenizer = struct {
 
         var self: Tokenizer = .{
             .kind = kind,
+            .is_gemma4 = is_gemma4,
             .vocab = vocab,
             .types = types,
             .piece_off = &.{},
@@ -99,6 +102,29 @@ pub const Tokenizer = struct {
                 self.byte_tok[b] = self.map.get(s);
             }
             self.add_space_prefix = f.getBool("tokenizer.ggml.add_space_prefix") orelse true;
+        } else if (is_gemma4) {
+            for (0..256) |b| {
+                var buf: [6]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "<0x{X:0>2}>", .{b}) catch unreachable;
+                self.byte_tok[b] = self.map.get(s);
+            }
+            const ma = f.getArray("tokenizer.ggml.merges") orelse return error.MissingTokenizer;
+            try self.merges.ensureTotalCapacity(gpa, @intCast(ma.len));
+            var mit = ma.strings();
+            var cat: std.ArrayList(u8) = .empty;
+            defer cat.deinit(gpa);
+            for (0..ma.len) |rank| {
+                const m = mit.next();
+                const sp = std.mem.indexOfScalarPos(u8, m, 1, ' ') orelse continue;
+                const a = self.map.get(m[0..sp]) orelse continue;
+                const b = self.map.get(m[sp + 1 ..]) orelse continue;
+                cat.clearRetainingCapacity();
+                try cat.appendSlice(gpa, m[0..sp]);
+                try cat.appendSlice(gpa, m[sp + 1 ..]);
+                const id = self.map.get(cat.items) orelse continue;
+                const gop = self.merges.getOrPutAssumeCapacity(pairKey(a, b));
+                if (!gop.found_existing) gop.value_ptr.* = .{ .rank = @intCast(rank), .id = id };
+            }
         } else {
             const pre = f.getString("tokenizer.ggml.pre") orelse "default";
             self.pre = if (std.mem.eql(u8, pre, "qwen2")) .qwen2 else if (std.mem.eql(u8, pre, "gpt-2") or std.mem.eql(u8, pre, "gpt2")) .gpt2 else .llama3;
@@ -135,7 +161,7 @@ pub const Tokenizer = struct {
 
         self.bos = if (f.getUint("tokenizer.ggml.bos_token_id")) |v| @intCast(v) else null;
         self.eos = if (f.getUint("tokenizer.ggml.eos_token_id")) |v| @intCast(v) else null;
-        self.add_bos = f.getBool("tokenizer.ggml.add_bos_token") orelse (kind == .spm);
+        self.add_bos = f.getBool("tokenizer.ggml.add_bos_token") orelse (kind == .spm or is_gemma4);
 
         try self.buildPieces(gpa);
         try self.buildSpecials(gpa);
@@ -173,35 +199,32 @@ pub const Tokenizer = struct {
             switch (self.types[id]) {
                 .control, .unused, .unknown => {},
                 .user_defined => try buf.appendSlice(gpa, s),
-                .byte => if (self.kind == .spm and s.len == 6) {
+                .byte => if ((self.kind == .spm or self.is_gemma4) and s.len == 6) {
                     try buf.append(gpa, std.fmt.parseInt(u8, s[3..5], 16) catch '?');
                 } else try buf.appendSlice(gpa, s),
-                else => switch (self.kind) {
-                    .spm => {
-                        var k: usize = 0;
-                        while (k < s.len) {
-                            if (std.mem.startsWith(u8, s[k..], "\u{2581}")) {
-                                try buf.append(gpa, ' ');
-                                k += 3;
-                            } else {
-                                try buf.append(gpa, s[k]);
-                                k += 1;
-                            }
+                else => if (self.kind == .spm or self.is_gemma4) {
+                    var k: usize = 0;
+                    while (k < s.len) {
+                        if (std.mem.startsWith(u8, s[k..], "\u{2581}")) {
+                            try buf.append(gpa, ' ');
+                            k += 3;
+                        } else {
+                            try buf.append(gpa, s[k]);
+                            k += 1;
                         }
-                    },
-                    .bpe => {
-                        var view = std.unicode.Utf8View.initUnchecked(s);
-                        var cit = view.iterator();
-                        while (cit.nextCodepoint()) |cp| {
-                            if (cp < cp_to_byte.len and cp_to_byte[cp] >= 0) {
-                                try buf.append(gpa, @intCast(cp_to_byte[cp]));
-                            } else {
-                                var tmp: [4]u8 = undefined;
-                                const l = std.unicode.utf8Encode(cp, &tmp) catch 0;
-                                try buf.appendSlice(gpa, tmp[0..l]);
-                            }
+                    }
+                } else {
+                    var view = std.unicode.Utf8View.initUnchecked(s);
+                    var cit = view.iterator();
+                    while (cit.nextCodepoint()) |cp| {
+                        if (cp < cp_to_byte.len and cp_to_byte[cp] >= 0) {
+                            try buf.append(gpa, @intCast(cp_to_byte[cp]));
+                        } else {
+                            var tmp: [4]u8 = undefined;
+                            const l = std.unicode.utf8Encode(cp, &tmp) catch 0;
+                            try buf.appendSlice(gpa, tmp[0..l]);
                         }
-                    },
+                    }
                 },
             }
         }
@@ -234,7 +257,7 @@ pub const Tokenizer = struct {
         for ([_][]const u8{ "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id" }) |k| {
             if (f.getUint(k)) |v| try list.append(gpa, @intCast(v));
         }
-        for ([_][]const u8{ "<|eot_id|>", "<|eom_id|>", "<|end_of_text|>", "<|im_end|>", "<|endoftext|>", "</s>", "<end_of_turn>" }) |s| {
+        for ([_][]const u8{ "<|eot_id|>", "<|eom_id|>", "<|end_of_text|>", "<|im_end|>", "<|endoftext|>", "</s>", "<end_of_turn>", "<turn|>", "<|tool_response>" }) |s| {
             if (self.map.get(s)) |id| if (isSpecial(self.types[id]) and std.mem.indexOfScalar(u32, list.items, id) == null)
                 try list.append(gpa, id);
         }
@@ -285,9 +308,78 @@ pub const Tokenizer = struct {
     }
 
     fn encodeText(self: *const Tokenizer, gpa: Allocator, text: []const u8, first: bool, out: *std.ArrayList(u32)) !void {
-        switch (self.kind) {
+        if (self.is_gemma4) {
+            try self.encodeGemma4(gpa, text, out);
+        } else switch (self.kind) {
             .bpe => try self.encodeBpe(gpa, text, out),
             .spm => try self.encodeSpm(gpa, text, first, out),
+        }
+    }
+
+    fn encodeGemma4(self: *const Tokenizer, gpa: Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
+        var i: usize = 0;
+        var syms: std.ArrayList(u32) = .empty;
+        defer syms.deinit(gpa);
+        var norm: std.ArrayList(u8) = .empty;
+        defer norm.deinit(gpa);
+
+        while (i < text.len) {
+            if (text[i] == '\n') {
+                var j = i + 1;
+                while (j < text.len and text[j] == '\n') : (j += 1) {}
+                const nl = text[i..j];
+                i = j;
+                if (self.map.get(nl)) |id| {
+                    try out.append(gpa, id);
+                    continue;
+                }
+                if (self.map.get("\n")) |id| {
+                    for (0..nl.len) |_| try out.append(gpa, id);
+                }
+                continue;
+            }
+            var j = i + 1;
+            while (j < text.len and text[j] != '\n') : (j += 1) {}
+            const chunk = text[i..j];
+            i = j;
+
+            norm.clearRetainingCapacity();
+            for (chunk) |c| {
+                if (c == ' ') try norm.appendSlice(gpa, "\u{2581}") else try norm.append(gpa, c);
+            }
+
+            syms.clearRetainingCapacity();
+            var k: usize = 0;
+            const s = norm.items;
+            while (k < s.len) {
+                const l = @min(std.unicode.utf8ByteSequenceLength(s[k]) catch 1, s.len - k);
+                const cp_bytes = s[k .. k + l];
+                k += l;
+                if (self.map.get(cp_bytes)) |id| {
+                    try syms.append(gpa, id);
+                } else {
+                    for (cp_bytes) |b| {
+                        if (self.byte_tok[b]) |t| try syms.append(gpa, t);
+                    }
+                }
+            }
+
+            while (syms.items.len > 1) {
+                var best: ?Merge = null;
+                var at: usize = 0;
+                for (0..syms.items.len - 1) |idx| {
+                    if (self.merges.get(pairKey(syms.items[idx], syms.items[idx + 1]))) |m| {
+                        if (best == null or m.rank < best.?.rank) {
+                            best = m;
+                            at = idx;
+                        }
+                    }
+                }
+                const m = best orelse break;
+                syms.items[at] = m.id;
+                _ = syms.orderedRemove(at + 1);
+            }
+            try out.appendSlice(gpa, syms.items);
         }
     }
 
