@@ -29,7 +29,7 @@ inline fn loadVec(comptime V: type, p: [*]const u8) V {
     return @as(*align(1) const V, @ptrCast(p)).*;
 }
 
-extern fn @"llvm.x86.avx2.psign.b"(@Vector(32, i8), @Vector(32, i8)) @Vector(32, i8);
+// LLVM lowers vector select / negate to vpsignb on AVX2.
 
 pub fn supported(t: GgmlType) bool {
     return switch (t) {
@@ -444,8 +444,6 @@ inline fn pairI8(p: [*]const u8) V16i16 {
 
 /// a * sign(s): negate where s < 0 (vpsignb; zero lanes are irrelevant here).
 inline fn applySign(a: V32i8, s: V32i8) V32i8 {
-    const builtin = @import("builtin");
-    if (builtin.os.tag != .windows and quant.has_avx2) return @"llvm.x86.avx2.psign.b"(a, s);
     return @select(i8, s < @as(V32i8, @splat(0)), @as(V32i8, @splat(0)) -% a, a);
 }
 

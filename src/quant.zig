@@ -13,8 +13,7 @@ pub const has_vnni = has_avx2 and std.Target.x86.featureSetHas(builtin.cpu.featu
 /// 32 vector registers (EVEX ymm16-31): room for wider token groups.
 pub const has_avx512vl = has_avx2 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vl);
 
-extern fn @"llvm.x86.avx2.pmadd.ub.sw"(@Vector(32, u8), @Vector(32, i8)) @Vector(16, i16);
-extern fn @"llvm.x86.avx2.pmadd.wd"(@Vector(16, i16), @Vector(16, i16)) @Vector(8, i32);
+// LLVM lowers the portable vector expressions below to vpmaddubsw / vpmaddwd on AVX2.
 extern fn @"llvm.x86.avx512.vpdpbusd.256"(V8i32, V32i8, V32i8) V8i32;
 
 /// VNNI dot-product step: acc += unsigned bytes of `u` x signed bytes of `s`,
@@ -90,7 +89,6 @@ const odd8 = evenOdd(8, true);
 
 /// u8 x i8 -> pairwise-summed i16 with saturation (vpmaddubsw).
 pub inline fn maddubs(a: V32u8, b: V32i8) V16i16 {
-    if (builtin.os.tag != .windows and has_avx2) return @"llvm.x86.avx2.pmadd.ub.sw"(a, b);
     const ae: @Vector(16, i32) = @shuffle(u8, a, undefined, even16);
     const ao: @Vector(16, i32) = @shuffle(u8, a, undefined, odd16);
     const be: @Vector(16, i32) = @shuffle(i8, b, undefined, even16);
@@ -101,7 +99,6 @@ pub inline fn maddubs(a: V32u8, b: V32i8) V16i16 {
 
 /// i16 x i16 -> pairwise-summed i32 (vpmaddwd).
 pub inline fn maddwd(a: V16i16, b: V16i16) V8i32 {
-    if (builtin.os.tag != .windows and has_avx2) return @"llvm.x86.avx2.pmadd.wd"(a, b);
     const ae: V8i32 = @shuffle(i16, a, undefined, even8);
     const ao: V8i32 = @shuffle(i16, a, undefined, odd8);
     const be: V8i32 = @shuffle(i16, b, undefined, even8);
