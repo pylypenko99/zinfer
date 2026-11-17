@@ -366,21 +366,7 @@ pub const Tokenizer = struct {
                 }
             }
 
-            while (syms.items.len > 1) {
-                var best: ?Merge = null;
-                var at: usize = 0;
-                for (0..syms.items.len - 1) |idx| {
-                    if (self.merges.get(pairKey(syms.items[idx], syms.items[idx + 1]))) |m| {
-                        if (best == null or m.rank < best.?.rank) {
-                            best = m;
-                            at = idx;
-                        }
-                    }
-                }
-                const m = best orelse break;
-                syms.items[at] = m.id;
-                _ = syms.orderedRemove(at + 1);
-            }
+            try self.bpeMerge(gpa, &syms);
             try out.appendSlice(gpa, syms.items);
         }
     }
@@ -406,6 +392,156 @@ pub const Tokenizer = struct {
         }
     }
 
+    const BpeNode = struct {
+        val: u32,
+        prev: ?u32,
+        next: ?u32,
+        deleted: bool,
+    };
+
+    const BpeHeapItem = struct {
+        rank: u32,
+        id: u32,
+        left: u32,
+        right: u32,
+    };
+
+    fn heapPush(heap: *std.ArrayList(BpeHeapItem), item: BpeHeapItem, gpa: Allocator) !void {
+        try heap.append(gpa, item);
+        var i = heap.items.len - 1;
+        while (i > 0) {
+            const parent = (i - 1) / 2;
+            if (heap.items[i].rank < heap.items[parent].rank) {
+                std.mem.swap(BpeHeapItem, &heap.items[i], &heap.items[parent]);
+                i = parent;
+            } else break;
+        }
+    }
+
+    fn heapPop(heap: *std.ArrayList(BpeHeapItem)) ?BpeHeapItem {
+        if (heap.items.len == 0) return null;
+        const top = heap.items[0];
+        const last = heap.pop() orelse unreachable;
+        if (heap.items.len > 0) {
+            heap.items[0] = last;
+            var i: usize = 0;
+            while (true) {
+                var smallest = i;
+                const left = 2 * i + 1;
+                const right = 2 * i + 2;
+                if (left < heap.items.len and heap.items[left].rank < heap.items[smallest].rank) smallest = left;
+                if (right < heap.items.len and heap.items[right].rank < heap.items[smallest].rank) smallest = right;
+                if (smallest != i) {
+                    std.mem.swap(BpeHeapItem, &heap.items[i], &heap.items[smallest]);
+                    i = smallest;
+                } else break;
+            }
+        }
+        return top;
+    }
+
+    /// Performs BPE merge in-place on a list of symbol token IDs.
+    /// Uses fast O(N) scan for words <= 16 characters (L1 cache friendly, 0 allocations);
+    /// switches to O(N log N) Min-Heap Priority Queue with Doubly Linked List for long sequences.
+    pub fn bpeMerge(self: *const Tokenizer, gpa: Allocator, syms: *std.ArrayList(u32)) !void {
+        if (syms.items.len <= 1) return;
+
+        if (syms.items.len <= 16) {
+            while (syms.items.len > 1) {
+                var best: ?Merge = null;
+                var at: usize = 0;
+                for (0..syms.items.len - 1) |k| {
+                    if (self.merges.get(pairKey(syms.items[k], syms.items[k + 1]))) |m| {
+                        if (best == null or m.rank < best.?.rank) {
+                            best = m;
+                            at = k;
+                        }
+                    }
+                }
+                const m = best orelse break;
+                syms.items[at] = m.id;
+                _ = syms.orderedRemove(at + 1);
+            }
+            return;
+        }
+
+        const n = syms.items.len;
+        const nodes = try gpa.alloc(BpeNode, n);
+        defer gpa.free(nodes);
+
+        for (syms.items, 0..) |val, idx| {
+            nodes[idx] = .{
+                .val = val,
+                .prev = if (idx > 0) @intCast(idx - 1) else null,
+                .next = if (idx + 1 < n) @intCast(idx + 1) else null,
+                .deleted = false,
+            };
+        }
+
+        var heap: std.ArrayList(BpeHeapItem) = .empty;
+        defer heap.deinit(gpa);
+        try heap.ensureTotalCapacity(gpa, n * 2);
+
+        for (0..n - 1) |idx| {
+            if (self.merges.get(pairKey(nodes[idx].val, nodes[idx + 1].val))) |m| {
+                try heapPush(&heap, .{
+                    .rank = m.rank,
+                    .id = m.id,
+                    .left = @intCast(idx),
+                    .right = @intCast(idx + 1),
+                }, gpa);
+            }
+        }
+
+        while (heapPop(&heap)) |item| {
+            if (nodes[item.left].deleted or nodes[item.right].deleted) continue;
+            if (nodes[item.left].next != item.right) continue;
+
+            const cur_m = self.merges.get(pairKey(nodes[item.left].val, nodes[item.right].val)) orelse continue;
+            if (cur_m.rank != item.rank) continue;
+
+            // Merge right into left
+            nodes[item.left].val = item.id;
+            nodes[item.right].deleted = true;
+            const nxt = nodes[item.right].next;
+            nodes[item.left].next = nxt;
+            if (nxt) |nxt_id| {
+                nodes[nxt_id].prev = item.left;
+            }
+
+            // Check new adjacent pair on the left
+            if (nodes[item.left].prev) |prev_id| {
+                if (self.merges.get(pairKey(nodes[prev_id].val, nodes[item.left].val))) |m_prev| {
+                    try heapPush(&heap, .{
+                        .rank = m_prev.rank,
+                        .id = m_prev.id,
+                        .left = prev_id,
+                        .right = item.left,
+                    }, gpa);
+                }
+            }
+
+            // Check new adjacent pair on the right
+            if (nodes[item.left].next) |next_id| {
+                if (self.merges.get(pairKey(nodes[item.left].val, nodes[next_id].val))) |m_next| {
+                    try heapPush(&heap, .{
+                        .rank = m_next.rank,
+                        .id = m_next.id,
+                        .left = item.left,
+                        .right = next_id,
+                    }, gpa);
+                }
+            }
+        }
+
+        syms.clearRetainingCapacity();
+        var cur: ?u32 = 0;
+        while (cur) |c| {
+            try syms.append(gpa, nodes[c].val);
+            cur = nodes[c].next;
+        }
+    }
+
     fn bpeWord(self: *const Tokenizer, gpa: Allocator, word: []const u8, syms: *std.ArrayList(u32), mapped: *std.ArrayList(u8), out: *std.ArrayList(u32)) !void {
         if (self.ignore_merges) {
             mapped.clearRetainingCapacity();
@@ -418,21 +554,7 @@ pub const Tokenizer = struct {
         }
         syms.clearRetainingCapacity();
         for (word) |c| if (self.byte_tok[c]) |t| try syms.append(gpa, t);
-        while (syms.items.len > 1) {
-            var best: ?Merge = null;
-            var at: usize = 0;
-            for (0..syms.items.len - 1) |k| {
-                if (self.merges.get(pairKey(syms.items[k], syms.items[k + 1]))) |m| {
-                    if (best == null or m.rank < best.?.rank) {
-                        best = m;
-                        at = k;
-                    }
-                }
-            }
-            const m = best orelse break;
-            syms.items[at] = m.id;
-            _ = syms.orderedRemove(at + 1);
-        }
+        try self.bpeMerge(gpa, syms);
         try out.appendSlice(gpa, syms.items);
     }
 
@@ -524,7 +646,24 @@ fn decodeCps(gpa: Allocator, text: []const u8, out: *std.ArrayList(Cp)) !void {
 const Class = enum { letter, number, space, other };
 
 fn inRanges(cp: u21, comptime ranges: []const [2]u21) bool {
-    for (ranges) |r| if (cp >= r[0] and cp <= r[1]) return true;
+    comptime {
+        for (ranges, 0..) |r, idx| {
+            std.debug.assert(r[0] <= r[1]);
+            if (idx > 0) std.debug.assert(ranges[idx - 1][1] < r[0]);
+        }
+    }
+    var l: usize = 0;
+    var r: usize = ranges.len;
+    while (l < r) {
+        const m = l + (r - l) / 2;
+        if (cp < ranges[m][0]) {
+            r = m;
+        } else if (cp > ranges[m][1]) {
+            l = m + 1;
+        } else {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -539,60 +678,80 @@ pub fn classify(cp: u21) Class {
         if (c == ' ' or (c >= 9 and c <= 13)) return .space;
         return .other;
     }
-    if (inRanges(cp, &.{ .{ 0x85, 0x85 }, .{ 0xA0, 0xA0 }, .{ 0x1680, 0x1680 }, .{ 0x2000, 0x200A }, .{ 0x2028, 0x2029 }, .{ 0x202F, 0x202F }, .{ 0x205F, 0x205F }, .{ 0x3000, 0x3000 } })) return .space;
     if (inRanges(cp, &.{
-        .{ 0xB2, 0xB3 },     .{ 0xB9, 0xB9 },     .{ 0xBC, 0xBE },     .{ 0x660, 0x669 },     .{ 0x6F0, 0x6F9 },
-        .{ 0x7C0, 0x7C9 },   .{ 0x966, 0x96F },   .{ 0x9E6, 0x9EF },   .{ 0xA66, 0xA6F },     .{ 0xAE6, 0xAEF },
-        .{ 0xB66, 0xB6F },   .{ 0xBE6, 0xBF2 },   .{ 0xC66, 0xC6F },   .{ 0xCE6, 0xCEF },     .{ 0xD66, 0xD78 },
-        .{ 0xE50, 0xE59 },   .{ 0xED0, 0xED9 },   .{ 0xF20, 0xF33 },   .{ 0x1040, 0x1049 },   .{ 0x17E0, 0x17E9 },
-        .{ 0x1810, 0x1819 }, .{ 0x2070, 0x2070 }, .{ 0x2074, 0x2079 }, .{ 0x2080, 0x2089 },   .{ 0x2150, 0x2189 },
-        .{ 0x2460, 0x249B }, .{ 0x24EA, 0x24FF }, .{ 0x2776, 0x2793 }, .{ 0x3007, 0x3007 },   .{ 0x3021, 0x3029 },
-        .{ 0x3038, 0x303A }, .{ 0x3192, 0x3195 }, .{ 0x3220, 0x3229 }, .{ 0x3248, 0x324F },   .{ 0x3251, 0x325F },
-        .{ 0x3280, 0x3289 }, .{ 0x32B1, 0x32BF }, .{ 0xFF10, 0xFF19 }, .{ 0x1D7CE, 0x1D7FF }, .{ 0x1F100, 0x1F10C },
+        .{ 0x85, 0x85 },
+        .{ 0xA0, 0xA0 },
+        .{ 0x1680, 0x1680 },
+        .{ 0x2000, 0x200A },
+        .{ 0x2028, 0x2029 },
+        .{ 0x202F, 0x202F },
+        .{ 0x205F, 0x205F },
+        .{ 0x3000, 0x3000 },
+    })) return .space;
+    if (inRanges(cp, &.{
+        .{ 0xB2, 0xB3 },         .{ 0xB9, 0xB9 },         .{ 0xBC, 0xBE },         .{ 0x660, 0x669 },
+        .{ 0x6F0, 0x6F9 },       .{ 0x7C0, 0x7C9 },       .{ 0x966, 0x96F },       .{ 0x9E6, 0x9EF },
+        .{ 0xA66, 0xA6F },       .{ 0xAE6, 0xAEF },       .{ 0xB66, 0xB6F },       .{ 0xBE6, 0xBF2 },
+        .{ 0xC66, 0xC6F },       .{ 0xCE6, 0xCEF },       .{ 0xD66, 0xD78 },       .{ 0xE50, 0xE59 },
+        .{ 0xED0, 0xED9 },       .{ 0xF20, 0xF33 },       .{ 0x1040, 0x1049 },     .{ 0x17E0, 0x17E9 },
+        .{ 0x1810, 0x1819 },     .{ 0x2070, 0x2070 },     .{ 0x2074, 0x2079 },     .{ 0x2080, 0x2089 },
+        .{ 0x2150, 0x2189 },     .{ 0x2460, 0x249B },     .{ 0x24EA, 0x24FF },     .{ 0x2776, 0x2793 },
+        .{ 0x3007, 0x3007 },     .{ 0x3021, 0x3029 },     .{ 0x3038, 0x303A },     .{ 0x3192, 0x3195 },
+        .{ 0x3220, 0x3229 },     .{ 0x3248, 0x324F },     .{ 0x3251, 0x325F },     .{ 0x3280, 0x3289 },
+        .{ 0x32B1, 0x32BF },     .{ 0xFF10, 0xFF19 },     .{ 0x10107, 0x10133 },   .{ 0x102E0, 0x102FB },
+        .{ 0x104A0, 0x104A9 },   .{ 0x11066, 0x1106F },   .{ 0x16B5B, 0x16B61 },   .{ 0x1D2E0, 0x1D2F3 },
+        .{ 0x1D7CE, 0x1D7FF },   .{ 0x1E950, 0x1E959 },   .{ 0x1F100, 0x1F10C },
     })) return .number;
     if (inRanges(cp, &.{
         // Latin-1 punctuation & symbols (letters ª µ º excluded)
-        .{ 0xA1, 0xA9 },       .{ 0xAB, 0xB1 },        .{ 0xB4, 0xB4 },       .{ 0xB6, 0xB8 },       .{ 0xBB, 0xBB },
-        .{ 0xBF, 0xBF },       .{ 0xD7, 0xD7 },        .{ 0xF7, 0xF7 },
+        .{ 0xA1, 0xA9 },         .{ 0xAB, 0xB1 },         .{ 0xB4, 0xB4 },         .{ 0xB6, 0xB8 },
+        .{ 0xBB, 0xBB },         .{ 0xBF, 0xBF },         .{ 0xD7, 0xD7 },         .{ 0xF7, 0xF7 },
         // Modifier symbols, combining marks
-              .{ 0x2C2, 0x2C5 },     .{ 0x2D2, 0x2DF },
-        .{ 0x2E5, 0x2EB },     .{ 0x2ED, 0x2ED },      .{ 0x2EF, 0x36F },     .{ 0x375, 0x375 },     .{ 0x37E, 0x37E },
-        .{ 0x384, 0x385 },     .{ 0x387, 0x387 },      .{ 0x3F6, 0x3F6 },     .{ 0x482, 0x489 },     .{ 0x55A, 0x55F },
-        .{ 0x589, 0x58A },     .{ 0x58D, 0x58F },      .{ 0x591, 0x5C7 },     .{ 0x5F3, 0x5F4 },     .{ 0x600, 0x61F },
-        .{ 0x64B, 0x65F },     .{ 0x66A, 0x66D },      .{ 0x670, 0x670 },     .{ 0x6D4, 0x6D4 },     .{ 0x6D6, 0x6ED },
-        .{ 0x6FD, 0x6FE },     .{ 0x700, 0x70F },      .{ 0x711, 0x711 },     .{ 0x730, 0x74A },     .{ 0x7A6, 0x7B0 },
-        .{ 0x900, 0x903 },     .{ 0x93A, 0x93C },      .{ 0x93E, 0x94F },     .{ 0x951, 0x957 },     .{ 0x962, 0x965 },
-        .{ 0x970, 0x970 },     .{ 0x981, 0x983 },      .{ 0x9BC, 0x9BC },     .{ 0x9BE, 0x9CD },     .{ 0x9D7, 0x9D7 },
-        .{ 0x9E2, 0x9E3 },     .{ 0xA01, 0xA03 },      .{ 0xA3C, 0xA51 },     .{ 0xA70, 0xA71 },     .{ 0xA81, 0xA83 },
-        .{ 0xABC, 0xABC },     .{ 0xABE, 0xACD },      .{ 0xB01, 0xB03 },     .{ 0xB3C, 0xB3C },     .{ 0xB3E, 0xB57 },
-        .{ 0xBBE, 0xBCD },     .{ 0xC00, 0xC04 },      .{ 0xC3E, 0xC56 },     .{ 0xC81, 0xC83 },     .{ 0xCBC, 0xCBC },
-        .{ 0xCBE, 0xCD6 },     .{ 0xD00, 0xD03 },      .{ 0xD3E, 0xD57 },     .{ 0xE31, 0xE31 },     .{ 0xE34, 0xE3A },
-        .{ 0xE3F, 0xE3F },     .{ 0xE47, 0xE4F },      .{ 0xEB1, 0xEB1 },     .{ 0xEB4, 0xEBC },     .{ 0xEC8, 0xECE },
-        .{ 0xF01, 0xF17 },     .{ 0xF3A, 0xF3F },      .{ 0xF71, 0xF87 },     .{ 0x102B, 0x103E },   .{ 0x104A, 0x104F },
-        .{ 0x10FB, 0x10FB },   .{ 0x1360, 0x1368 },    .{ 0x16EB, 0x16ED },   .{ 0x17B4, 0x17D6 },   .{ 0x1800, 0x180F },
-        .{ 0x1AB0, 0x1AFF },   .{ 0x1DC0, 0x1DFF },    .{ 0x1FBD, 0x1FBD },   .{ 0x1FBF, 0x1FC1 },   .{ 0x1FCD, 0x1FCF },
-        .{ 0x1FDD, 0x1FDF },   .{ 0x1FED, 0x1FEF },    .{ 0x1FFD, 0x1FFE },
+        .{ 0x2C2, 0x2C5 },       .{ 0x2D2, 0x2DF },       .{ 0x2E5, 0x2EB },       .{ 0x2ED, 0x2ED },
+        .{ 0x2EF, 0x36F },       .{ 0x375, 0x375 },       .{ 0x37E, 0x37E },       .{ 0x384, 0x385 },
+        .{ 0x387, 0x387 },       .{ 0x3F6, 0x3F6 },       .{ 0x482, 0x489 },       .{ 0x55A, 0x55F },
+        .{ 0x589, 0x58A },       .{ 0x58D, 0x58F },       .{ 0x591, 0x5C7 },       .{ 0x5F3, 0x5F4 },
+        .{ 0x600, 0x61F },       .{ 0x64B, 0x65F },       .{ 0x66A, 0x66D },       .{ 0x670, 0x670 },
+        .{ 0x6D4, 0x6D4 },       .{ 0x6D6, 0x6ED },       .{ 0x6FD, 0x6FE },       .{ 0x700, 0x70F },
+        .{ 0x711, 0x711 },       .{ 0x730, 0x74A },       .{ 0x7A6, 0x7B0 },       .{ 0x900, 0x903 },
+        .{ 0x93A, 0x93C },       .{ 0x93E, 0x94F },       .{ 0x951, 0x957 },       .{ 0x962, 0x965 },
+        .{ 0x970, 0x970 },       .{ 0x981, 0x983 },       .{ 0x9BC, 0x9BC },       .{ 0x9BE, 0x9CD },
+        .{ 0x9D7, 0x9D7 },       .{ 0x9E2, 0x9E3 },       .{ 0xA01, 0xA03 },       .{ 0xA3C, 0xA51 },
+        .{ 0xA70, 0xA71 },       .{ 0xA81, 0xA83 },       .{ 0xABC, 0xABC },       .{ 0xABE, 0xACD },
+        .{ 0xB01, 0xB03 },       .{ 0xB3C, 0xB3C },       .{ 0xB3E, 0xB57 },       .{ 0xBBE, 0xBCD },
+        .{ 0xC00, 0xC04 },       .{ 0xC3E, 0xC56 },       .{ 0xC81, 0xC83 },       .{ 0xCBC, 0xCBC },
+        .{ 0xCBE, 0xCD6 },       .{ 0xD00, 0xD03 },       .{ 0xD3E, 0xD57 },       .{ 0xE31, 0xE31 },
+        .{ 0xE34, 0xE3A },       .{ 0xE3F, 0xE3F },       .{ 0xE47, 0xE4F },       .{ 0xEB1, 0xEB1 },
+        .{ 0xEB4, 0xEBC },       .{ 0xEC8, 0xECE },       .{ 0xF01, 0xF17 },       .{ 0xF3A, 0xF3F },
+        .{ 0xF71, 0xF87 },       .{ 0x102B, 0x103E },     .{ 0x104A, 0x104F },     .{ 0x10FB, 0x10FB },
+        .{ 0x1360, 0x1368 },     .{ 0x16EB, 0x16ED },     .{ 0x17B4, 0x17D6 },     .{ 0x1800, 0x180F },
+        .{ 0x1AB0, 0x1AFF },     .{ 0x1DC0, 0x1DFF },     .{ 0x1FBD, 0x1FBD },     .{ 0x1FBF, 0x1FC1 },
+        .{ 0x1FCD, 0x1FCF },     .{ 0x1FDD, 0x1FDF },     .{ 0x1FED, 0x1FEF },     .{ 0x1FFD, 0x1FFE },
         // General punctuation, super/subscript signs, currency, combining for symbols
-          .{ 0x200B, 0x2027 },   .{ 0x2030, 0x205E },
-        .{ 0x2060, 0x206F },   .{ 0x207A, 0x207E },    .{ 0x208A, 0x208E },   .{ 0x20A0, 0x20FF },
-        // Letterlike symbols (mixed; mostly symbols), arrows ... misc symbols, dingbats
-          .{ 0x2100, 0x2101 },
-        .{ 0x2103, 0x2106 },   .{ 0x2108, 0x2109 },    .{ 0x2114, 0x2114 },   .{ 0x2116, 0x2118 },   .{ 0x211E, 0x2123 },
-        .{ 0x2125, 0x2125 },   .{ 0x2127, 0x2127 },    .{ 0x2129, 0x2129 },   .{ 0x212E, 0x212E },   .{ 0x213A, 0x213B },
-        .{ 0x2140, 0x2144 },   .{ 0x214A, 0x214D },    .{ 0x214F, 0x214F },   .{ 0x218A, 0x245F },   .{ 0x249C, 0x24E9 },
-        .{ 0x2500, 0x2775 },   .{ 0x2794, 0x2BFF },    .{ 0x2CE5, 0x2CEA },   .{ 0x2CF9, 0x2CFF },   .{ 0x2DE0, 0x2E7F },
-        .{ 0x2E80, 0x2FFF },   .{ 0x3001, 0x3004 },    .{ 0x3008, 0x3020 },   .{ 0x302A, 0x3030 },   .{ 0x3036, 0x3037 },
-        .{ 0x303D, 0x303F },   .{ 0x3099, 0x309C },    .{ 0x30A0, 0x30A0 },   .{ 0x30FB, 0x30FB },   .{ 0x3190, 0x3191 },
-        .{ 0x3196, 0x319F },   .{ 0x31C0, 0x31E3 },    .{ 0x3200, 0x321E },   .{ 0x322A, 0x3247 },   .{ 0x3250, 0x3250 },
-        .{ 0x3260, 0x327F },   .{ 0x328A, 0x32B0 },    .{ 0x32C0, 0x33FF },   .{ 0x4DC0, 0x4DFF },   .{ 0xA490, 0xA4C6 },
-        .{ 0xA4FE, 0xA4FF },   .{ 0xA60D, 0xA60F },    .{ 0xA66F, 0xA67E },   .{ 0xA69E, 0xA69F },   .{ 0xA6F0, 0xA6F7 },
-        .{ 0xA700, 0xA716 },   .{ 0xA720, 0xA721 },    .{ 0xA789, 0xA78A },   .{ 0xA802, 0xA802 },   .{ 0xA806, 0xA806 },
-        .{ 0xA80B, 0xA80B },   .{ 0xA823, 0xA82B },    .{ 0xA874, 0xA877 },   .{ 0xA880, 0xA881 },   .{ 0xA8B4, 0xA8C5 },
-        .{ 0xA8CE, 0xA8CF },   .{ 0xA8E0, 0xA8F1 },    .{ 0xA8F8, 0xA8FA },   .{ 0xA8FC, 0xA8FC },   .{ 0xE000, 0xF8FF },
-        .{ 0xFB1E, 0xFB1E },   .{ 0xFB29, 0xFB29 },    .{ 0xFD3E, 0xFD3F },   .{ 0xFDFC, 0xFDFF },   .{ 0xFE00, 0xFE6F },
-        .{ 0xFEFF, 0xFEFF },   .{ 0xFF01, 0xFF0F },    .{ 0xFF1A, 0xFF20 },   .{ 0xFF3B, 0xFF40 },   .{ 0xFF5B, 0xFF65 },
-        .{ 0xFFE0, 0xFFFD },   .{ 0x1D000, 0x1D245 },  .{ 0x1D360, 0x1D378 }, .{ 0x1F000, 0x1F0FF }, .{ 0x1F10D, 0x1FAFF },
-        .{ 0xE0000, 0xE01EF }, .{ 0xF0000, 0x10FFFF },
+        .{ 0x200B, 0x2027 },     .{ 0x2030, 0x205E },     .{ 0x2060, 0x206F },     .{ 0x207A, 0x207E },
+        .{ 0x208A, 0x208E },     .{ 0x20A0, 0x20FF },
+        // Letterlike symbols, arrows, misc technical, geometric shapes, dingbats
+        .{ 0x2100, 0x2101 },     .{ 0x2103, 0x2106 },     .{ 0x2108, 0x2109 },     .{ 0x2114, 0x2114 },
+        .{ 0x2116, 0x2118 },     .{ 0x211E, 0x2123 },     .{ 0x2125, 0x2125 },     .{ 0x2127, 0x2127 },
+        .{ 0x2129, 0x2129 },     .{ 0x212E, 0x212E },     .{ 0x213A, 0x213B },     .{ 0x2140, 0x2144 },
+        .{ 0x214A, 0x214D },     .{ 0x214F, 0x214F },     .{ 0x218A, 0x245F },     .{ 0x249C, 0x24E9 },
+        .{ 0x2500, 0x2775 },     .{ 0x2794, 0x2BFF },     .{ 0x2CE5, 0x2CEA },     .{ 0x2CF9, 0x2CFF },
+        .{ 0x2DE0, 0x2E7F },     .{ 0x2E80, 0x2FFF },     .{ 0x3001, 0x3004 },     .{ 0x3008, 0x3020 },
+        .{ 0x302A, 0x3030 },     .{ 0x3036, 0x3037 },     .{ 0x303D, 0x303F },     .{ 0x3099, 0x309C },
+        .{ 0x30A0, 0x30A0 },     .{ 0x30FB, 0x30FB },     .{ 0x3190, 0x3191 },     .{ 0x3196, 0x319F },
+        .{ 0x31C0, 0x31E3 },     .{ 0x3200, 0x321E },     .{ 0x322A, 0x3247 },     .{ 0x3250, 0x3250 },
+        .{ 0x3260, 0x327F },     .{ 0x328A, 0x32B0 },     .{ 0x32C0, 0x33FF },     .{ 0x4DC0, 0x4DFF },
+        .{ 0xA490, 0xA4C6 },     .{ 0xA4FE, 0xA4FF },     .{ 0xA60D, 0xA60F },     .{ 0xA66F, 0xA67E },
+        .{ 0xA69E, 0xA69F },     .{ 0xA6F0, 0xA6F7 },     .{ 0xA700, 0xA716 },     .{ 0xA720, 0xA721 },
+        .{ 0xA789, 0xA78A },     .{ 0xA802, 0xA802 },     .{ 0xA806, 0xA806 },     .{ 0xA80B, 0xA80B },
+        .{ 0xA823, 0xA82B },     .{ 0xA874, 0xA877 },     .{ 0xA880, 0xA881 },     .{ 0xA8B4, 0xA8C5 },
+        .{ 0xA8CE, 0xA8CF },     .{ 0xA8E0, 0xA8F1 },     .{ 0xA8F8, 0xA8FA },     .{ 0xA8FC, 0xA8FC },
+        .{ 0xE000, 0xF8FF },     .{ 0xFB1E, 0xFB1E },     .{ 0xFB29, 0xFB29 },     .{ 0xFD3E, 0xFD3F },
+        .{ 0xFDFC, 0xFDFF },     .{ 0xFE00, 0xFE6F },     .{ 0xFEFF, 0xFEFF },     .{ 0xFF01, 0xFF0F },
+        .{ 0xFF1A, 0xFF20 },     .{ 0xFF3B, 0xFF40 },     .{ 0xFF5B, 0xFF65 },     .{ 0xFFE0, 0xFFFD },
+        .{ 0x16FE0, 0x16FE4 },   .{ 0x1BC9D, 0x1BC9F },   .{ 0x1D000, 0x1D245 },   .{ 0x1D360, 0x1D378 },
+        .{ 0x1DA9F, 0x1DAAF },   .{ 0x1F000, 0x1F0FF },   .{ 0x1F10D, 0x1FBFF },   .{ 0xE0000, 0xE01EF },
+        .{ 0xF0000, 0x10FFFF },
     })) return .other;
     return .letter;
 }
@@ -703,4 +862,72 @@ test "llama3 pre-tokenizer splits like the reference regex" {
         try std.testing.expectEqual(cs.out.len, got.items.len);
         for (cs.out, got.items) |e, g| try std.testing.expectEqualStrings(e, g);
     }
+}
+
+test "Unicode classification covers expanded categories with fast binary search" {
+    // Letters (ASCII, Cyrillic, Latin-1 supplement)
+    try std.testing.expectEqual(Class.letter, classify('A'));
+    try std.testing.expectEqual(Class.letter, classify('z'));
+    try std.testing.expectEqual(Class.letter, classify(0x041F)); // 'П'
+    try std.testing.expectEqual(Class.letter, classify(0x0456)); // 'і'
+
+    // Spaces
+    try std.testing.expectEqual(Class.space, classify(' '));
+    try std.testing.expectEqual(Class.space, classify('\t'));
+    try std.testing.expectEqual(Class.space, classify(0x00A0)); // NBSP
+    try std.testing.expectEqual(Class.space, classify(0x2003)); // EM SPACE
+    try std.testing.expectEqual(Class.space, classify(0x3000)); // IDEOGRAPHIC SPACE
+
+    // Numbers (ASCII, full-width, Indic, Adlam, Mayan)
+    try std.testing.expectEqual(Class.number, classify('0'));
+    try std.testing.expectEqual(Class.number, classify('9'));
+    try std.testing.expectEqual(Class.number, classify(0xFF15)); // Fullwidth '５'
+    try std.testing.expectEqual(Class.number, classify(0x0661)); // Arabic-Indic digit 1
+    try std.testing.expectEqual(Class.number, classify(0x1E950)); // Adlam digit 0
+    try std.testing.expectEqual(Class.number, classify(0x1D2E0)); // Mayan numeral 0
+
+    // Punctuation and symbols
+    try std.testing.expectEqual(Class.other, classify('!'));
+    try std.testing.expectEqual(Class.other, classify(0x1F600)); // 😀
+    try std.testing.expectEqual(Class.other, classify(0x1F3FB)); // Emoji modifier (skin tone)
+    try std.testing.expectEqual(Class.other, classify(0x1F1FA)); // Regional indicator 'U'
+    try std.testing.expectEqual(Class.other, classify(0x1FB00)); // Symbols for Legacy Computing
+}
+
+test "BPE priority queue matches linear merge on long token sequences" {
+    const gpa = std.testing.allocator;
+
+    var tok: Tokenizer = undefined;
+    tok.merges = .empty;
+    defer tok.merges.deinit(gpa);
+
+    // Populate a test merge vocabulary
+    // Tokens:
+    // 1 + 2 -> 10 (rank 0)
+    // 10 + 3 -> 11 (rank 1)
+    // 4 + 5 -> 12 (rank 2)
+    // 12 + 6 -> 13 (rank 3)
+    // 11 + 13 -> 14 (rank 4)
+    try tok.merges.put(gpa, Tokenizer.pairKey(1, 2), .{ .rank = 0, .id = 10 });
+    try tok.merges.put(gpa, Tokenizer.pairKey(10, 3), .{ .rank = 1, .id = 11 });
+    try tok.merges.put(gpa, Tokenizer.pairKey(4, 5), .{ .rank = 2, .id = 12 });
+    try tok.merges.put(gpa, Tokenizer.pairKey(12, 6), .{ .rank = 3, .id = 13 });
+    try tok.merges.put(gpa, Tokenizer.pairKey(11, 13), .{ .rank = 4, .id = 14 });
+
+    // Build a sequence with > 16 tokens to trigger the priority queue branch:
+    // [1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6] (length = 18)
+    const base_pat = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    var syms_pq: std.ArrayList(u32) = .empty;
+    defer syms_pq.deinit(gpa);
+    for (0..3) |_| try syms_pq.appendSlice(gpa, &base_pat);
+
+    try tok.bpeMerge(gpa, &syms_pq);
+
+    // Each block [1, 2, 3, 4, 5, 6] should merge to 14:
+    // 1+2->10, 10+3->11, 4+5->12, 12+6->13, 11+13->14
+    // So 3 blocks of 14:
+    try std.testing.expectEqual(@as(usize, 3), syms_pq.items.len);
+    try std.testing.expectEqual(@as(u32, 14), syms_pq.items[0]);
+    try std.testing.expectEqual(@as(u32, 14), syms_pq.items[1]);
+    try std.testing.expectEqual(@as(u32, 14), syms_pq.items[2]);
 }
