@@ -6,6 +6,9 @@ const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const sampler_mod = @import("sampler.zig");
 pub const grammar_mod = @import("grammar.zig");
 
+/// Global flag for graceful interrupt (SIGINT/Ctrl+C) during generation.
+pub var interrupted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
 /// Monotonic stopwatch on the Io awake clock.
 pub const Timer = struct {
     io: std.Io,
@@ -436,7 +439,8 @@ pub const Gen = struct {
             g.prompt_cache_save = null;
         }
 
-        // Tokens emitted by this call: `n` limits every call on its own.
+        // Tokens emitted by this call: `n` limits every call on its own (0 = unlimited).
+        const max_new = if (n == 0) std.math.maxInt(usize) else n;
         var n_run: usize = 0;
         if (g.json_validator) |*jv| {
             jv.applyMask(logits, g.tok, g.tok.eos);
@@ -456,7 +460,11 @@ pub const Gen = struct {
         var tree_pending_len: usize = 0;
         var tree_pending_buf: [sampler_mod.max_branch_len]u32 = undefined;
 
-        while (n_run < n and g.st.pos < g.st.ctx) {
+        while (n_run < max_new and g.st.pos < g.st.ctx) {
+            if (interrupted.load(.monotonic)) {
+                interrupted.store(false, .monotonic);
+                break;
+            }
             const current_max_k = if (g.draft_adaptive) adaptive.nextDraft() else g.draft_k;
             const max_draft = @min(current_max_k, max_spec_draft);
             const d = g.draft_st;
@@ -536,7 +544,7 @@ pub const Gen = struct {
                     const res = g.smp.sampleWithMargin(l);
                     const pred = res.tok;
                     last_margin = res.margin;
-                    if (pred == draft_buf[accepted_count] and !g.tok.isEog(pred) and n_run < n) {
+                    if (pred == draft_buf[accepted_count] and !g.tok.isEog(pred) and n_run < max_new) {
                         try g.take(sink, history, pred, &n_run);
                         g.stats.n_accepted += 1;
                     } else {
@@ -578,7 +586,10 @@ pub const Gen = struct {
                     } else dst.pos = g.st.pos;
                 }
 
-                if (n_run >= n) break;
+                if (n_run >= max_new or interrupted.load(.monotonic)) {
+                    if (interrupted.load(.monotonic)) interrupted.store(false, .monotonic);
+                    break;
+                }
                 const next_tok = next_cur.?;
                 if (g.tok.isEog(next_tok)) {
                     g.stats.t_gen_ns += timer.lap();

@@ -14,7 +14,7 @@ const usage =
     \\
     \\  -p, --prompt TEXT     prompt text (special tokens like <|eot_id|> are parsed)
     \\  -f, --file PATH       read prompt from file
-    \\  -n, --predict N       max tokens to generate (default 256)
+    \\  -n, --predict N       max tokens to generate (default: 256 for prompt, unlimited for --chat; -1 or 0 = unlimited)
     \\  --chat                interactive chat using the model's chat template
     \\  -s, --system TEXT     system message for --chat
     \\  --no-think            start assistant turns with an empty think block (Qwen3, LFM3)
@@ -71,7 +71,7 @@ const Args = struct {
     prompt_cache: ?[]const u8 = null,
     prompt_cache_all: bool = false,
     system: ?[]const u8 = null,
-    n_predict: usize = 256,
+    n_predict: ?usize = null,
     chat: bool = false,
     no_think: bool = false,
     json: bool = false,
@@ -139,7 +139,12 @@ fn parseArgs(argv: []const [:0]const u8) Args {
         } else if (r.is(&.{ "-s", "--system" })) {
             a.system = r.str();
         } else if (r.is(&.{ "-n", "--predict" })) {
-            a.n_predict = r.uint();
+            const s = r.str();
+            if (std.mem.eql(u8, s, "-1") or std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "inf")) {
+                a.n_predict = 0;
+            } else {
+                a.n_predict = std.fmt.parseInt(usize, s, 10) catch fail("bad number '{s}'", .{s});
+            }
         } else if (r.is(&.{ "-t", "--threads" })) {
             a.threads = r.uint();
         } else if (r.is(&.{"--no-pin"})) {
@@ -250,6 +255,10 @@ const Out = struct {
         };
     }
 };
+
+fn sigHandler(_: std.posix.SIG) callconv(.c) void {
+    gen_mod.interrupted.store(true, .monotonic);
+}
 
 pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.smp_allocator;
@@ -365,6 +374,12 @@ pub fn main(init: std.process.Init) !void {
     defer tokens.deinit(gpa);
 
     if (args.chat) {
+        var cur_n_predict: usize = args.n_predict orelse 0;
+        if (@hasDecl(std.posix, "sigaction") and @hasDecl(std.posix, "SIG")) {
+            var act: std.posix.Sigaction = std.mem.zeroes(std.posix.Sigaction);
+            act.handler = .{ .handler = sigHandler };
+            std.posix.sigaction(std.posix.SIG.INT, &act, null);
+        }
         const tpl: chat_mod.Template = .detect(&tok);
         const has_think = chat_mod.hasThinkSwitch(&tok, model.file.getString("tokenizer.chat_template"));
         var in_buf: [64 * 1024]u8 = undefined;
@@ -394,10 +409,10 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print(
             \\
             \\  \x1b[1;36mzinfer interactive chat\x1b[0m
-            \\  template: \x1b[33m{s}\x1b[0m | cache: \x1b[35m{s}\x1b[0m | threads: {d}
-            \\  Type \x1b[32m/help\x1b[0m for commands, \x1b[31m/quit\x1b[0m or Ctrl-D to exit.
+            \\  template: \x1b[33m{s}\x1b[0m | cache: \x1b[35m{s}\x1b[0m | threads: {d} | limit: {s}
+            \\  Type \x1b[32m/help\x1b[0m for commands, Ctrl+C to stop generation, \x1b[31m/quit\x1b[0m or Ctrl-D to exit.
             \\
-        , .{ @tagName(tpl), @tagName(st.cache_type), pool.nth });
+        , .{ @tagName(tpl), @tagName(st.cache_type), pool.nth, if (cur_n_predict == 0) "unlimited" else "custom" });
         while (true) {
             std.debug.print("\n\x1b[1;32mUser>\x1b[0m ", .{});
             const line = (stdin.interface.takeDelimiter('\n') catch null) orelse break;
@@ -439,6 +454,27 @@ pub fn main(init: std.process.Init) !void {
                     pending = null;
                     std.debug.print("context cleared.\n", .{});
                     continue;
+                } else if (std.mem.startsWith(u8, cmd, "/predict") or std.mem.startsWith(u8, cmd, "/tokens")) {
+                    var pit = std.mem.tokenizeScalar(u8, msg, ' ');
+                    _ = pit.next();
+                    if (pit.next()) |val| {
+                        if (std.mem.eql(u8, val, "-1") or std.mem.eql(u8, val, "0") or std.mem.eql(u8, val, "inf")) {
+                            cur_n_predict = 0;
+                            std.debug.print("token limit per turn: unlimited (until EOS or context full)\n", .{});
+                        } else if (std.fmt.parseInt(usize, val, 10)) |p_val| {
+                            cur_n_predict = p_val;
+                            std.debug.print("token limit per turn set to {d}\n", .{cur_n_predict});
+                        } else |_| {
+                            std.debug.print("invalid number '{s}'. Usage: /predict [N|0|-1]\n", .{val});
+                        }
+                    } else {
+                        if (cur_n_predict == 0) {
+                            std.debug.print("current token limit: unlimited (until EOS or context full)\n", .{});
+                        } else {
+                            std.debug.print("current token limit: {d} tokens per turn\n", .{cur_n_predict});
+                        }
+                    }
+                    continue;
                 } else if (std.mem.eql(u8, cmd, "/stats")) {
                     gen.report();
                     std.debug.print("cached tokens: {d}, pos: {d}/{d}\n", .{ gen.cached.items.len, st.pos, st.ctx });
@@ -446,6 +482,7 @@ pub fn main(init: std.process.Init) !void {
                 } else if (std.mem.eql(u8, cmd, "/help")) {
                     std.debug.print(
                         \\Commands:
+                        \\  /predict [N]   Set max tokens per turn (0 or -1 for unlimited)
                         \\  /save [path]   Save current KV cache and token history to file
                         \\  /load [path]   Load KV cache and token history from file
                         \\  /reset, /clear Reset context and start a new conversation
@@ -466,6 +503,13 @@ pub fn main(init: std.process.Init) !void {
             if (pending) |p| {
                 try tokens.append(gpa, p);
                 try text.appendSlice(gpa, tpl.turnSeparator());
+            } else if (!first) {
+                if (tok.eog.len > 0) {
+                    try tokens.append(gpa, tok.eog[0]);
+                } else if (tok.eos) |eos| {
+                    try tokens.append(gpa, eos);
+                }
+                try text.appendSlice(gpa, tpl.turnSeparator());
             }
             if (first) {
                 try chat.begin();
@@ -476,7 +520,7 @@ pub fn main(init: std.process.Init) !void {
             try tok.encode(gpa, text.items, first, true, &tokens);
             first = false;
             std.debug.print("\x1b[1;35mAssistant>\x1b[0m ", .{});
-            pending = gen.run(tokens.items, args.n_predict, out) catch |e| blk: {
+            pending = gen.run(tokens.items, cur_n_predict, out) catch |e| blk: {
                 if (e != error.ContextFull) return e;
                 std.debug.print("\n[context full: pos {d}/{d}. Attempting context shift...]\n", .{ st.pos, st.ctx });
                 if (gen.cached.items.len > 64) {
@@ -495,7 +539,7 @@ pub fn main(init: std.process.Init) !void {
                     try shifted.appendSlice(gpa, gen.cached.items[tail_start..]);
                     try shifted.appendSlice(gpa, tokens.items);
                     gen.reset();
-                    break :blk gen.run(shifted.items, args.n_predict, out) catch |e2| {
+                    break :blk gen.run(shifted.items, cur_n_predict, out) catch |e2| {
                         std.debug.print("\n[StreamingLLM context shift failed: {s}. Use /reset or /clear to restart]\n", .{@errorName(e2)});
                         continue;
                     };
@@ -547,7 +591,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try out.emit(prompt);
-    _ = try gen.runPrompt(tokens.items, args.n_predict, out);
+    _ = try gen.runPrompt(tokens.items, args.n_predict orelse 256, out);
 
     if (args.prompt_cache) |cp| {
         if (args.prompt_cache_all) {
