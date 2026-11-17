@@ -232,9 +232,18 @@ fn samplingParams(cli: SamplingArgs, f: *const gguf.File, default_seed: u64) sam
 /// Best-effort stdout sink for Gen.run: a closed stdout must not abort generation.
 const Out = struct {
     w: *std.Io.Writer,
+    verbose: bool = false,
     pub fn emit(o: Out, bytes: []const u8) !void {
-        o.w.writeAll(bytes) catch {};
-        o.w.flush() catch {};
+        o.w.writeAll(bytes) catch |err| {
+            if (o.verbose and err != error.BrokenPipe) {
+                std.debug.print("\n[warning: stdout write failed: {s}]\n", .{@errorName(err)});
+            }
+        };
+        o.w.flush() catch |err| {
+            if (o.verbose and err != error.BrokenPipe) {
+                std.debug.print("\n[warning: stdout flush failed: {s}]\n", .{@errorName(err)});
+            }
+        };
     }
 };
 
@@ -322,7 +331,7 @@ pub fn main(init: std.process.Init) !void {
 
     var out_buf: [4096]u8 = undefined;
     var stdout: std.Io.File.Writer = .init(.stdout(), io, &out_buf);
-    const out: Out = .{ .w = &stdout.interface };
+    const out: Out = .{ .w = &stdout.interface, .verbose = args.verbose };
     var gen: gen_mod.Gen = .{
         .gpa = gpa,
         .io = io,

@@ -60,6 +60,7 @@ pub const Tokenizer = struct {
 
         const tok_arr = f.getArray("tokenizer.ggml.tokens") orelse return error.MissingTokenizer;
         const n = tok_arr.len;
+        if (n > std.math.maxInt(u32)) return error.VocabTooLarge;
         const vocab = try gpa.alloc([]const u8, n);
         errdefer gpa.free(vocab);
         var it = tok_arr.strings();
@@ -182,7 +183,8 @@ pub const Tokenizer = struct {
     }
 
     fn pairKey(a: u32, b: u32) u64 {
-        return (@as(u64, a) << 32) | b;
+        comptime std.debug.assert(@sizeOf(u32) * 2 == @sizeOf(u64));
+        return (@as(u64, a) << 32) | @as(u64, b);
     }
 
     fn isSpecial(t: TokType) bool {

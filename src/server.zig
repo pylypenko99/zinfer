@@ -1,3 +1,14 @@
+//! zinfer HTTP Inference Server (OpenAI & llama.cpp compatible)
+//!
+//! Architecture & Scope:
+//! - Intended for local development, CLI integrations, and single-tenant edge devices.
+//! - Pure Zig 0.17.1 with `link_libc = false` and direct system call execution.
+//! - Sequential request model: requests share the engine's KV cache and prefix history,
+//!   achieving high prefix hit rates across successive turns without context reallocation.
+//! - For multi-tenant concurrent production workloads, front with a load balancer / worker pool.
+//! - Supports SSE streaming (`/v1/chat/completions`), discovery endpoints (`/v1/models`, `/props`),
+//!   and graceful shutdown.
+
 const std = @import("std");
 const Io = std.Io;
 const gen_mod = @import("gen.zig");
@@ -9,21 +20,30 @@ pub const ServerConfig = struct {
     no_think: bool = false,
 };
 
+/// Global shutdown request flag for graceful termination
+pub var should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+pub fn requestShutdown() void {
+    should_stop.store(true, .release);
+}
+
 pub fn run(gpa: std.mem.Allocator, io: Io, g: *gen_mod.Gen, cfg: ServerConfig) !void {
     const addr = try Io.net.IpAddress.parseIp4("127.0.0.1", cfg.port);
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
     std.debug.print("zinfer server listening on http://127.0.0.1:{d}\n", .{cfg.port});
-    std.debug.print("Model ID: {s} (ctx={d})\n", .{ cfg.model_id, g.st.ctx });
+    std.debug.print("Architecture: single-tenant edge server (ctx={d})\n", .{g.st.ctx});
+    std.debug.print("Model ID: {s}\n", .{cfg.model_id});
     if (g.draft_st != null) {
         std.debug.print("speculative decoding: draft model, {d} tokens per round\n", .{g.draft_k});
     } else if (g.draft_k > 0) {
         std.debug.print("speculative decoding: n-gram lookup, up to {d} tokens\n", .{g.draft_k});
     }
 
-    while (true) {
+    while (!should_stop.load(.acquire)) {
         var stream = server.accept(io) catch |err| {
+            if (should_stop.load(.acquire)) break;
             std.debug.print("accept error: {s}\n", .{@errorName(err)});
             continue;
         };
@@ -35,6 +55,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, g: *gen_mod.Gen, cfg: ServerConfig) !
             }
         };
     }
+    std.debug.print("zinfer server stopped gracefully.\n", .{});
 }
 
 fn handleConnection(

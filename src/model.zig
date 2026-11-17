@@ -2189,6 +2189,8 @@ pub const State = struct {
     logits: []f32,
     rope_cs: []f32,
     rope_cs_swa: []f32,
+    /// NTK-aware scaled inverse frequencies when context extends beyond training window
+    inv_freq: []f32 = &.{},
     /// Per (attention layer, kv head) byte region: K and V in tiles of 16
     /// positions. f16: hd*16 f16 values per tile (V row-major). q8_0: hd*17
     /// bytes per tile (32 i8 values + 16 f16 scales per 32 head dims).
@@ -2350,6 +2352,19 @@ pub const State = struct {
             s.coarse_scores = &.{};
             s.cands = &.{};
         }
+
+        // NTK-aware scaled RoPE for extended context beyond training length
+        if (s.ctx > c.ctx_train and c.ctx_train > 0 and c.n_rot > 2 and model.inv_freq.len > 0) {
+            const alpha = @as(f64, @floatFromInt(s.ctx)) / @as(f64, @floatFromInt(c.ctx_train));
+            const dim: f64 = @floatFromInt(c.n_rot);
+            const ntk_exponent = dim / (dim - 2.0);
+            const base_ntk: f32 = @floatCast(@as(f64, c.rope_base) * std.math.pow(f64, alpha, ntk_exponent));
+            s.inv_freq = try gpa.alloc(f32, model.inv_freq.len);
+            Model.ropeFreqs(base_ntk, c.rope_scale, null, s.inv_freq);
+        } else {
+            s.inv_freq = &.{};
+        }
+
         return s;
     }
 
@@ -2369,6 +2384,7 @@ pub const State = struct {
         gpa.free(s.v_cache);
         if (s.coarse_scores.len > 0) gpa.free(s.coarse_scores);
         if (s.cands.len > 0) gpa.free(s.cands);
+        if (s.inv_freq.len > 0) gpa.free(s.inv_freq);
     }
     /// Forget the context (KV cache positions and convolution state).
     pub fn reset(s: *State) void {
@@ -2456,9 +2472,10 @@ pub const State = struct {
         const half_swa = n_rot_swa / 2;
         for (0..ntok) |t| {
             const p: f32 = @floatFromInt(pos0 + t);
-            if (m.inv_freq.len > 0) {
+            const freqs = if (s.inv_freq.len > 0) s.inv_freq else m.inv_freq;
+            if (freqs.len > 0) {
                 const cs = s.rope_cs[t * n_rot ..];
-                for (m.inv_freq, 0..) |f, i| {
+                for (freqs, 0..) |f, i| {
                     const a = p * f;
                     cs[i] = @cos(a);
                     cs[half + i] = @sin(a);
@@ -4334,4 +4351,68 @@ test "PMM adaptive scale and asymmetric shift estimator on symmetric vs skewed d
     var sc_q4: f16 = undefined;
     quantBlock32_q4(&skewed_xs, &q4, &sc_q4);
     try std.testing.expect(sc_q4 > 0);
+}
+
+test "RoPE mathematical reference and NTK-aware frequency scaling" {
+    // 1. Orthogonality and norm preservation of RoPE rotation
+    const hd = 64;
+    const half = hd / 2;
+    var v: [hd]f32 = undefined;
+    for (&v, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i)) * 0.1 - 3.2;
+
+    var norm_before: f32 = 0;
+    for (v) |x| norm_before += x * x;
+
+    const angle: f32 = 0.785398; // pi / 4
+    const cos_a = @cos(angle);
+    const sin_a = @sin(angle);
+
+    var v_rot: [hd]f32 = undefined;
+    for (0..half) |i| {
+        const a = v[i];
+        const b = v[i + half];
+        v_rot[i] = a * cos_a - b * sin_a;
+        v_rot[i + half] = a * sin_a + b * cos_a;
+    }
+
+    var norm_after: f32 = 0;
+    for (v_rot) |x| norm_after += x * x;
+
+    try std.testing.expectApproxEqRel(norm_before, norm_after, 1e-5);
+
+    // 2. NTK-aware base frequency scaling verification
+    const base: f32 = 10000.0;
+    const ctx_train: usize = 4096;
+    const ctx_ext: usize = 16384; // 4x extension
+    const alpha: f64 = @as(f64, @floatFromInt(ctx_ext)) / @as(f64, @floatFromInt(ctx_train));
+    const dim: f64 = @floatFromInt(hd);
+    const ntk_exponent = dim / (dim - 2.0);
+    const base_ntk = @as(f64, base) * std.math.pow(f64, alpha, ntk_exponent);
+
+    try std.testing.expect(base_ntk > base);
+    try std.testing.expect(base_ntk > 40000.0);
+}
+
+test "SwiGLU and GeLU FFN mathematical reference" {
+    // 1. SiLU: x * sigmoid(x)
+    const x0: f32 = 0.0;
+    const silu0 = x0 / (1.0 + @exp(-x0));
+    try std.testing.expectEqual(@as(f32, 0.0), silu0);
+
+    const x2: f32 = 2.0;
+    const silu2 = x2 / (1.0 + @exp(-x2));
+    try std.testing.expect(silu2 > 1.76 and silu2 < 1.77);
+
+    // 2. SwiGLU: silu(gate) * up
+    const gate_val: f32 = 1.0;
+    const up_val: f32 = 3.0;
+    const swiglu = (gate_val / (1.0 + @exp(-gate_val))) * up_val;
+    try std.testing.expect(swiglu > 2.19 and swiglu < 2.20);
+
+    // 3. GeLU negative suppression threshold (predictive sparsity zone)
+    // For x <= -4.0, 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) is tiny
+    const neg: f32 = -5.0;
+    const inner = 0.79788456 * (neg + 0.044715 * neg * neg * neg);
+    const gelu_neg = 0.5 * neg * (1.0 + std.math.tanh(inner));
+    try std.testing.expect(@abs(gelu_neg) < 1e-4);
 }
