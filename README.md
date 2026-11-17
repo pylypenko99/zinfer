@@ -6,6 +6,7 @@
 *Zero dependencies · No libc · Прямі системні виклики · 20–50% швидше за llama.cpp*
 
 [![Zig](https://img.shields.io/badge/Zig-0.17.1-orange?logo=zig&logoColor=white)](https://ziglang.org/)
+[![CI](https://github.com/pylypenko99/zinfer/actions/workflows/ci.yml/badge.svg)](https://github.com/pylypenko99/zinfer/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Dependencies](https://img.shields.io/badge/Dependencies-0%20(no%20libc)-brightgreen)](#архітектура)
 [![Speedup](https://img.shields.io/badge/vs%20llama.cpp-+20%E2%80%9350%25-success)](#швидкість-і-бенчмарки)
