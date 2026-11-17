@@ -147,11 +147,7 @@ pub const Pool = struct {
         if (pin) pinCurrentThread(self.cpu_map[0]);
 
         var spawned: usize = 0;
-        errdefer {
-            self.shutdown(spawned);
-            gpa.free(self.threads);
-            gpa.free(self.cpu_map);
-        }
+        errdefer self.shutdown(spawned);
         while (spawned < nth - 1) : (spawned += 1) {
             const tid = spawned + 1;
             self.threads[spawned] = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, worker, .{ self, tid, pin });

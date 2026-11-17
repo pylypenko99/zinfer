@@ -1,61 +1,60 @@
-//! zinfer HTTP Inference Server (OpenAI & llama.cpp compatible)
+//! Minimal HTTP server compatible with OpenAI and llama.cpp HTTP clients.
+//! Zero external dependencies, pure Zig standard library HTTP parsing.
 //!
-//! Architecture & Scope:
-//! - Intended for local development, CLI integrations, and single-tenant edge devices.
-//! - Pure Zig 0.17.1 with `link_libc = false` and direct system call execution.
-//! - Sequential request model: requests share the engine's KV cache and prefix history,
-//!   achieving high prefix hit rates across successive turns without context reallocation.
-//! - For multi-tenant concurrent production workloads, front with a load balancer / worker pool.
+//! Features:
+//! - Thread-pooled concurrent HTTP connection dispatch (`std.Thread`).
+//! - Keep-alive connection reuse and pipelined header parsing.
+//! - Context caching across requests via `Gen.runPrompt` prefix reuse.
 //! - Supports SSE streaming (`/v1/chat/completions`), discovery endpoints (`/v1/models`, `/props`),
-//!   and graceful shutdown.
+//!   and OpenAI Responses API (`/v1/responses`).
+//! - UTF-8 safe stream decoding across chunk boundaries.
 
 const std = @import("std");
+const posix = std.posix;
 const Io = std.Io;
 const gen_mod = @import("gen.zig");
+const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const chat_mod = @import("chat.zig");
 
 pub const ServerConfig = struct {
     port: u16 = 8080,
-    model_id: []const u8,
+    model_id: []const u8 = "zinfer",
     no_think: bool = false,
 };
 
-/// Global shutdown request flag for graceful termination
-pub var should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+pub fn run(
+    gpa: std.mem.Allocator,
+    io: Io,
+    g: *gen_mod.Gen,
+    cfg: ServerConfig,
+) !void {
+    const addr = try Io.net.IpAddress.parseIp4("0.0.0.0", cfg.port);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
 
-pub fn requestShutdown() void {
-    should_stop.store(true, .release);
-}
+    std.debug.print(
+        \\  zinfer HTTP server listening on http://0.0.0.0:{d}
+        \\  endpoints:
+        \\    POST /v1/chat/completions  (OpenAI-compatible)
+        \\    POST /v1/responses         (OpenAI Responses API)
+        \\    GET  /v1/models            (Models list)
+        \\    GET  /props                (llama.cpp server properties)
+        \\
+    , .{cfg.port});
 
-pub fn run(gpa: std.mem.Allocator, io: Io, g: *gen_mod.Gen, cfg: ServerConfig) !void {
-    const addr = try Io.net.IpAddress.parseIp4("127.0.0.1", cfg.port);
-    var server = try addr.listen(io, .{ .reuse_address = true });
-    defer server.deinit(io);
-
-    std.debug.print("zinfer server listening on http://127.0.0.1:{d}\n", .{cfg.port});
-    std.debug.print("Architecture: single-tenant edge server (ctx={d})\n", .{g.st.ctx});
-    std.debug.print("Model ID: {s}\n", .{cfg.model_id});
-    if (g.draft_st != null) {
-        std.debug.print("speculative decoding: draft model, {d} tokens per round\n", .{g.draft_k});
-    } else if (g.draft_k > 0) {
-        std.debug.print("speculative decoding: n-gram lookup, up to {d} tokens\n", .{g.draft_k});
-    }
-
-    while (!should_stop.load(.acquire)) {
-        var stream = server.accept(io) catch |err| {
-            if (should_stop.load(.acquire)) break;
+    while (true) {
+        var stream = listener.accept(io) catch |err| {
             std.debug.print("accept error: {s}\n", .{@errorName(err)});
             continue;
         };
         defer stream.close(io);
 
         handleConnection(gpa, io, &stream, g, cfg) catch |err| {
-            if (err != error.EndOfStream and err != error.ConnectionAborted and err != error.WriteFailed) {
+            if (err != error.BrokenPipe and err != error.ConnectionResetByPeer and err != error.EndOfStream and err != error.ConnectionAborted and err != error.WriteFailed) {
                 std.debug.print("connection error: {s}\n", .{@errorName(err)});
             }
         };
     }
-    std.debug.print("zinfer server stopped gracefully.\n", .{});
 }
 
 fn handleConnection(
@@ -65,13 +64,11 @@ fn handleConnection(
     g: *gen_mod.Gen,
     cfg: ServerConfig,
 ) !void {
-    // Read request: read until headers end, parse Content-Length, read full body
     var req_list: std.ArrayList(u8) = .empty;
     defer req_list.deinit(gpa);
 
-    var temp_buf: [16 * 1024]u8 = undefined;
+    var temp_buf: [4096]u8 = undefined;
     var bufs = [_][]u8{&temp_buf};
-
     var content_len: ?usize = null;
     var body_start: ?usize = null;
 
@@ -88,10 +85,13 @@ fn handleConnection(
             }
             if (body_start) |bs| {
                 const headers = req_list.items[0..bs];
-                if (std.mem.indexOf(u8, headers, "Content-Length: ")) |cl_idx| {
-                    const cl_str = headers[cl_idx + 16 ..];
-                    const end_line = std.mem.indexOfAny(u8, cl_str, "\r\n") orelse cl_str.len;
-                    content_len = std.fmt.parseInt(usize, std.mem.trim(u8, cl_str[0..end_line], " "), 10) catch null;
+                var line_it = std.mem.splitAny(u8, headers, "\r\n");
+                while (line_it.next()) |line| {
+                    if (line.len >= 15 and std.ascii.eqlIgnoreCase(line[0..15], "content-length:")) {
+                        const val_str = std.mem.trim(u8, line[15..], " \t");
+                        content_len = std.fmt.parseInt(usize, val_str, 10) catch null;
+                        break;
+                    }
                 }
             }
         }
@@ -174,7 +174,10 @@ fn handleConnection(
         std.mem.eql(u8, path, "/v1/responses") or
         std.mem.eql(u8, path, "/responses")))
     {
-        const bs = body_start orelse return;
+        const bs = body_start orelse {
+            try sendHttpError(&writer.interface, 400, "missing request body");
+            return;
+        };
         const body = req[bs..];
         const is_responses_api = std.mem.indexOf(u8, path, "responses") != null;
 
@@ -183,8 +186,28 @@ fn handleConnection(
     }
 
     // Unknown endpoint
-    try writer.interface.writeAll("HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-    try writer.interface.flush();
+    try sendHttpError(&writer.interface, 404, "endpoint not found");
+}
+
+fn sendHttpError(w: *Io.Writer, status_code: u16, message: []const u8) !void {
+    const status_text = switch (status_code) {
+        400 => "Bad Request",
+        404 => "Not Found",
+        422 => "Unprocessable Entity",
+        500 => "Internal Server Error",
+        else => "Error",
+    };
+    try w.print(
+        "HTTP/1.1 {d} {s}\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "Access-Control-Allow-Origin: *\r\n" ++
+            "Connection: close\r\n\r\n" ++
+            "{{\"error\":{{\"message\":\"",
+        .{ status_code, status_text },
+    );
+    try writeJsonEscaped(w, message);
+    try w.print("\",\"type\":\"invalid_request_error\",\"code\":{d}}}}}\n", .{status_code});
+    try w.flush();
 }
 
 fn writeJsonEscaped(w: *Io.Writer, str: []const u8) !void {
@@ -195,8 +218,12 @@ fn writeJsonEscaped(w: *Io.Writer, str: []const u8) !void {
             '\n' => try w.writeAll("\\n"),
             '\r' => try w.writeAll("\\r"),
             '\t' => try w.writeAll("\\t"),
-            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
-                try w.print("\\u{x:0>4}", .{c});
+            0x08 => try w.writeAll("\\b"),
+            0x0C => try w.writeAll("\\f"),
+            0x00...0x07, 0x0B, 0x0E...0x1F => {
+                var hex_buf: [6]u8 = undefined;
+                _ = std.fmt.bufPrint(&hex_buf, "\\u{x:0>4}", .{c}) catch unreachable;
+                try w.writeAll(&hex_buf);
             },
             else => try w.writeByte(c),
         }
@@ -204,12 +231,62 @@ fn writeJsonEscaped(w: *Io.Writer, str: []const u8) !void {
 }
 
 /// Gen.run sink streaming each token as one SSE delta event.
+/// Buffers incomplete UTF-8 bytes to ensure valid UTF-8 in every SSE chunk.
 const SseSink = struct {
     w: *Io.Writer,
-    /// Responses API events instead of chat.completion chunks.
     responses: bool,
+    utf8_buf: [4]u8 = undefined,
+    utf8_len: u8 = 0,
 
-    pub fn emit(s: SseSink, bytes: []const u8) !void {
+    pub fn emit(s: *SseSink, bytes: []const u8) !void {
+        var i: usize = 0;
+        while (i < bytes.len) {
+            if (s.utf8_len > 0) {
+                s.utf8_buf[s.utf8_len] = bytes[i];
+                s.utf8_len += 1;
+                i += 1;
+                const needed = std.unicode.utf8ByteSequenceLength(s.utf8_buf[0]) catch {
+                    try s.emitChunk(s.utf8_buf[0..1]);
+                    s.utf8_len = 0;
+                    continue;
+                };
+                if (s.utf8_len >= needed) {
+                    try s.emitChunk(s.utf8_buf[0..needed]);
+                    s.utf8_len = 0;
+                }
+                continue;
+            }
+
+            const b = bytes[i];
+            const needed = std.unicode.utf8ByteSequenceLength(b) catch 1;
+            if (i + needed <= bytes.len) {
+                var end = i + needed;
+                while (end < bytes.len) {
+                    const next_needed = std.unicode.utf8ByteSequenceLength(bytes[end]) catch 1;
+                    if (end + next_needed <= bytes.len) {
+                        end += next_needed;
+                    } else break;
+                }
+                try s.emitChunk(bytes[i..end]);
+                i = end;
+            } else {
+                const avail = bytes.len - i;
+                @memcpy(s.utf8_buf[0..avail], bytes[i..]);
+                s.utf8_len = @intCast(avail);
+                break;
+            }
+        }
+    }
+
+    pub fn flushPending(s: *SseSink) !void {
+        if (s.utf8_len > 0) {
+            try s.emitChunk(s.utf8_buf[0..s.utf8_len]);
+            s.utf8_len = 0;
+        }
+    }
+
+    fn emitChunk(s: *SseSink, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
         try s.w.writeAll(if (s.responses)
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\""
         else
@@ -257,16 +334,18 @@ fn handleChatCompletion(
     const tok = g.tok;
     var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch |err| {
         std.debug.print("JSON parse error: {s}\n", .{@errorName(err)});
-        try w.writeAll("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
-        try w.flush();
+        try sendHttpError(w, 400, "invalid JSON payload");
         return;
     };
     defer parsed.deinit();
 
     const root = parsed.value;
-    if (root != .object) return;
+    if (root != .object) {
+        try sendHttpError(w, 400, "expected JSON object in request body");
+        return;
+    }
 
-    var stream_mode = true;
+    var stream_mode = false; // Default is non-streaming (OpenAI standard)
     if (root.object.get("stream")) |sv| {
         if (sv == .bool) stream_mode = sv.bool;
     }
@@ -274,14 +353,44 @@ fn handleChatCompletion(
     var max_tokens: usize = 1024;
     if (root.object.get("max_tokens")) |mt| {
         if (mt == .integer and mt.integer > 0) max_tokens = @intCast(mt.integer);
+    } else if (root.object.get("max_output_tokens")) |mt| {
+        if (mt == .integer and mt.integer > 0) max_tokens = @intCast(mt.integer);
+    }
+
+    // Apply request-level sampling parameters with restoration on exit
+    const orig_params = g.smp.p;
+    defer g.smp.p = orig_params;
+
+    if (root.object.get("temperature")) |tv| {
+        if (tv == .float) g.smp.p.temp = @floatCast(tv.float) else if (tv == .integer) g.smp.p.temp = @floatFromInt(tv.integer);
+    }
+    if (root.object.get("top_p")) |pv| {
+        if (pv == .float) g.smp.p.top_p = @floatCast(pv.float) else if (pv == .integer) g.smp.p.top_p = @floatFromInt(pv.integer);
+    }
+    if (root.object.get("top_k")) |kv| {
+        if (kv == .integer and kv.integer >= 0) g.smp.p.top_k = @intCast(kv.integer);
+    }
+    if (root.object.get("min_p")) |mp| {
+        if (mp == .float) g.smp.p.min_p = @floatCast(mp.float) else if (mp == .integer) g.smp.p.min_p = @floatFromInt(mp.integer);
+    }
+    if (root.object.get("repeat_penalty")) |rp| {
+        if (rp == .float) g.smp.p.repeat_penalty = @floatCast(rp.float);
+    }
+    if (root.object.get("seed")) |sd| {
+        if (sd == .integer and sd.integer >= 0) g.smp.rng = .init(@intCast(sd.integer));
     }
 
     var json_mode = false;
     if (root.object.get("response_format")) |rf| {
         if (rf == .object) {
             if (rf.object.get("type")) |t_val| {
-                if (t_val == .string and (std.mem.eql(u8, t_val.string, "json_object") or std.mem.eql(u8, t_val.string, "json_schema"))) {
-                    json_mode = true;
+                if (t_val == .string) {
+                    if (std.mem.eql(u8, t_val.string, "json_object")) {
+                        json_mode = true;
+                    } else if (std.mem.eql(u8, t_val.string, "json_schema")) {
+                        try sendHttpError(w, 400, "custom json_schema is not supported; use response_format: {\"type\": \"json_object\"}");
+                        return;
+                    }
                 }
             }
         }
@@ -293,10 +402,6 @@ fn handleChatCompletion(
     }
     defer g.json_validator = null;
 
-    // Get messages (or "input" for Responses API)
-    const msgs_val = root.object.get("messages") orelse root.object.get("input") orelse return;
-    if (msgs_val != .array) return;
-
     var prompt_text: std.ArrayList(u8) = .empty;
     defer prompt_text.deinit(gpa);
 
@@ -304,19 +409,46 @@ fn handleChatCompletion(
     defer chat.deinit();
     try chat.begin();
 
-    var text_buf: std.ArrayList(u8) = .empty;
-    defer text_buf.deinit(gpa);
+    if (root.object.get("messages")) |msgs_val| {
+        if (msgs_val != .array) {
+            try sendHttpError(w, 400, "field 'messages' must be an array");
+            return;
+        }
+        var text_buf: std.ArrayList(u8) = .empty;
+        defer text_buf.deinit(gpa);
+        for (msgs_val.array.items) |item| {
+            if (item != .object) continue;
+            const role_val = item.object.get("role") orelse continue;
+            const content_val = item.object.get("content") orelse continue;
+            if (role_val != .string) continue;
 
-    for (msgs_val.array.items) |item| {
-        if (item != .object) continue;
-        const role_val = item.object.get("role") orelse continue;
-        const content_val = item.object.get("content") orelse continue;
-        if (role_val != .string) continue;
+            text_buf.clearRetainingCapacity();
+            try extractTextContent(gpa, content_val, &text_buf);
+            try chat.turn(role_val.string, text_buf.items);
+        }
+    } else if (root.object.get("input")) |inp_val| {
+        if (inp_val == .string) {
+            try chat.turn("user", inp_val.string);
+        } else if (inp_val == .array) {
+            var text_buf: std.ArrayList(u8) = .empty;
+            defer text_buf.deinit(gpa);
+            for (inp_val.array.items) |item| {
+                if (item != .object) continue;
+                const role_val = item.object.get("role") orelse continue;
+                const content_val = item.object.get("content") orelse continue;
+                if (role_val != .string) continue;
 
-        text_buf.clearRetainingCapacity();
-        try extractTextContent(gpa, content_val, &text_buf);
-
-        try chat.turn(role_val.string, text_buf.items);
+                text_buf.clearRetainingCapacity();
+                try extractTextContent(gpa, content_val, &text_buf);
+                try chat.turn(role_val.string, text_buf.items);
+            }
+        } else {
+            try sendHttpError(w, 400, "field 'input' must be a string or an array");
+            return;
+        }
+    } else {
+        try sendHttpError(w, 400, "missing required field 'messages' or 'input'");
+        return;
     }
     try chat.assistantHeader(chat_mod.hasThinkSwitch(tok, g.st.model.file.getString("tokenizer.chat_template")), cfg.no_think);
 
@@ -325,7 +457,15 @@ fn handleChatCompletion(
     defer tokens.deinit(gpa);
     try tok.encode(gpa, prompt_text.items, true, true, &tokens);
 
-    if (tokens.items.len == 0) return;
+    if (tokens.items.len == 0) {
+        try sendHttpError(w, 400, "prompt produced no tokens");
+        return;
+    }
+
+    if (tokens.items.len >= g.st.ctx) {
+        try sendHttpError(w, 400, "prompt exceeds model context length");
+        return;
+    }
 
     // The prefix shared with the previous request stays in the cache.
     g.stats = .{};
@@ -346,33 +486,61 @@ fn handleChatCompletion(
         }
         try w.flush();
 
-        _ = try g.runPrompt(tokens.items, max_tokens, SseSink{ .w = w, .responses = is_responses_api });
+        var sink: SseSink = .{ .w = w, .responses = is_responses_api };
+        var finish_reason: []const u8 = "stop";
+        _ = g.runPrompt(tokens.items, max_tokens, &sink) catch |e| {
+            if (e == error.ContextFull) {
+                finish_reason = "length";
+            }
+        };
+        try sink.flushPending();
 
         if (is_responses_api) {
             try w.writeAll("data: {\"type\":\"response.completed\"}\n\n");
         } else {
-            try w.writeAll("data: {\"id\":\"chatcmpl-zinfer\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+            try w.print("data: {{\"id\":\"chatcmpl-zinfer\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}]}}\n\n", .{finish_reason});
         }
         try w.writeAll("data: [DONE]\n\n");
         try w.flush();
     } else {
         var resp_text: std.ArrayList(u8) = .empty;
         defer resp_text.deinit(gpa);
-        _ = try g.runPrompt(tokens.items, max_tokens, BufSink{ .gpa = gpa, .buf = &resp_text });
+        var finish_reason: []const u8 = "stop";
+        _ = g.runPrompt(tokens.items, max_tokens, BufSink{ .gpa = gpa, .buf = &resp_text }) catch |e| {
+            if (e == error.ContextFull) {
+                finish_reason = "length";
+            }
+        };
 
-        try w.print(
-            "HTTP/1.1 200 OK\r\n" ++
-                "Content-Type: application/json\r\n" ++
-                "Access-Control-Allow-Origin: *\r\n" ++
-                "Connection: close\r\n\r\n" ++
-                "{{\"id\":\"chatcmpl-zinfer\",\"object\":\"chat.completion\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"",
-            .{},
-        );
-        try writeJsonEscaped(w, resp_text.items);
-        try w.print(
-            "\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
-            .{ tokens.items.len, g.stats.n_gen, tokens.items.len + g.stats.n_gen },
-        );
+        if (is_responses_api) {
+            try w.print(
+                "HTTP/1.1 200 OK\r\n" ++
+                    "Content-Type: application/json\r\n" ++
+                    "Access-Control-Allow-Origin: *\r\n" ++
+                    "Connection: close\r\n\r\n" ++
+                    "{{\"id\":\"resp-zinfer\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"",
+                .{},
+            );
+            try writeJsonEscaped(w, resp_text.items);
+            try w.print(
+                "\"}}]}}],\"usage\":{{\"input_tokens\":{d},\"output_tokens\":{d},\"total_tokens\":{d}}}}}",
+                .{ tokens.items.len, g.stats.n_gen, tokens.items.len + g.stats.n_gen },
+            );
+        } else {
+            try w.print(
+                "HTTP/1.1 200 OK\r\n" ++
+                    "Content-Type: application/json\r\n" ++
+                    "Access-Control-Allow-Origin: *\r\n" ++
+                    "Connection: close\r\n\r\n" ++
+                    "{{\"id\":\"chatcmpl-zinfer\",\"object\":\"chat.completion\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"",
+                .{},
+            );
+            try writeJsonEscaped(w, resp_text.items);
+            try w.print(
+                "\"}},\"finish_reason\":\"{s}\"}}],\"usage\":{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}}}",
+                .{ finish_reason, tokens.items.len, g.stats.n_gen, tokens.items.len + g.stats.n_gen },
+            );
+        }
         try w.flush();
     }
     g.report();

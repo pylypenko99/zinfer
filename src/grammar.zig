@@ -1,5 +1,5 @@
 //! Zero-allocation JSON Schema and Grammar-Constrained Logit Masking for zinfer.
-//! Enforces valid JSON syntax (objects, arrays, strings, numbers, booleans, null)
+//! Enforces RFC 8259-compliant JSON syntax (objects, arrays, strings, numbers, booleans, null)
 //! directly during token sampling by setting logits of invalid tokens to -infinity.
 
 const std = @import("std");
@@ -11,23 +11,57 @@ pub const ContainerType = enum {
 };
 
 pub const State = enum {
-    start, // Waiting for '{' (or '[' if root is array)
-    obj_expect_key_or_close, // Expecting '"' key or '}'
-    inside_key, // Inside key string until unescaped '"'
-    obj_expect_colon, // Expecting ':'
-    expect_value, // Expecting any value: '"', '{', '[', number, true, false, null
-    inside_str_value, // Inside string value until unescaped '"'
-    inside_num_value, // Inside number
-    inside_literal, // Inside true, false, null
-    expect_comma_or_close, // Expecting ',' or '}' / ']'
-    finished, // Root container closed, only whitespace / EOS allowed
+    start,                   // Waiting for '{' (or '[' if root is array)
+    obj_expect_key_or_close, // Expecting '"' key or '}' (only right after '{')
+    obj_expect_key_only,     // Expecting '"' key (after comma; trailing comma '}' is forbidden)
+    inside_key,              // Inside key string until unescaped '"'
+    obj_expect_colon,        // Expecting ':'
+    expect_value,            // Expecting any value: '"', '{', '[', number, true, false, null
+    arr_expect_val_or_close, // Expecting value or ']' (only right after '[')
+    inside_str_value,        // Inside string value until unescaped '"'
+    inside_num,              // Inside number
+    inside_literal,          // Inside true, false, null
+    expect_comma_or_close,   // Expecting ',' or '}' / ']'
+    finished,                // Root container closed, only whitespace / EOS allowed
 };
+
+pub const EscapeState = enum {
+    none,
+    escaped, // Just read '\'
+    hex1,    // After '\u'
+    hex2,    // After '\uX'
+    hex3,    // After '\uXX'
+    hex4,    // After '\uXXX'
+};
+
+pub const NumState = enum {
+    minus,       // Just read '-'
+    zero,        // Read '0' (can be followed by '.' or 'e'/'E', or end)
+    int_digits,  // Read '1'..'9' (can be followed by more digits, '.', 'e'/'E', or end)
+    dot,         // Just read '.' (MUST be followed by at least one digit)
+    frac_digits, // Read digit after '.' (can be followed by more digits, 'e'/'E', or end)
+    exp,         // Just read 'e' or 'E' (can be followed by '+', '-', or digit)
+    exp_sign,    // Just read '+' or '-' after 'e'/'E' (MUST be followed by at least one digit)
+    exp_digits,  // Read digit in exponent (can be followed by more digits, or end)
+
+    pub fn canTerminate(self: NumState) bool {
+        return switch (self) {
+            .zero, .int_digits, .frac_digits, .exp_digits => true,
+            .minus, .dot, .exp, .exp_sign => false,
+        };
+    }
+};
+
+inline fn isHex(b: u8) bool {
+    return (b >= '0' and b <= '9') or (b >= 'a' and b <= 'f') or (b >= 'A' and b <= 'F');
+}
 
 pub const JsonValidator = struct {
     state: State = .start,
     depth: usize = 0,
     stack: [64]ContainerType = undefined,
-    in_escape: bool = false,
+    escape_state: EscapeState = .none,
+    num_state: NumState = .zero,
     lit_expected: [8]u8 = undefined,
     lit_len: u8 = 0,
     lit_idx: u8 = 0,
@@ -43,6 +77,117 @@ pub const JsonValidator = struct {
 
     pub fn isFinished(self: *const JsonValidator) bool {
         return self.state == .finished and self.depth == 0;
+    }
+
+    fn stepString(self: *JsonValidator, b: u8, next_state: State) bool {
+        switch (self.escape_state) {
+            .none => {
+                if (b == '\\') {
+                    self.escape_state = .escaped;
+                    return true;
+                }
+                if (b == '"') {
+                    self.state = next_state;
+                    return true;
+                }
+                // Control characters (< 0x20) in JSON strings are forbidden unless escaped
+                if (b < 0x20) return false;
+                return true;
+            },
+            .escaped => {
+                // RFC 8259: valid escapes are ", \, /, b, f, n, r, t, u
+                if (b == '"' or b == '\\' or b == '/' or b == 'b' or b == 'f' or b == 'n' or b == 'r' or b == 't') {
+                    self.escape_state = .none;
+                    return true;
+                }
+                if (b == 'u') {
+                    self.escape_state = .hex1;
+                    return true;
+                }
+                return false;
+            },
+            .hex1 => {
+                if (isHex(b)) {
+                    self.escape_state = .hex2;
+                    return true;
+                }
+                return false;
+            },
+            .hex2 => {
+                if (isHex(b)) {
+                    self.escape_state = .hex3;
+                    return true;
+                }
+                return false;
+            },
+            .hex3 => {
+                if (isHex(b)) {
+                    self.escape_state = .none;
+                    return true;
+                }
+                return false;
+            },
+            .hex4 => unreachable,
+        }
+    }
+
+    fn stepValueStart(self: *JsonValidator, b: u8) bool {
+        if (b == '"') {
+            self.escape_state = .none;
+            self.state = .inside_str_value;
+            return true;
+        }
+        if (b == '{') {
+            if (self.depth >= self.stack.len) return false;
+            self.stack[self.depth] = .object;
+            self.depth += 1;
+            self.state = .obj_expect_key_or_close;
+            return true;
+        }
+        if (b == '[') {
+            if (self.depth >= self.stack.len) return false;
+            self.stack[self.depth] = .array;
+            self.depth += 1;
+            self.state = .arr_expect_val_or_close;
+            return true;
+        }
+        if (b == '-') {
+            self.state = .inside_num;
+            self.num_state = .minus;
+            return true;
+        }
+        if (b == '0') {
+            self.state = .inside_num;
+            self.num_state = .zero;
+            return true;
+        }
+        if (b >= '1' and b <= '9') {
+            self.state = .inside_num;
+            self.num_state = .int_digits;
+            return true;
+        }
+        if (b == 't') {
+            @memcpy(self.lit_expected[0..4], "true");
+            self.lit_len = 4;
+            self.lit_idx = 1;
+            self.state = .inside_literal;
+            return true;
+        }
+        if (b == 'f') {
+            @memcpy(self.lit_expected[0..5], "false");
+            self.lit_len = 5;
+            self.lit_idx = 1;
+            self.state = .inside_literal;
+            return true;
+        }
+        if (b == 'n') {
+            @memcpy(self.lit_expected[0..4], "null");
+            self.lit_len = 4;
+            self.lit_idx = 1;
+            self.state = .inside_literal;
+            return true;
+        }
+        return false;
     }
 
     /// Feeds a single byte into the state machine.
@@ -62,7 +207,7 @@ pub const JsonValidator = struct {
                     if (self.depth >= self.stack.len) return false;
                     self.stack[self.depth] = .array;
                     self.depth += 1;
-                    self.state = .expect_value;
+                    self.state = .arr_expect_val_or_close;
                     return true;
                 }
                 return false;
@@ -77,7 +222,18 @@ pub const JsonValidator = struct {
                     return true;
                 }
                 if (b == '"') {
-                    self.in_escape = false;
+                    self.escape_state = .none;
+                    self.state = .inside_key;
+                    return true;
+                }
+                return false;
+            },
+
+            .obj_expect_key_only => {
+                if (b == ' ' or b == '\t' or b == '\n' or b == '\r') return true;
+                // Trailing comma before '}' is forbidden by RFC 8259
+                if (b == '"') {
+                    self.escape_state = .none;
                     self.state = .inside_key;
                     return true;
                 }
@@ -85,21 +241,7 @@ pub const JsonValidator = struct {
             },
 
             .inside_key => {
-                if (self.in_escape) {
-                    self.in_escape = false;
-                    return true;
-                }
-                if (b == '\\') {
-                    self.in_escape = true;
-                    return true;
-                }
-                if (b == '"') {
-                    self.state = .obj_expect_colon;
-                    return true;
-                }
-                // Control characters < 0x20 in JSON strings must be escaped
-                if (b < 0x20) return false;
-                return true;
+                return self.stepString(b, .obj_expect_colon);
             },
 
             .obj_expect_colon => {
@@ -111,97 +253,102 @@ pub const JsonValidator = struct {
                 return false;
             },
 
-            .expect_value => {
+            .arr_expect_val_or_close => {
                 if (b == ' ' or b == '\t' or b == '\n' or b == '\r') return true;
-                if (self.depth > 0 and self.stack[self.depth - 1] == .array and b == ']') {
-                    // Empty array close
+                if (b == ']') {
+                    // Empty array []
+                    if (self.depth == 0) return false;
                     self.depth -= 1;
                     self.state = if (self.depth == 0) .finished else .expect_comma_or_close;
                     return true;
                 }
-                if (b == '"') {
-                    self.in_escape = false;
-                    self.state = .inside_str_value;
-                    return true;
-                }
-                if (b == '{') {
-                    if (self.depth >= self.stack.len) return false;
-                    self.stack[self.depth] = .object;
-                    self.depth += 1;
-                    self.state = .obj_expect_key_or_close;
-                    return true;
-                }
-                if (b == '[') {
-                    if (self.depth >= self.stack.len) return false;
-                    self.stack[self.depth] = .array;
-                    self.depth += 1;
-                    self.state = .expect_value;
-                    return true;
-                }
-                if (b == '-' or (b >= '0' and b <= '9')) {
-                    self.state = .inside_num_value;
-                    return true;
-                }
-                if (b == 't') {
-                    // "true"
-                    @memcpy(self.lit_expected[0..4], "true");
-                    self.lit_len = 4;
-                    self.lit_idx = 1;
-                    self.state = .inside_literal;
-                    return true;
-                }
-                if (b == 'f') {
-                    // "false"
-                    @memcpy(self.lit_expected[0..5], "false");
-                    self.lit_len = 5;
-                    self.lit_idx = 1;
-                    self.state = .inside_literal;
-                    return true;
-                }
-                if (b == 'n') {
-                    // "null"
-                    @memcpy(self.lit_expected[0..4], "null");
-                    self.lit_len = 4;
-                    self.lit_idx = 1;
-                    self.state = .inside_literal;
-                    return true;
-                }
-                return false;
+                return self.stepValueStart(b);
+            },
+
+            .expect_value => {
+                if (b == ' ' or b == '\t' or b == '\n' or b == '\r') return true;
+                return self.stepValueStart(b);
             },
 
             .inside_str_value => {
-                if (self.in_escape) {
-                    self.in_escape = false;
-                    return true;
-                }
-                if (b == '\\') {
-                    self.in_escape = true;
-                    return true;
-                }
-                if (b == '"') {
-                    self.state = .expect_comma_or_close;
-                    return true;
-                }
-                if (b < 0x20) return false;
-                return true;
+                return self.stepString(b, .expect_comma_or_close);
             },
 
-            .inside_num_value => {
-                if ((b >= '0' and b <= '9') or b == '.' or b == 'e' or b == 'E' or b == '+' or b == '-') {
-                    return true;
+            .inside_num => {
+                switch (self.num_state) {
+                    .minus => {
+                        if (b == '0') {
+                            self.num_state = .zero;
+                            return true;
+                        }
+                        if (b >= '1' and b <= '9') {
+                            self.num_state = .int_digits;
+                            return true;
+                        }
+                        return false;
+                    },
+                    .zero => {
+                        if (b == '.') {
+                            self.num_state = .dot;
+                            return true;
+                        }
+                        if (b == 'e' or b == 'E') {
+                            self.num_state = .exp;
+                            return true;
+                        }
+                        // Zero terminated by whitespace or delimiter
+                        return self.stepNumDelimiter(b);
+                    },
+                    .int_digits => {
+                        if (b >= '0' and b <= '9') return true;
+                        if (b == '.') {
+                            self.num_state = .dot;
+                            return true;
+                        }
+                        if (b == 'e' or b == 'E') {
+                            self.num_state = .exp;
+                            return true;
+                        }
+                        return self.stepNumDelimiter(b);
+                    },
+                    .dot => {
+                        if (b >= '0' and b <= '9') {
+                            self.num_state = .frac_digits;
+                            return true;
+                        }
+                        return false;
+                    },
+                    .frac_digits => {
+                        if (b >= '0' and b <= '9') return true;
+                        if (b == 'e' or b == 'E') {
+                            self.num_state = .exp;
+                            return true;
+                        }
+                        return self.stepNumDelimiter(b);
+                    },
+                    .exp => {
+                        if (b == '+' or b == '-') {
+                            self.num_state = .exp_sign;
+                            return true;
+                        }
+                        if (b >= '0' and b <= '9') {
+                            self.num_state = .exp_digits;
+                            return true;
+                        }
+                        return false;
+                    },
+                    .exp_sign => {
+                        if (b >= '0' and b <= '9') {
+                            self.num_state = .exp_digits;
+                            return true;
+                        }
+                        return false;
+                    },
+                    .exp_digits => {
+                        if (b >= '0' and b <= '9') return true;
+                        return self.stepNumDelimiter(b);
+                    },
                 }
-                // Number terminated by comma, close, or whitespace
-                if (b == ' ' or b == '\t' or b == '\n' or b == '\r') {
-                    self.state = .expect_comma_or_close;
-                    return true;
-                }
-                if (b == ',') {
-                    return self.transitionComma();
-                }
-                if (b == '}' or b == ']') {
-                    return self.transitionClose(b);
-                }
-                return false;
             },
 
             .inside_literal => {
@@ -233,11 +380,26 @@ pub const JsonValidator = struct {
         }
     }
 
+    fn stepNumDelimiter(self: *JsonValidator, b: u8) bool {
+        if (!self.num_state.canTerminate()) return false;
+        if (b == ' ' or b == '\t' or b == '\n' or b == '\r') {
+            self.state = .expect_comma_or_close;
+            return true;
+        }
+        if (b == ',') {
+            return self.transitionComma();
+        }
+        if (b == '}' or b == ']') {
+            return self.transitionClose(b);
+        }
+        return false;
+    }
+
     fn transitionComma(self: *JsonValidator) bool {
         if (self.depth == 0) return false;
         const cur = self.stack[self.depth - 1];
         if (cur == .object) {
-            self.state = .obj_expect_key_or_close;
+            self.state = .obj_expect_key_only; // Trailing comma forbidden
             return true;
         } else {
             self.state = .expect_value;
@@ -330,4 +492,22 @@ test "JsonValidator valid and invalid sequences" {
     var jv_nested = JsonValidator.initObjectOnly();
     try std.testing.expect(jv_nested.consume("{\"items\": [1, 2, {\"sub\": null}]}"));
     try std.testing.expect(jv_nested.isFinished());
+
+    // Finding 8 checks:
+    // 1. Incomplete number {"x":-}
+    var jv_minus = JsonValidator.initObjectOnly();
+    try std.testing.expect(!jv_minus.consume("{\"x\":-}"));
+
+    // 2. Trailing comma {"x":1,}
+    var jv_trail = JsonValidator.initObjectOnly();
+    try std.testing.expect(!jv_trail.consume("{\"x\":1,}"));
+
+    // 3. Illegal escape {"x":"\q"}
+    var jv_esc = JsonValidator.initObjectOnly();
+    try std.testing.expect(!jv_esc.consume("{\"x\":\"\\q\"}"));
+
+    // 4. Valid escapes and unicode
+    var jv_valid_esc = JsonValidator.initObjectOnly();
+    try std.testing.expect(jv_valid_esc.consume("{\"text\": \"hello\\nworld\\u12af\\\"\"}"));
+    try std.testing.expect(jv_valid_esc.isFinished());
 }

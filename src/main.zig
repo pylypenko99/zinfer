@@ -20,7 +20,7 @@ const usage =
     \\  --no-think            start assistant turns with an empty think block (Qwen3, LFM3)
     \\  -t, --threads N       worker threads (default: physical cores)
     \\  -c, --ctx N           context length (default: min(4096, trained))
-    \\  -b, --batch N         prompt batch size (default 64)
+    \\  -b, --batch N         prompt batch size (default 512)
     \\
     \\sampling (defaults: the model's general.sampling.* metadata, else the values shown)
     \\  --temp F              temperature, 0 = greedy (0.8)
@@ -83,7 +83,7 @@ const Args = struct {
     threads: usize = 0,
     pin: bool = true,
     ctx: usize = 0,
-    batch: usize = 64,
+    batch: usize = 512,
     sampling: SamplingArgs = .{},
     load: model_mod.LoadOptions = .{},
     cache_type: model_mod.CacheType = .f16,

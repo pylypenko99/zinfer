@@ -231,6 +231,7 @@ pub const Model = struct {
     per_layer_proj_norm: ?[]const f32 = null,
     out_norm: []const f32,
     layers: []Layer,
+    n_initialized_layers: usize = 0,
     inv_freq: []f32,
     /// RoPE frequencies of sliding-window layers (empty when there are none).
     inv_freq_swa: []f32 = &.{},
@@ -254,6 +255,7 @@ pub const Model = struct {
             .output = undefined,
             .out_norm = &.{},
             .layers = &.{},
+            .n_initialized_layers = 0,
             .inv_freq = &.{},
         };
         errdefer self.deinit(gpa);
@@ -267,13 +269,13 @@ pub const Model = struct {
     pub fn deinit(self: *Model, gpa: Allocator) void {
         for (self.owned.items) |b| gpa.free(b);
         self.owned.deinit(gpa);
-        for (self.layers) |*L| {
+        for (self.layers[0..self.n_initialized_layers]) |*L| {
             switch (L.ffn) {
                 .dense => {},
                 .moe => |*m| gpa.free(m.experts),
             }
         }
-        gpa.free(self.layers);
+        if (self.layers.len > 0) gpa.free(self.layers);
         gpa.free(self.inv_freq);
         gpa.free(self.inv_freq_swa);
         if (self.weights) |w| posix.munmap(w);
@@ -603,6 +605,8 @@ pub const Model = struct {
             self.per_layer_proj_norm = try self.vector(gpa, "per_layer_proj_norm.weight", c.n_embd_per_layer);
         }
         self.layers = try gpa.alloc(Layer, c.n_layers);
+        @memset(std.mem.sliceAsBytes(self.layers), 0);
+        self.n_initialized_layers = 0;
         if (c.n_layers > max_layers) return error.InvalidConfig;
         var nb: [256]u8 = undefined;
         var kv_source: [max_layers]usize = undefined;
@@ -744,6 +748,11 @@ pub const Model = struct {
                 const l_n_rot = if (c.arch == .gemma4 and is_swa) c.n_rot_swa else c.n_rot;
                 const l_attn_scale: f32 = if (c.arch == .gemma4) 1.0 else 1.0 / @sqrt(@as(f32, @floatFromInt(l_hd)));
 
+                if (c.arch == .deepseek2 or self.file.tensors.contains(n(&nb, i, "attn_kv_a_mqa.weight"))) {
+                    std.log.err("DeepSeek MLA latent projections (attn_kv_a_mqa) detected on layer {d}. Full end-to-end MLA graph execution is under development.", .{i});
+                    return error.UnsupportedArchitecture;
+                }
+
                 L.mixer = .{ .attention = .{
                     .wq = try self.tensor(n(&nb, i, "attn_q.weight"), c.dim, l_q_dim),
                     .wk = try self.tensor(n(&nb, i, "attn_k.weight"), c.dim, l_kv_dim),
@@ -772,6 +781,7 @@ pub const Model = struct {
                 L.per_layer_post_norm = try self.optVector(gpa, n(&nb, i, "post_norm.weight"), c.dim);
                 L.layer_output_scale = self.optScalar(n(&nb, i, "layer_output_scale.weight"));
             }
+            self.n_initialized_layers += 1;
         }
     }
 
@@ -1385,9 +1395,9 @@ fn attnWorker(job: *AttnJob, _: usize, _: usize) void {
     };
 }
 
-fn reduceFlashDecoding(s: *State, n_chunks: usize) void {
+fn reduceFlashDecoding(s: *State, head_dim: usize, q_dim: usize, n_chunks: usize) void {
     const c = &s.model.cfg;
-    attention.reduceFlashDecoding(s.att.f.ptr, s.flash_o.ptr, s.flash_m, s.flash_l, c.n_heads, c.head_dim, c.q_dim, n_chunks);
+    attention.reduceFlashDecoding(s.att.f.ptr, s.flash_o.ptr, s.flash_m, s.flash_l, c.n_heads, head_dim, q_dim, n_chunks);
 }
 
 pub const State = struct {
@@ -1531,7 +1541,7 @@ pub const State = struct {
                 .attention => |*A| {
                     if (A.has_kv) {
                         const is_swa = A.swa and c.swa_window > 0;
-                        const tiles = if (is_swa) (c.swa_window + kv_tile - 1) / kv_tile + 1 else s.ctx_pad / kv_tile;
+                        const tiles = if (is_swa) (c.swa_window + batch_cap + kv_tile - 1) / kv_tile + 1 else s.ctx_pad / kv_tile;
                         const k_tile_bytes: usize = switch (cache_type) {
                             .f16 => A.head_dim * 32,
                             .q8_0 => A.head_dim * 17,
@@ -1966,7 +1976,7 @@ pub const State = struct {
         s.pool.run(&aj, attnWorker);
 
         if (flash_chunks > 1) {
-            reduceFlashDecoding(s, flash_chunks);
+            reduceFlashDecoding(s, A.head_dim, A.q_dim, flash_chunks);
         }
 
         if (A.gate != null) {

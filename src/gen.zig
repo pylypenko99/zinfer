@@ -103,6 +103,8 @@ pub const Gen = struct {
     /// generation.
     fn reusablePrefix(g: *const Gen, prompt: []const u32) usize {
         if (prompt.len == 0) return 0;
+        // If sliding-window attention has wrapped around, earlier keys are overwritten in ring buffer
+        if (g.st.model.cfg.swa_window > 0 and g.st.pos > g.st.model.cfg.swa_window) return 0;
         const shared = std.mem.indexOfDiff(u32, g.cached.items, prompt) orelse prompt.len;
         const limit = @min(shared, prompt.len - 1);
         if (g.st.conv_state.len == 0 or limit == g.st.pos) return limit;
@@ -123,7 +125,9 @@ pub const Gen = struct {
             g.n_snaps = keep - g.snap_pos + 1;
         }
         // The draft mirrors the target cache and has no short-conv layers.
-        if (g.draft_st) |d| d.truncate(keep, &.{});
+        if (g.draft_st) |d| {
+            if (keep <= d.pos) d.truncate(keep, &.{}) else d.reset();
+        }
         g.cached.shrinkRetainingCapacity(keep);
     }
 
@@ -179,21 +183,22 @@ pub const Gen = struct {
             try writer.interface.writeAll(slice);
         }
 
-        const tb_k: usize = switch (st.cache_type) {
-            .f16 => c.head_dim * 32,
-            .q8_0 => c.head_dim * 17,
-            .q4_0 => c.head_dim * 9,
-            .q2_0, .q2_k => c.head_dim * 5,
-        };
-        const tb_v: usize = switch (st.cache_type) {
-            .f16 => c.head_dim * 32,
-            .q8_0 => c.head_dim * 17,
-            .q4_0, .q2_k => c.head_dim * 9,
-            .q2_0 => c.head_dim * 5,
-        };
         for (st.model.layers) |*L| {
             switch (L.mixer) {
                 .attention => |*A| {
+                    const h_dim = if (A.head_dim > 0) A.head_dim else c.head_dim;
+                    const tb_k: usize = switch (st.cache_type) {
+                        .f16 => h_dim * 32,
+                        .q8_0 => h_dim * 17,
+                        .q4_0 => h_dim * 9,
+                        .q2_0, .q2_k => h_dim * 5,
+                    };
+                    const tb_v: usize = switch (st.cache_type) {
+                        .f16 => h_dim * 32,
+                        .q8_0 => h_dim * 17,
+                        .q4_0, .q2_k => h_dim * 9,
+                        .q2_0 => h_dim * 5,
+                    };
                     const is_swa = A.swa and c.swa_window > 0;
                     const max_tiles = st.slot_tiles[A.kv_slot];
                     const tiles = if (st.pos == 0) 0 else if (is_swa) @min(max_tiles, (st.pos + model_mod.kv_tile - 1) / model_mod.kv_tile) else (st.pos + model_mod.kv_tile - 1) / model_mod.kv_tile;
@@ -262,22 +267,23 @@ pub const Gen = struct {
             hasher.update(slice);
         }
 
-        const tb_k: usize = switch (st.cache_type) {
-            .f16 => c.head_dim * 32,
-            .q8_0 => c.head_dim * 17,
-            .q4_0 => c.head_dim * 9,
-            .q2_0, .q2_k => c.head_dim * 5,
-        };
-        const tb_v: usize = switch (st.cache_type) {
-            .f16 => c.head_dim * 32,
-            .q8_0 => c.head_dim * 17,
-            .q4_0, .q2_k => c.head_dim * 9,
-            .q2_0 => c.head_dim * 5,
-        };
         const pos: usize = @intCast(hdr.pos);
         for (st.model.layers) |*L| {
             switch (L.mixer) {
                 .attention => |*A| {
+                    const h_dim = if (A.head_dim > 0) A.head_dim else c.head_dim;
+                    const tb_k: usize = switch (st.cache_type) {
+                        .f16 => h_dim * 32,
+                        .q8_0 => h_dim * 17,
+                        .q4_0 => h_dim * 9,
+                        .q2_0, .q2_k => h_dim * 5,
+                    };
+                    const tb_v: usize = switch (st.cache_type) {
+                        .f16 => h_dim * 32,
+                        .q8_0 => h_dim * 17,
+                        .q4_0, .q2_k => h_dim * 9,
+                        .q2_0 => h_dim * 5,
+                    };
                     const is_swa = A.swa and c.swa_window > 0;
                     const max_tiles = st.slot_tiles[A.kv_slot];
                     const tiles = if (pos == 0) 0 else if (is_swa) @min(max_tiles, (pos + model_mod.kv_tile - 1) / model_mod.kv_tile) else (pos + model_mod.kv_tile - 1) / model_mod.kv_tile;
@@ -302,14 +308,20 @@ pub const Gen = struct {
         reader.interface.readSliceAll(std.mem.asBytes(&stored_checksum)) catch |e| switch (e) {
             error.EndOfStream => {
                 st.pos = pos;
-                if (g.draft_st) |d| d.reset();
+                if (g.draft_st) |d| {
+                    d.reset();
+                    if (g.cached.items.len > 0) _ = d.forwardN(g.cached.items, 0) catch {};
+                }
                 return;
             },
             else => return e,
         };
         if (stored_checksum != hasher.final()) return error.InvalidCacheChecksum;
         st.pos = pos;
-        if (g.draft_st) |d| d.reset();
+        if (g.draft_st) |d| {
+            d.reset();
+            if (g.cached.items.len > 0) _ = d.forwardN(g.cached.items, 0) catch {};
+        }
     }
 
     /// Feed `prompt[keep..]` to a cache that ends with `prompt[0..keep]`, then
@@ -712,6 +724,7 @@ test "saveCache and loadCache roundtrip" {
             .swa = false,
             .n_kv_heads = 1,
             .kv_slot = 0,
+            .head_dim = 32,
         },
     };
     model.layers = (&layer)[0..1];
