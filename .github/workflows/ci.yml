@@ -27,4 +27,4 @@ jobs:
         run: zig build -Doptimize=ReleaseFast
 
       - name: Run Test Suite
-        run: zig test -OReleaseFast -mcpu=native src/tests.zig
+        run: zig test -OReleaseSafe -mcpu=native src/tests.zig
