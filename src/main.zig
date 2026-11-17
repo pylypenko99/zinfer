@@ -303,10 +303,14 @@ pub fn main(init: std.process.Init) !void {
         }
         std.debug.print(" ({d:.0} ms load)\n", .{@as(f64, @floatFromInt(timer.read())) / 1e6});
         const l0 = &model.layers[0];
-        std.debug.print("layers: {d} attention + {d} short-conv | weights: ffn_up={s} ffn_down={s} output={s} layout={s}\n", .{
-            model.n_attn_layers,                                                                    model.n_conv_layers, @tagName(l0.w_up.typ), @tagName(l0.w_down.typ), @tagName(model.output.typ),
-            if (l0.w_up.x8) (if (model.output_coarse != null) "x8 (pruned)" else "x8") else "rows",
+        std.debug.print("layers: {d} attention + {d} short-conv | weights: ffn_up={s} ffn_down={s} output={s} layout={s}", .{
+            model.n_attn_layers,                                                                          model.n_conv_layers, @tagName(l0.ffnUp().typ), @tagName(l0.ffnDown().typ), @tagName(model.output.typ),
+            if (l0.ffnUp().x8) (if (model.output_coarse != null) "x8 (pruned)" else "x8") else "rows",
         });
+        if (c.n_experts > 0) {
+            std.debug.print(" | moe={d}x{d} (top-{d})", .{ c.n_experts, c.expert_feed_forward_length, c.n_experts_used });
+        }
+        std.debug.print("\n", .{});
         std.debug.print("sampling: temp={d} top_k={d} top_p={d} min_p={d} repeat_penalty={d}\n", .{ sp.temp, sp.top_k, sp.top_p, sp.min_p, sp.repeat_penalty });
     }
 

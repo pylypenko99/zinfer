@@ -17,7 +17,7 @@ const Chunks = pool_mod.Chunks;
 const GgmlType = gguf.GgmlType;
 const Allocator = std.mem.Allocator;
 
-pub const Arch = enum { llama, qwen2, qwen3, lfm2, lfm3, gemma3 };
+pub const Arch = enum { llama, qwen2, qwen3, lfm2, lfm3, gemma3, qwen2moe, mixtral, deepseek2 };
 pub const CacheType = enum(u32) { f16 = 0, q8_0 = 1, q4_0 = 2 };
 
 pub const Config = struct {
@@ -50,6 +50,12 @@ pub const Config = struct {
     attn_scale: f32 = 1,
     /// GELU-gated FFN (Gemma) instead of SiLU.
     gelu: bool = false,
+    /// MoE (Mixture of Experts) configuration (0 = dense model).
+    n_experts: usize = 0,
+    n_experts_used: usize = 0,
+    n_shared_experts: usize = 0,
+    expert_feed_forward_length: usize = 0,
+    expert_weights_scale: f32 = 1.0,
 };
 
 pub const Tensor = struct {
@@ -109,6 +115,29 @@ pub const ShortConv = struct {
     slot: usize,
 };
 
+pub const DenseFfn = struct {
+    w_gate: Tensor,
+    w_up: Tensor,
+    w_down: Tensor,
+};
+
+pub const Expert = struct {
+    w_gate: Tensor,
+    w_up: Tensor,
+    w_down: Tensor,
+};
+
+pub const MoEFfn = struct {
+    router: Tensor,
+    experts: []Expert,
+    shared: ?DenseFfn = null,
+};
+
+pub const Ffn = union(enum) {
+    dense: DenseFfn,
+    moe: MoEFfn,
+};
+
 pub const Layer = struct {
     attn_norm: []const f32,
     ffn_norm: []const f32,
@@ -116,9 +145,21 @@ pub const Layer = struct {
     post_mix_norm: ?[]const f32 = null,
     post_ffn_norm: ?[]const f32 = null,
     mixer: union(enum) { attention: Attention, shortconv: ShortConv },
-    w_gate: Tensor,
-    w_up: Tensor,
-    w_down: Tensor,
+    ffn: Ffn,
+
+    pub inline fn ffnUp(L: *const Layer) *const Tensor {
+        return switch (L.ffn) {
+            .dense => |*d| &d.w_up,
+            .moe => |*m| if (m.experts.len > 0) &m.experts[0].w_up else if (m.shared) |*s| &s.w_up else &m.router,
+        };
+    }
+
+    pub inline fn ffnDown(L: *const Layer) *const Tensor {
+        return switch (L.ffn) {
+            .dense => |*d| &d.w_down,
+            .moe => |*m| if (m.experts.len > 0) &m.experts[0].w_down else if (m.shared) |*s| &s.w_down else &m.router,
+        };
+    }
 };
 
 pub const LoadOptions = struct {
@@ -172,6 +213,12 @@ pub const Model = struct {
     pub fn deinit(self: *Model, gpa: Allocator) void {
         for (self.owned.items) |b| gpa.free(b);
         self.owned.deinit(gpa);
+        for (self.layers) |*L| {
+            switch (L.ffn) {
+                .dense => {},
+                .moe => |*m| gpa.free(m.experts),
+            }
+        }
         gpa.free(self.layers);
         gpa.free(self.inv_freq);
         gpa.free(self.inv_freq_swa);
@@ -196,7 +243,18 @@ pub const Model = struct {
                 },
                 .shortconv => |*C| try list.appendSlice(gpa, &.{ &C.in_proj, &C.out_proj }),
             }
-            try list.appendSlice(gpa, &.{ &L.w_gate, &L.w_up, &L.w_down });
+            switch (L.ffn) {
+                .dense => |*d| try list.appendSlice(gpa, &.{ &d.w_gate, &d.w_up, &d.w_down }),
+                .moe => |*m| {
+                    try list.append(gpa, &m.router);
+                    for (m.experts) |*exp| {
+                        try list.appendSlice(gpa, &.{ &exp.w_gate, &exp.w_up, &exp.w_down });
+                    }
+                    if (m.shared) |*sh| {
+                        try list.appendSlice(gpa, &.{ &sh.w_gate, &sh.w_up, &sh.w_down });
+                    }
+                },
+            }
         }
         try list.append(gpa, &self.output);
         return list.toOwnedSlice(gpa);
@@ -278,8 +336,10 @@ pub const Model = struct {
     fn readConfig(self: *Model) !void {
         const f = &self.file;
         const arch_s = f.getString("general.architecture") orelse return error.MissingArchitecture;
-        const arch = std.meta.stringToEnum(Arch, arch_s) orelse {
-            std.log.err("unsupported architecture '{s}' (supported: llama, qwen2, qwen3, lfm2, lfm3, gemma3)", .{arch_s});
+        const arch = std.meta.stringToEnum(Arch, arch_s) orelse if (std.mem.eql(u8, arch_s, "qwen2_moe"))
+            Arch.qwen2moe
+        else {
+            std.log.err("unsupported architecture '{s}' (supported: llama, qwen2, qwen3, lfm2, lfm3, gemma3, qwen2moe, mixtral, deepseek2)", .{arch_s});
             return error.UnsupportedArchitecture;
         };
         self.cfg.arch = arch;
@@ -325,6 +385,11 @@ pub const Model = struct {
         c.attn_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim)));
         c.embd_scale = if (arch == .gemma3) @sqrt(@as(f32, @floatFromInt(c.dim))) else 1;
         c.gelu = arch == .gemma3;
+        c.n_experts = @intCast(f.getUint(self.key(&kb, "expert_count")) orelse f.getUint("expert_count") orelse 0);
+        c.n_experts_used = @intCast(f.getUint(self.key(&kb, "expert_used_count")) orelse f.getUint("expert_used_count") orelse @min(c.n_experts, 2));
+        c.n_shared_experts = @intCast(f.getUint(self.key(&kb, "expert_shared_count")) orelse f.getUint("expert_shared_count") orelse 0);
+        c.expert_feed_forward_length = @intCast(f.getUint(self.key(&kb, "expert_feed_forward_length")) orelse c.ffn_dim);
+        c.expert_weights_scale = @floatCast(f.getFloat(self.key(&kb, "expert_weights_scale")) orelse 1.0);
         if (arch == .gemma3) {
             // gemma_pytorch: the 27B scales queries by 1 / sqrt(dim / n_heads).
             if (c.n_layers == 62) c.attn_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.dim / c.n_heads)));
@@ -432,15 +497,94 @@ pub const Model = struct {
                     return std.fmt.bufPrint(buf, "blk.{d}." ++ s, .{l}) catch unreachable;
                 }
             }.f;
+            var layer_ffn: Ffn = undefined;
+            if (c.n_experts > 0) {
+                var experts = try gpa.alloc(Expert, c.n_experts);
+                const gate_exps_name = n(&nb, i, "ffn_gate_exps.weight");
+                if (self.file.tensors.contains(gate_exps_name)) {
+                    const g_info = self.file.tensors.get(gate_exps_name).?;
+                    const u_info = self.file.tensors.get(n(&nb, i, "ffn_up_exps.weight")).?;
+                    const d_info = self.file.tensors.get(n(&nb, i, "ffn_down_exps.weight")).?;
+                    const g_row_bytes = g_info.typ.rowBytes(c.dim) orelse return error.UnsupportedQuantType;
+                    const u_row_bytes = u_info.typ.rowBytes(c.dim) orelse return error.UnsupportedQuantType;
+                    const d_row_bytes = d_info.typ.rowBytes(c.expert_feed_forward_length) orelse return error.UnsupportedQuantType;
+                    const g_slice_bytes = c.expert_feed_forward_length * g_row_bytes;
+                    const u_slice_bytes = c.expert_feed_forward_length * u_row_bytes;
+                    const d_slice_bytes = c.dim * d_row_bytes;
+
+                    for (0..c.n_experts) |e| {
+                        experts[e] = .{
+                            .w_gate = .{
+                                .typ = g_info.typ,
+                                .data = g_info.data.ptr + e * g_slice_bytes,
+                                .rows = c.expert_feed_forward_length,
+                                .cols = c.dim,
+                                .row_bytes = g_row_bytes,
+                            },
+                            .w_up = .{
+                                .typ = u_info.typ,
+                                .data = u_info.data.ptr + e * u_slice_bytes,
+                                .rows = c.expert_feed_forward_length,
+                                .cols = c.dim,
+                                .row_bytes = u_row_bytes,
+                            },
+                            .w_down = .{
+                                .typ = d_info.typ,
+                                .data = d_info.data.ptr + e * d_slice_bytes,
+                                .rows = c.dim,
+                                .cols = c.expert_feed_forward_length,
+                                .row_bytes = d_row_bytes,
+                            },
+                        };
+                    }
+                } else {
+                    for (0..c.n_experts) |e| {
+                        var eb: [96]u8 = undefined;
+                        const ne = struct {
+                            fn f(buf: []u8, l: usize, comptime s: []const u8, exp_idx: usize) []const u8 {
+                                return std.fmt.bufPrint(buf, "blk.{d}." ++ s ++ ".{d}.weight", .{ l, exp_idx }) catch unreachable;
+                            }
+                        }.f;
+                        experts[e] = .{
+                            .w_gate = try self.tensor(ne(&eb, i, "ffn_gate", e), c.dim, c.expert_feed_forward_length),
+                            .w_up = try self.tensor(ne(&eb, i, "ffn_up", e), c.dim, c.expert_feed_forward_length),
+                            .w_down = try self.tensor(ne(&eb, i, "ffn_down", e), c.expert_feed_forward_length, c.dim),
+                        };
+                    }
+                }
+                const router = try self.tensor(n(&nb, i, "ffn_gate_inp.weight"), c.dim, c.n_experts);
+                const shared_gate_name = n(&nb, i, "ffn_gate_shexp.weight");
+                const has_shexp = self.file.tensors.contains(shared_gate_name) or (c.n_shared_experts > 0 and self.file.tensors.contains(n(&nb, i, "ffn_gate.weight")));
+                const shared: ?DenseFfn = if (has_shexp) blk: {
+                    const sg_name = if (self.file.tensors.contains(shared_gate_name)) shared_gate_name else n(&nb, i, "ffn_gate.weight");
+                    const su_name = if (self.file.tensors.contains(n(&nb, i, "ffn_up_shexp.weight"))) n(&nb, i, "ffn_up_shexp.weight") else n(&nb, i, "ffn_up.weight");
+                    const sd_name = if (self.file.tensors.contains(n(&nb, i, "ffn_down_shexp.weight"))) n(&nb, i, "ffn_down_shexp.weight") else n(&nb, i, "ffn_down.weight");
+                    break :blk DenseFfn{
+                        .w_gate = try self.tensor(sg_name, c.dim, c.ffn_dim),
+                        .w_up = try self.tensor(su_name, c.dim, c.ffn_dim),
+                        .w_down = try self.tensor(sd_name, c.ffn_dim, c.dim),
+                    };
+                } else null;
+
+                layer_ffn = .{ .moe = .{
+                    .router = router,
+                    .experts = experts,
+                    .shared = shared,
+                } };
+            } else {
+                layer_ffn = .{ .dense = .{
+                    .w_gate = try self.tensor(n(&nb, i, "ffn_gate.weight"), c.dim, c.ffn_dim),
+                    .w_up = try self.tensor(n(&nb, i, "ffn_up.weight"), c.dim, c.ffn_dim),
+                    .w_down = try self.tensor(n(&nb, i, "ffn_down.weight"), c.ffn_dim, c.dim),
+                } };
+            }
             L.* = .{
                 .attn_norm = try self.vector(gpa, n(&nb, i, "attn_norm.weight"), c.dim),
                 .ffn_norm = try self.vector(gpa, n(&nb, i, "ffn_norm.weight"), c.dim),
                 .post_mix_norm = try self.optVector(gpa, n(&nb, i, "post_attention_norm.weight"), c.dim),
                 .post_ffn_norm = try self.optVector(gpa, n(&nb, i, "post_ffw_norm.weight"), c.dim),
                 .mixer = undefined,
-                .w_gate = try self.tensor(n(&nb, i, "ffn_gate.weight"), c.dim, c.ffn_dim),
-                .w_up = try self.tensor(n(&nb, i, "ffn_up.weight"), c.dim, c.ffn_dim),
-                .w_down = try self.tensor(n(&nb, i, "ffn_down.weight"), c.ffn_dim, c.dim),
+                .ffn = layer_ffn,
             };
             const kv = self.layerKvHeads(i);
             if (kv == 0) {
@@ -690,6 +834,7 @@ const MatJob = struct {
     outs: []const MatOut,
     act: *const Act,
     ntok: usize,
+    tok_offset: usize = 0,
     rows_chunk: usize,
     /// First chunk index of each output (prefix sums), len = outs.len + 1.
     first: [max_outs + 1]usize,
@@ -704,7 +849,7 @@ fn matWorker(job: *MatJob, _: usize, _: usize) void {
             const o = &job.outs[m];
             const r0 = (ci - job.first[m]) * job.rows_chunk;
             const r1 = @min(r0 + job.rows_chunk, o.w.rows);
-            rowsDispatch(o.accumulate, o.w, r0, r1, job.act, 0, job.ntok, o.out + r0, o.stride);
+            rowsDispatch(o.accumulate, o.w, r0, r1, job.act, job.tok_offset, job.tok_offset + job.ntok, o.out + r0, o.stride);
         }
     }
 }
@@ -715,6 +860,7 @@ const FfnJob = struct {
     act: *const Act,
     out: []f32,
     ntok: usize,
+    tok_offset: usize = 0,
     rows_chunk: usize,
     gelu: bool,
     chunks: Chunks,
@@ -736,7 +882,7 @@ fn ffnWorkerFusedX8(comptime t: GgmlType, job: *FfnJob) void {
                 switch (@min(job.ntok - tk, tok_group)) {
                     inline 1...tok_group => |n| {
                         var ptrs: [n][*]const u8 = undefined;
-                        inline for (0..n) |k| ptrs[k] = job.act.rowPtr(kind, tk + k);
+                        inline for (0..n) |k| ptrs[k] = job.act.rowPtr(kind, job.tok_offset + tk + k);
                         const vg = repack.gemm(t, n, gg, ptrs, job.gate.cols);
                         const vu = repack.gemm(t, n, gu, ptrs, job.up.cols);
                         inline for (0..n) |k| {
@@ -774,8 +920,8 @@ fn ffnWorker(job: *FfnJob, _: usize, _: usize) void {
         var ts: usize = 0;
         while (ts < job.ntok) : (ts += tok_tile) {
             const te = @min(ts + tok_tile, job.ntok);
-            rowsDispatch(false, job.gate, r0, r1, job.act, ts, te, &g, nr);
-            rowsDispatch(false, job.up, r0, r1, job.act, ts, te, &u, nr);
+            rowsDispatch(false, job.gate, r0, r1, job.act, job.tok_offset + ts, job.tok_offset + te, &g, nr);
+            rowsDispatch(false, job.up, r0, r1, job.act, job.tok_offset + ts, job.tok_offset + te, &u, nr);
             for (ts..te) |tk| {
                 const gi = g[(tk - ts) * nr ..][0..nr];
                 const ui = u[(tk - ts) * nr ..][0..nr];
@@ -1614,6 +1760,9 @@ pub const State = struct {
     flash_o: []f32,
     flash_m: []f32,
     flash_l: []f32,
+    /// MoE router logits and combined expert output
+    router_logits: []f32,
+    moe_out: []f32,
     /// Short conv: in_proj output [bmax][3*dim], input history
     /// [(kernel-1) + bmax][dim], and the last kernel-1 inputs of every conv layer.
     conv_in: []f32,
@@ -1643,7 +1792,7 @@ pub const State = struct {
         errdefer s.xn.deinit(gpa);
         s.att = try Act.init(gpa, c.q_dim, batch_cap);
         errdefer s.att.deinit(gpa);
-        s.hb = try Act.init(gpa, c.ffn_dim, batch_cap);
+        s.hb = try Act.init(gpa, @max(c.ffn_dim, c.expert_feed_forward_length), batch_cap);
         errdefer s.hb.deinit(gpa);
         // Plain f32 buffers: one allocation each, freed together on failure.
         const bufs = .{
@@ -1663,6 +1812,8 @@ pub const State = struct {
             .{ "flash_o", max_flash_chunks * c.q_dim },
             .{ "flash_m", max_flash_chunks * c.n_heads },
             .{ "flash_l", max_flash_chunks * c.n_heads },
+            .{ "router_logits", if (c.n_experts > 0) batch_cap * c.n_experts else 0 },
+            .{ "moe_out", if (c.n_experts > 0) batch_cap * c.dim else 0 },
         };
         var done: usize = 0;
         errdefer inline for (bufs, 0..) |b, i| {
@@ -1726,7 +1877,7 @@ pub const State = struct {
         s.xn.deinit(gpa);
         s.att.deinit(gpa);
         s.hb.deinit(gpa);
-        inline for (.{ "x", "q", "k", "v", "logits", "rope_cs", "rope_cs_swa", "tmp", "gate", "conv_in", "conv_hist", "conv_state", "conv_checkpoint", "flash_o", "flash_m", "flash_l" }) |name| gpa.free(@field(s, name));
+        inline for (.{ "x", "q", "k", "v", "logits", "rope_cs", "rope_cs_swa", "tmp", "gate", "conv_in", "conv_hist", "conv_state", "conv_checkpoint", "flash_o", "flash_m", "flash_l", "router_logits", "moe_out" }) |name| gpa.free(@field(s, name));
         gpa.free(s.slot_offsets);
         gpa.free(s.slot_strides);
         gpa.free(s.slot_tiles);
@@ -1784,7 +1935,7 @@ pub const State = struct {
         return s.slot_offsets[slot] + kh * s.slot_strides[slot];
     }
 
-    fn matmul(s: *State, outs: []const MatOut, act: *Act) void {
+    fn matmulOffset(s: *State, outs: []const MatOut, act: *Act, tok_offset: usize, ntok: usize) void {
         std.debug.assert(outs.len <= max_outs);
         var rows: usize = 0;
         for (outs) |o| {
@@ -1792,11 +1943,15 @@ pub const State = struct {
             rows += o.w.rows;
         }
         const rc = rowsChunk(rows, s.pool.nth);
-        var job: MatJob = .{ .outs = outs, .act = act, .ntok = act.ntok, .rows_chunk = rc, .first = undefined, .chunks = undefined };
+        var job: MatJob = .{ .outs = outs, .act = act, .ntok = ntok, .tok_offset = tok_offset, .rows_chunk = rc, .first = undefined, .chunks = undefined };
         job.first[0] = 0;
         for (outs, 0..) |o, i| job.first[i + 1] = job.first[i] + (o.w.rows + rc - 1) / rc;
         job.chunks = .init(job.first[outs.len], 1);
         s.pool.run(&job, matWorker);
+    }
+
+    fn matmul(s: *State, outs: []const MatOut, act: *Act) void {
+        s.matmulOffset(outs, act, 0, act.ntok);
     }
 
     /// Rows per work item: a multiple of 8 (x8 groups), ~8 items per thread.
@@ -2247,6 +2402,165 @@ pub const State = struct {
         }
     }
 
+    fn forwardMoE(s: *State, moe: *const MoEFfn, ffn_norm: []const f32, post_ffn_norm: ?[]const f32, nt: usize) void {
+        const c = &s.model.cfg;
+        const dim = c.dim;
+        const ffn_dim = c.expert_feed_forward_length;
+        const n_exp = c.n_experts;
+        const k_exp = @min(c.n_experts_used, n_exp);
+
+        // 1. Normalize input x into s.xn
+        const router_kind = quant.actKind(moe.router.typ);
+        s.fusedNorm(nt, s.x.ptr, ffn_norm, router_kind);
+
+        // 2. Compute router logits: [nt][n_exp]
+        s.matmul(&.{.{ .w = &moe.router, .out = s.router_logits.ptr, .stride = n_exp }}, &s.xn);
+
+        // Clear moe_out buffer for the batch
+        @memset(s.moe_out[0 .. nt * dim], 0);
+
+        // Top-K routing buffers (supports up to 64 active experts per token)
+        var top_idx: [64]usize = undefined;
+        var top_val: [64]f32 = undefined;
+
+        for (0..nt) |t| {
+            const logits = s.router_logits[t * n_exp ..][0..n_exp];
+
+            // 3. Find top-K experts for token t
+            var found: usize = 0;
+            for (logits, 0..) |v, e| {
+                if (found < k_exp) {
+                    var j = found;
+                    found += 1;
+                    while (j > 0 and top_val[j - 1] < v) : (j -= 1) {
+                        top_val[j] = top_val[j - 1];
+                        top_idx[j] = top_idx[j - 1];
+                    }
+                    top_val[j] = v;
+                    top_idx[j] = e;
+                } else if (v > top_val[k_exp - 1]) {
+                    var j = k_exp - 1;
+                    while (j > 0 and top_val[j - 1] < v) : (j -= 1) {
+                        top_val[j] = top_val[j - 1];
+                        top_idx[j] = top_idx[j - 1];
+                    }
+                    top_val[j] = v;
+                    top_idx[j] = e;
+                }
+            }
+
+            // 4. Softmax over top-K logits
+            var max_l: f32 = top_val[0];
+            for (top_val[1..k_exp]) |v| max_l = @max(max_l, v);
+            var sum_exp: f32 = 0;
+            for (0..k_exp) |j| {
+                const ev = @exp(top_val[j] - max_l);
+                top_val[j] = ev;
+                sum_exp += ev;
+            }
+            const inv_sum = (1.0 / sum_exp) * c.expert_weights_scale;
+            for (0..k_exp) |j| {
+                top_val[j] *= inv_sum;
+            }
+
+            // 5. Evaluate selected top-K experts for token t
+            const tok_moe_out = s.moe_out[t * dim ..][0..dim];
+
+            for (0..k_exp) |j| {
+                const exp_idx = top_idx[j];
+                const weight = top_val[j];
+                const exp = &moe.experts[exp_idx];
+
+                s.xn.prepare(quant.actKind(exp.w_gate.typ), s.pool);
+
+                const rc = rowsChunk(ffn_dim, s.pool.nth);
+                var fj: FfnJob = .{
+                    .gate = &exp.w_gate,
+                    .up = &exp.w_up,
+                    .act = &s.xn,
+                    .out = s.hb.f,
+                    .ntok = 1,
+                    .tok_offset = t,
+                    .rows_chunk = rc,
+                    .gelu = c.gelu,
+                    .chunks = .init((ffn_dim + rc - 1) / rc, 1),
+                };
+                s.pool.run(&fj, ffnWorker);
+                s.hb.reset(1);
+
+                // Down projection into s.tmp
+                s.matmul(&.{.{ .w = &exp.w_down, .out = s.tmp.ptr, .stride = dim, .accumulate = false }}, &s.hb);
+
+                // Accumulate scaled expert output: tok_moe_out += weight * s.tmp
+                const w_vec: quant.V8f = @splat(weight);
+                var d: usize = 0;
+                while (d + 8 <= dim) : (d += 8) {
+                    const tmp_v: quant.V8f = s.tmp[d..][0..8].*;
+                    const out_v: quant.V8f = tok_moe_out[d..][0..8].*;
+                    tok_moe_out[d..][0..8].* = @mulAdd(quant.V8f, w_vec, tmp_v, out_v);
+                }
+                while (d < dim) : (d += 1) {
+                    tok_moe_out[d] += weight * s.tmp[d];
+                }
+            }
+
+            // 6. Optional shared expert
+            if (moe.shared) |*sh| {
+                s.xn.prepare(quant.actKind(sh.w_gate.typ), s.pool);
+                const rc = rowsChunk(c.ffn_dim, s.pool.nth);
+                var fj: FfnJob = .{
+                    .gate = &sh.w_gate,
+                    .up = &sh.w_up,
+                    .act = &s.xn,
+                    .out = s.hb.f,
+                    .ntok = 1,
+                    .tok_offset = t,
+                    .rows_chunk = rc,
+                    .gelu = c.gelu,
+                    .chunks = .init((c.ffn_dim + rc - 1) / rc, 1),
+                };
+                s.pool.run(&fj, ffnWorker);
+                s.hb.reset(1);
+
+                s.matmul(&.{.{ .w = &sh.w_down, .out = s.tmp.ptr, .stride = dim, .accumulate = false }}, &s.hb);
+
+                var d: usize = 0;
+                while (d + 8 <= dim) : (d += 8) {
+                    const tmp_v: quant.V8f = s.tmp[d..][0..8].*;
+                    const out_v: quant.V8f = tok_moe_out[d..][0..8].*;
+                    tok_moe_out[d..][0..8].* = tmp_v + out_v;
+                }
+                while (d < dim) : (d += 1) {
+                    tok_moe_out[d] += s.tmp[d];
+                }
+            }
+        }
+
+        // 7. Add MoE output into residual stream x
+        for (0..nt) |t| {
+            const x_tok = s.x[t * dim ..][0..dim];
+            const moe_tok = s.moe_out[t * dim ..][0..dim];
+            if (post_ffn_norm) |w| {
+                rmsnorm(s.tmp[0..dim], moe_tok, w, c.eps);
+                var d: usize = 0;
+                while (d + 8 <= dim) : (d += 8) {
+                    const tv: quant.V8f = s.tmp[d..][0..8].*;
+                    const xv: quant.V8f = x_tok[d..][0..8].*;
+                    x_tok[d..][0..8].* = xv + tv;
+                }
+                while (d < dim) : (d += 1) x_tok[d] += s.tmp[d];
+            } else {
+                var d: usize = 0;
+                while (d + 8 <= dim) : (d += 8) {
+                    const mv: quant.V8f = moe_tok[d..][0..8].*;
+                    const xv: quant.V8f = x_tok[d..][0..8].*;
+                    x_tok[d..][0..8].* = xv + mv;
+                }
+                while (d < dim) : (d += 1) x_tok[d] += moe_tok[d];
+            }
+        }
+    }
+
     fn forwardBatch(s: *State, tokens: []const u32, n_logits: usize) void {
         const m = s.model;
         const c = &m.cfg;
@@ -2276,15 +2590,22 @@ pub const State = struct {
             }
             if (L.post_mix_norm) |w| s.addNormed(w, nt);
 
-            const ffn_kind = quant.actKind(L.w_gate.typ);
-            s.fusedNorm(nt, s.x.ptr, L.ffn_norm, ffn_kind);
-            const rc = rowsChunk(c.ffn_dim, s.pool.nth);
-            var fj: FfnJob = .{ .gate = &L.w_gate, .up = &L.w_up, .act = &s.xn, .out = s.hb.f, .ntok = nt, .rows_chunk = rc, .gelu = c.gelu, .chunks = .init((c.ffn_dim + rc - 1) / rc, 1) };
-            s.pool.run(&fj, ffnWorker);
-            s.hb.reset(nt);
-            const ffn_direct = L.post_ffn_norm == null;
-            s.matmul(&.{.{ .w = &L.w_down, .out = if (ffn_direct) s.x.ptr else s.tmp.ptr, .stride = c.dim, .accumulate = ffn_direct }}, &s.hb);
-            if (L.post_ffn_norm) |w| s.addNormed(w, nt);
+            switch (L.ffn) {
+                .dense => |*d| {
+                    const ffn_kind = quant.actKind(d.w_gate.typ);
+                    s.fusedNorm(nt, s.x.ptr, L.ffn_norm, ffn_kind);
+                    const rc = rowsChunk(c.ffn_dim, s.pool.nth);
+                    var fj: FfnJob = .{ .gate = &d.w_gate, .up = &d.w_up, .act = &s.xn, .out = s.hb.f, .ntok = nt, .rows_chunk = rc, .gelu = c.gelu, .chunks = .init((c.ffn_dim + rc - 1) / rc, 1) };
+                    s.pool.run(&fj, ffnWorker);
+                    s.hb.reset(nt);
+                    const ffn_direct = L.post_ffn_norm == null;
+                    s.matmul(&.{.{ .w = &d.w_down, .out = if (ffn_direct) s.x.ptr else s.tmp.ptr, .stride = c.dim, .accumulate = ffn_direct }}, &s.hb);
+                    if (L.post_ffn_norm) |w| s.addNormed(w, nt);
+                },
+                .moe => |*moe| {
+                    s.forwardMoE(moe, L.ffn_norm, L.post_ffn_norm, nt);
+                },
+            }
         }
         s.pos += nt;
 
@@ -3018,4 +3339,67 @@ test "FlashDecoding chunked attention matches unchunked reference across cache f
             }
         }
     }
+}
+
+test "MoE top-K routing and expert execution matches mathematical reference" {
+    // Test 4 experts, top-2 routing, dim=16, ffn_dim=32
+    const n_exp = 4;
+    const k_exp = 2;
+    const dim = 16;
+
+    var prng = std.Random.DefaultPrng.init(12345);
+    const r = prng.random();
+
+    // 1. Router weights [n_exp][dim]
+    var router_w: [n_exp * dim]f32 = undefined;
+    for (&router_w) |*x| x.* = r.floatNorm(f32);
+
+    // 2. Input x [dim]
+    var x: [dim]f32 = undefined;
+    for (&x) |*v| v.* = r.floatNorm(f32);
+
+    // Compute router logits s = W_router * x
+    var logits: [n_exp]f32 = undefined;
+    for (0..n_exp) |e| {
+        var dot: f32 = 0;
+        for (0..dim) |d| dot += router_w[e * dim + d] * x[d];
+        logits[e] = dot;
+    }
+
+    // Top-2 selection
+    var top_idx: [k_exp]usize = undefined;
+    var top_val: [k_exp]f32 = undefined;
+    var found: usize = 0;
+    for (logits, 0..) |v, e| {
+        if (found < k_exp) {
+            var j: usize = found;
+            found += 1;
+            while (j > 0 and top_val[j - 1] < v) : (j -= 1) {
+                top_val[j] = top_val[j - 1];
+                top_idx[j] = top_idx[j - 1];
+            }
+            top_val[j] = v;
+            top_idx[j] = e;
+        } else if (v > top_val[k_exp - 1]) {
+            var j: usize = k_exp - 1;
+            while (j > 0 and top_val[j - 1] < v) : (j -= 1) {
+                top_val[j] = top_val[j - 1];
+                top_idx[j] = top_idx[j - 1];
+            }
+            top_val[j] = v;
+            top_idx[j] = e;
+        }
+    }
+
+    // Softmax over top-2
+    const max_l = @max(top_val[0], top_val[1]);
+    const e0 = @exp(top_val[0] - max_l);
+    const e1 = @exp(top_val[1] - max_l);
+    const sum_e = e0 + e1;
+    const w0 = e0 / sum_e;
+    const w1 = e1 / sum_e;
+
+    try std.testing.expect(w0 + w1 >= 0.9999 and w0 + w1 <= 1.0001);
+    try std.testing.expect(w0 >= w1);
+    try std.testing.expect(top_idx[0] != top_idx[1]);
 }
