@@ -644,27 +644,23 @@ fn groupsDot(comptime t: GgmlType, comptime acc: bool, w: *const Tensor, r0: usi
         }
         return;
     }
-    var ts = t0;
-    while (ts < t1) : (ts += tok_tile) {
-        const te = @min(ts + tok_tile, t1);
-        var r = r0;
-        while (r < r1) : (r += 8) {
-            const g = w.group(r);
-            var tk = ts;
-            while (tk < te) {
-                switch (@min(te - tk, tok_group)) {
-                    inline 1...tok_group => |n| {
-                        var ptrs: [n][*]const u8 = undefined;
-                        inline for (0..n) |k| ptrs[k] = act.rowPtr(kind, tk + k);
-                        const v = repack.gemm(t, n, g, ptrs, w.cols);
-                        inline for (0..n) |k| {
-                            const o: *[8]f32 = out[(tk + k - t0) * ostride + (r - r0) ..][0..8];
-                            o.* = if (acc) @as(quant.V8f, o.*) + v[k] else v[k];
-                        }
-                        tk += n;
-                    },
-                    else => unreachable,
-                }
+    var r = r0;
+    while (r < r1) : (r += 8) {
+        const g = w.group(r);
+        var tk = t0;
+        while (tk < t1) {
+            switch (@min(t1 - tk, tok_group)) {
+                inline 1...tok_group => |n| {
+                    var ptrs: [n][*]const u8 = undefined;
+                    inline for (0..n) |k| ptrs[k] = act.rowPtr(kind, tk + k);
+                    const v = repack.gemm(t, n, g, ptrs, w.cols);
+                    inline for (0..n) |k| {
+                        const o: *[8]f32 = out[(tk + k - t0) * ostride + (r - r0) ..][0..8];
+                        o.* = if (acc) @as(quant.V8f, o.*) + v[k] else v[k];
+                    }
+                    tk += n;
+                },
+                else => unreachable,
             }
         }
     }
@@ -724,10 +720,53 @@ const FfnJob = struct {
     chunks: Chunks,
 };
 
+fn ffnWorkerFusedX8(comptime t: GgmlType, job: *FfnJob) void {
+    const kind = comptime quant.actKind(t);
+    const ffn = job.gate.rows;
+    const gelu = job.gelu;
+    while (job.chunks.grab()) |range| {
+        const r0 = range[0] * job.rows_chunk;
+        const r1 = @min(range[1] * job.rows_chunk, ffn);
+        var r = r0;
+        while (r < r1) : (r += 8) {
+            const gg = job.gate.group(r);
+            const gu = job.up.group(r);
+            var tk: usize = 0;
+            while (tk < job.ntok) {
+                switch (@min(job.ntok - tk, tok_group)) {
+                    inline 1...tok_group => |n| {
+                        var ptrs: [n][*]const u8 = undefined;
+                        inline for (0..n) |k| ptrs[k] = job.act.rowPtr(kind, tk + k);
+                        const vg = repack.gemm(t, n, gg, ptrs, job.gate.cols);
+                        const vu = repack.gemm(t, n, gu, ptrs, job.up.cols);
+                        inline for (0..n) |k| {
+                            const o: *[8]f32 = job.out[(tk + k) * ffn + r ..][0..8];
+                            o.* = if (gelu) geluMulV(vg[k], vu[k]) else siluMulV(vg[k], vu[k]);
+                        }
+                        tk += n;
+                    },
+                    else => unreachable,
+                }
+            }
+        }
+    }
+}
+
 fn ffnWorker(job: *FfnJob, _: usize, _: usize) void {
+    const ffn = job.gate.rows;
+    if (job.gate.x8 and job.up.x8) {
+        switch (job.gate.typ) {
+            inline .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q4_k, .q5_k, .q6_k => |gt| {
+                if (job.up.typ == gt) {
+                    ffnWorkerFusedX8(gt, job);
+                    return;
+                }
+            },
+            else => {},
+        }
+    }
     var g: [max_rows_chunk * tok_tile]f32 = undefined;
     var u: [max_rows_chunk * tok_tile]f32 = undefined;
-    const ffn = job.gate.rows;
     while (job.chunks.grab()) |range| {
         const r0 = range[0] * job.rows_chunk;
         const r1 = @min(range[1] * job.rows_chunk, ffn);
@@ -812,12 +851,27 @@ inline fn expV(x_in: V8f) V8f {
     return y * p2;
 }
 
+inline fn siluMulV(gv: V8f, uv: V8f) V8f {
+    return gv / (@as(V8f, @splat(1)) + expV(-gv)) * uv;
+}
+
+inline fn geluMulV(x: V8f, uv: V8f) V8f {
+    const H = @Vector(8, f16);
+    const k0: V8f = @splat(2 * 0.79788456080286535587989211986876);
+    const k1: V8f = @splat(0.044715);
+    const one: V8f = @splat(1);
+    const xh: V8f = @floatCast(@as(H, @floatCast(x)));
+    const gl: V8f = @floatCast(@as(H, @floatCast(xh / (one + expV(-k0 * xh * (one + k1 * xh * xh))))));
+    const y = @select(f32, x <= @as(V8f, @splat(-10)), @as(V8f, @splat(0)), @select(f32, x >= @as(V8f, @splat(10)), x, gl));
+    return y * uv;
+}
+
 fn silu_mul(out: []f32, g: []const f32, u: []const f32) void {
     var i: usize = 0;
     while (i + 8 <= out.len) : (i += 8) {
         const gv: V8f = g[i..][0..8].*;
         const uv: V8f = u[i..][0..8].*;
-        out[i..][0..8].* = gv / (@as(V8f, @splat(1)) + expV(-gv)) * uv;
+        out[i..][0..8].* = siluMulV(gv, uv);
     }
     while (i < out.len) : (i += 1) out[i] = g[i] / (1 + @exp(-g[i])) * u[i];
 }
@@ -827,17 +881,13 @@ fn silu_mul(out: []f32, g: []const f32, u: []const f32) void {
 /// on the way in and out, |x| >= 10 bypasses it: ggml's CPU table does the
 /// same, and matching it keeps greedy output identical to llama.cpp.
 fn gelu_mul(out: []f32, g: []const f32, u: []const f32) void {
-    const H = @Vector(8, f16);
     const k0: V8f = @splat(2 * 0.79788456080286535587989211986876);
     const k1: V8f = @splat(0.044715);
-    const one: V8f = @splat(1);
     var i: usize = 0;
     while (i + 8 <= out.len) : (i += 8) {
         const x: V8f = g[i..][0..8].*;
-        const xh: V8f = @floatCast(@as(H, @floatCast(x)));
-        const gl: V8f = @floatCast(@as(H, @floatCast(xh / (one + expV(-k0 * xh * (one + k1 * xh * xh))))));
-        const y = @select(f32, x <= @as(V8f, @splat(-10)), @as(V8f, @splat(0)), @select(f32, x >= @as(V8f, @splat(10)), x, gl));
-        out[i..][0..8].* = y * @as(V8f, u[i..][0..8].*);
+        const uv: V8f = u[i..][0..8].*;
+        out[i..][0..8].* = geluMulV(x, uv);
     }
     while (i < out.len) : (i += 1) {
         const x = g[i];
