@@ -1014,6 +1014,19 @@ fn ffnWorkerFusedX8(comptime t: GgmlType, job: *FfnJob) void {
                         var ptrs: [n][*]const u8 = undefined;
                         inline for (0..n) |k| ptrs[k] = job.act.rowPtr(kind, job.tok_offset + tk + k);
                         const vg = repack.gemm(t, n, gg, ptrs, job.gate.cols);
+                        const dead_thresh: f32 = if (gelu) -4.0 else -6.0;
+                        var all_dead = true;
+                        inline for (0..n) |k| {
+                            if (@reduce(.Max, vg[k]) > dead_thresh) all_dead = false;
+                        }
+                        if (all_dead) {
+                            inline for (0..n) |k| {
+                                const o: *[8]f32 = job.out[(tk + k) * ffn + r ..][0..8];
+                                o.* = @splat(0);
+                            }
+                            tk += n;
+                            continue;
+                        }
                         const vu = repack.gemm(t, n, gu, ptrs, job.up.cols);
                         inline for (0..n) |k| {
                             const o: *[8]f32 = job.out[(tk + k) * ffn + r ..][0..8];
@@ -1594,7 +1607,7 @@ fn attendBlockChunk(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt
                     sv = @select(f32, visible, sv, @as(V16f, @splat(-std.math.inf(f32))));
                 }
                 const tmax = @reduce(.Max, sv);
-                if (tmax == -std.math.inf(f32)) {
+                if (tmax == -std.math.inf(f32) or (m[i] != -std.math.inf(f32) and m[i] - tmax > 13.0)) {
                     p[i] = @splat(0);
                 } else {
                     has_active_p = true;
