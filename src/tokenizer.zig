@@ -70,7 +70,8 @@ pub const Tokenizer = struct {
         errdefer gpa.free(types);
         @memset(types, .normal);
         if (f.getArray("tokenizer.ggml.token_type")) |ta| {
-            for (types, 0..) |*t, i| t.* = @fromBackingInt(@intCast(@as(u8, @intCast(ta.item(i32, i)))));
+            if (ta.elem != .i32) return error.InvalidTokenizer;
+            for (types[0..@min(n, ta.len)], 0..) |*t, i| t.* = @fromBackingInt(@intCast(@as(u8, @intCast(ta.item(i32, i)))));
         }
 
         var self: Tokenizer = .{

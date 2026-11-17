@@ -320,6 +320,35 @@ test "tensor dims overflowing u64 are rejected" {
     const bytes: []align(std.heap.page_size_min) const u8 = buf[0..w.end];
 
     var f: File = .{ .map = bytes };
-    defer f.deinit(gpa);
+    defer f.deinitTables(gpa);
     try std.testing.expectError(error.InvalidGguf, f.parse(gpa));
+}
+
+test "truncated and oversized GGUF inputs fail cleanly" {
+    const gpa = std.testing.allocator;
+    var buf: [256]u8 align(std.heap.page_size_min) = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeAll("GGUF");
+    try w.writeInt(u32, 3, .little);
+    try w.writeInt(u64, 0, .little); // n_tensors
+    try w.writeInt(u64, 1, .little); // n_kv
+    try w.writeInt(u64, 3, .little); // key length
+    try w.writeAll("key");
+    try w.writeInt(u32, @intFromEnum(ValueType.array), .little);
+    try w.writeInt(u32, @intFromEnum(ValueType.string), .little); // element type
+    try w.writeInt(u64, 2, .little); // element count
+    try w.writeInt(u64, 1 << 40, .little); // first string claims 2^40 bytes
+    try w.writeAll("ab");
+    const full = w.buffered();
+
+    // Every prefix of a malformed file must fail with an error, never crash.
+    var len: usize = 0;
+    while (len < full.len) : (len += 1) {
+        const copy = try gpa.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), len);
+        defer gpa.free(copy);
+        @memcpy(copy, full[0..len]);
+        var f: File = .{ .map = copy };
+        defer f.deinitTables(gpa);
+        try std.testing.expect(std.meta.isError(f.parse(gpa)));
+    }
 }
