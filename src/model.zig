@@ -1315,6 +1315,44 @@ pub const max_spec = 8;
 
 const V16f = @Vector(16, f32);
 
+/// Fast Walsh-Hadamard Transform (FWHT) for power-of-2 length vectors.
+/// Rotates activations by orthogonal matrix H_d (H_d * H_d^T = I),
+/// preserving all inner products and norms exactly (<H x, H y> == <x, y>)
+/// while diffusing heavy-tail outlier dimensions into Gaussian statistics via CLT.
+inline fn fwhtSimd(x: []f32) void {
+    const n = x.len;
+    var len: usize = 1;
+    while (len < n) : (len *= 2) {
+        if (len >= 8) {
+            var i: usize = 0;
+            while (i < n) : (i += 2 * len) {
+                var j: usize = 0;
+                while (j < len) : (j += 8) {
+                    const u: V8f = x[i + j ..][0..8].*;
+                    const v: V8f = x[i + len + j ..][0..8].*;
+                    x[i + j ..][0..8].* = u + v;
+                    x[i + len + j ..][0..8].* = u - v;
+                }
+            }
+        } else {
+            var i: usize = 0;
+            while (i < n) : (i += 2 * len) {
+                for (0..len) |j| {
+                    const u = x[i + j];
+                    const v = x[i + len + j];
+                    x[i + j] = u + v;
+                    x[i + len + j] = u - v;
+                }
+            }
+        }
+    }
+    const norm_v: V8f = @splat(1.0 / @sqrt(@as(f32, @floatFromInt(n))));
+    var j: usize = 0;
+    while (j < n) : (j += 8) {
+        x[j..][0..8].* = @as(V8f, x[j..][0..8].*) * norm_v;
+    }
+}
+
 /// PMM (Polynomial Maximization Method) scale estimation for 4-bit block quantization.
 /// Evaluates sample moments (m1..m4) and Kunchenko's non-Gaussian variance reduction
 /// factor g2 = 1 - gamma3^2 / (2 + gamma4) to compute the optimal scale factor,
@@ -2235,6 +2273,10 @@ pub const State = struct {
                 while (h < q.len) : (h += hd) rmsnorm(q[h..][0..hd], q[h..][0..hd], w, c.eps);
             }
             s.rope(q, t, A.swa, hd, A.n_rot);
+            if (s.cache_type == .q4_0 and (hd & (hd - 1)) == 0) {
+                var h: usize = 0;
+                while (h < q.len) : (h += hd) fwhtSimd(q[h..][0..hd]);
+            }
 
             if (A.has_kv) {
                 const k = s.k[t * kv_dim ..][0..kv_dim];
@@ -2250,6 +2292,10 @@ pub const State = struct {
                     while (h < k.len) : (h += hd) rmsnorm(k[h..][0..hd], k[h..][0..hd], w, c.eps);
                 }
                 s.rope(k, t, A.swa, hd, A.n_rot);
+                if (s.cache_type == .q4_0 and (hd & (hd - 1)) == 0) {
+                    var kh: usize = 0;
+                    while (kh < k.len) : (kh += hd) fwhtSimd(k[kh..][0..hd]);
+                }
                 const is_swa = A.swa and c.swa_window > 0;
                 const w_tiles = s.slot_tiles[A.kv_slot];
                 const p = pos0 + t;
