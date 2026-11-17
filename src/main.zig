@@ -370,17 +370,25 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        std.debug.print("chat template: {s}. Empty line or Ctrl-D quits. Type /help for commands.\n", .{@tagName(tpl)});
+        std.debug.print(
+            \\
+            \\  \x1b[1;36mzinfer interactive chat\x1b[0m
+            \\  template: \x1b[33m{s}\x1b[0m | cache: \x1b[35m{s}\x1b[0m | threads: {d}
+            \\  Type \x1b[32m/help\x1b[0m for commands, \x1b[31m/quit\x1b[0m or Ctrl-D to exit.
+            \\
+        , .{ @tagName(tpl), @tagName(st.cache_type), pool.nth });
         while (true) {
-            std.debug.print("\n> ", .{});
+            std.debug.print("\n\x1b[1;32mUser>\x1b[0m ", .{});
             const line = (stdin.interface.takeDelimiter('\n') catch null) orelse break;
             const msg = std.mem.trim(u8, line, " \r\t");
-            if (msg.len == 0) break;
+            if (msg.len == 0) continue;
 
             if (std.mem.startsWith(u8, msg, "/")) {
                 var it = std.mem.tokenizeScalar(u8, msg, ' ');
                 const cmd = it.next() orelse "";
-                if (std.mem.eql(u8, cmd, "/save")) {
+                if (std.mem.eql(u8, cmd, "/quit") or std.mem.eql(u8, cmd, "/exit")) {
+                    break;
+                } else if (std.mem.eql(u8, cmd, "/save")) {
                     const path = it.next() orelse args.prompt_cache orelse {
                         std.debug.print("usage: /save <path>\n", .{});
                         continue;
@@ -421,6 +429,7 @@ pub fn main(init: std.process.Init) !void {
                         \\  /load [path]   Load KV cache and token history from file
                         \\  /reset, /clear Reset context and start a new conversation
                         \\  /stats         Display generation timing and memory statistics
+                        \\  /quit, /exit   Exit chat
                         \\  /help          Show this help message
                         \\
                     , .{});
@@ -445,6 +454,7 @@ pub fn main(init: std.process.Init) !void {
             try chat.assistantHeader(has_think, args.no_think);
             try tok.encode(gpa, text.items, first, true, &tokens);
             first = false;
+            std.debug.print("\x1b[1;35mAssistant>\x1b[0m ", .{});
             pending = gen.run(tokens.items, args.n_predict, out) catch |e| blk: {
                 if (e != error.ContextFull) return e;
                 std.debug.print("\n[context full: pos {d}/{d}. Attempting context shift...]\n", .{ st.pos, st.ctx });
@@ -468,6 +478,7 @@ pub fn main(init: std.process.Init) !void {
                 }
             };
             try out.emit("\n");
+            std.debug.print("\x1b[2;37m[{d} tokens in cache, pos {d}/{d}]\x1b[0m\n", .{ gen.cached.items.len, st.pos, st.ctx });
         }
 
         if (args.prompt_cache) |cp| {

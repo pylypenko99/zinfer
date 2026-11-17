@@ -181,6 +181,24 @@ pub const PromptLookup = struct {
             }
         }
 
+        // 4. Try 1-gram Markov follower match (most recent transition from history[len - 1])
+        if (history.len >= 2 and k >= 1) {
+            const last_tok = history[history.len - 1];
+            const search_len = history.len - 1;
+            var idx: usize = search_len;
+            while (idx > 0) {
+                idx -= 1;
+                if (history[idx] == last_tok and idx + 1 < search_len) {
+                    out[0] = history[idx + 1];
+                    if (k >= 2 and idx + 2 < search_len) {
+                        out[1] = history[idx + 2];
+                        return 2;
+                    }
+                    return 1;
+                }
+            }
+        }
+
         return 0;
     }
 };

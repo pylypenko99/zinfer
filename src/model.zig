@@ -1495,6 +1495,15 @@ fn attendBlockChunk(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt
     for (j_start..j_end) |j| {
         const tile_idx = if (window > 0) j % w_tiles else j;
         const tile = kt + tile_idx * tile_bytes;
+        if (j + 1 < j_end) {
+            const next_idx = if (window > 0) (j + 1) % w_tiles else (j + 1);
+            const nk = kt + next_idx * tile_bytes;
+            const nv = vr + next_idx * tile_bytes;
+            inline for (0..8) |cl| {
+                @prefetch(nk + cl * 64, .{ .rw = .read, .locality = 3, .cache = .data });
+                @prefetch(nv + cl * 64, .{ .rw = .read, .locality = 3, .cache = .data });
+            }
+        }
         var s: [NQ]V16f = @splat(@splat(0));
         switch (CACHE) {
             .q4_0 => {
@@ -1506,6 +1515,7 @@ fn attendBlockChunk(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt
                     var s0_acc: [q_sub]V8f = @splat(@splat(0));
                     var s1_acc: [q_sub]V8f = @splat(@splat(0));
                     while (b < nblocks) : (b += 1) {
+                        if (b + 1 < nblocks) @prefetch(bp + 288, .{ .rw = .read, .locality = 3, .cache = .data });
                         const ksc: [*]const f16 = @ptrCast(@alignCast(bp + 256));
                         const sv: V16f = @floatCast(@as(@Vector(16, f16), ksc[0..kv_tile].*));
                         const sv0: V8f = @as([16]f32, sv)[0..8].*;
@@ -1646,6 +1656,7 @@ fn attendBlockChunk(comptime NQ: usize, comptime CACHE: CacheType, hd: usize, kt
                     var ps: [q_sub][kv_tile]f32 = undefined;
                     var b: usize = 0;
                     while (b < nblocks) : (b += 1) {
+                        if (b + 1 < nblocks) @prefetch(vt + 8 * hd + (b + 1) * 32, .{ .rw = .read, .locality = 3, .cache = .data });
                         const vsc: [*]const f16 = @ptrCast(@alignCast(vt + 8 * hd + b * 32));
                         const sv: V16f = @floatCast(@as(@Vector(16, f16), vsc[0..kv_tile].*));
                         inline for (0..q_sub) |qi_idx| {
