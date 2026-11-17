@@ -76,7 +76,7 @@ pub const Gen = struct {
     pub fn reset(g: *Gen) void {
         g.st.reset();
         if (g.draft_st) |d| d.reset();
-        g.smp.n_recent = 0;
+        g.smp.reset();
         g.cached.clearRetainingCapacity();
         g.n_snaps = 0;
     }
@@ -94,7 +94,7 @@ pub const Gen = struct {
     pub fn runPrompt(g: *Gen, prompt: []const u32, n: usize, sink: anytype) !?u32 {
         const keep = g.reusablePrefix(prompt);
         g.truncate(keep);
-        g.smp.n_recent = 0;
+        g.smp.reset();
         return g.generate(prompt, keep, g.st.conv_state.len > 0, n, sink);
     }
 
@@ -764,7 +764,7 @@ test "saveCache and loadCache roundtrip" {
     for (0..32) |i| try cached_toks.append(gpa, @intCast(100 + i));
 
     var smp: sampler_mod.Sampler = undefined;
-    smp.n_recent = 0;
+    smp.reset();
 
     var g: Gen = undefined;
     g.gpa = gpa;

@@ -384,6 +384,18 @@ fn handleChatCompletion(
     if (root.object.get("repeat_penalty")) |rp| {
         if (rp == .float) g.smp.p.repeat_penalty = @floatCast(rp.float);
     }
+    if (root.object.get("dry_multiplier")) |dm| {
+        if (dm == .float) g.smp.p.dry_multiplier = @floatCast(dm.float) else if (dm == .integer) g.smp.p.dry_multiplier = @floatFromInt(dm.integer);
+    }
+    if (root.object.get("dry_base")) |db| {
+        if (db == .float) g.smp.p.dry_base = @floatCast(db.float) else if (db == .integer) g.smp.p.dry_base = @floatFromInt(db.integer);
+    }
+    if (root.object.get("dry_allowed_length")) |dl| {
+        if (dl == .integer and dl.integer >= 0) g.smp.p.dry_allowed_length = @intCast(dl.integer);
+    }
+    if (root.object.get("dry_range")) |dr| {
+        if (dr == .integer and dr.integer >= 0) g.smp.p.dry_range = @intCast(dr.integer);
+    }
     if (root.object.get("seed")) |sd| {
         if (sd == .integer and sd.integer >= 0) g.smp.rng = .init(@intCast(sd.integer));
     }

@@ -30,6 +30,10 @@ const usage =
     \\  --top-p F             (0.95)
     \\  --min-p F             (0.05)
     \\  --repeat-penalty F    penalize the last 64 tokens, 1 = off (1.0)
+    \\  --dry-multiplier F    DRY repetition penalty multiplier, 0 = off (default: 0.0, 0.8 recommended)
+    \\  --dry-base F          DRY exponential penalty base (default: 1.75)
+    \\  --dry-allowed-length N minimum matching sequence length before DRY penalty (default: 2)
+    \\  --dry-range N         DRY lookback context length in tokens (default: 1024)
     \\  --seed N              RNG seed (time)
     \\
     \\prompt caching:
@@ -63,6 +67,10 @@ const SamplingArgs = struct {
     top_p: ?f32 = null,
     min_p: ?f32 = null,
     repeat_penalty: ?f32 = null,
+    dry_multiplier: ?f32 = null,
+    dry_base: ?f32 = null,
+    dry_allowed_length: ?usize = null,
+    dry_range: ?usize = null,
     seed: ?u64 = null,
 };
 
@@ -165,6 +173,14 @@ fn parseArgs(argv: []const [:0]const u8) Args {
             a.sampling.min_p = r.float();
         } else if (r.is(&.{"--repeat-penalty"})) {
             a.sampling.repeat_penalty = r.float();
+        } else if (r.is(&.{"--dry-multiplier"})) {
+            a.sampling.dry_multiplier = r.float();
+        } else if (r.is(&.{"--dry-base"})) {
+            a.sampling.dry_base = r.float();
+        } else if (r.is(&.{"--dry-allowed-length"})) {
+            a.sampling.dry_allowed_length = r.uint();
+        } else if (r.is(&.{"--dry-range"})) {
+            a.sampling.dry_range = r.uint();
         } else if (r.is(&.{"--seed"})) {
             a.sampling.seed = r.uint();
         } else if (r.is(&.{"--draft"})) {
@@ -236,6 +252,10 @@ fn samplingParams(cli: SamplingArgs, f: *const gguf.File, default_seed: u64) sam
         .top_p = cli.top_p orelse meta.float(f, "general.sampling.top_p") orelse d.top_p,
         .min_p = cli.min_p orelse meta.float(f, "general.sampling.min_p") orelse d.min_p,
         .repeat_penalty = cli.repeat_penalty orelse meta.float(f, "general.sampling.penalty_repeat") orelse d.repeat_penalty,
+        .dry_multiplier = cli.dry_multiplier orelse d.dry_multiplier,
+        .dry_base = cli.dry_base orelse d.dry_base,
+        .dry_allowed_length = cli.dry_allowed_length orelse d.dry_allowed_length,
+        .dry_range = cli.dry_range orelse d.dry_range,
         .seed = cli.seed orelse default_seed,
     };
 }
@@ -297,6 +317,12 @@ pub fn main(init: std.process.Init) !void {
     var smp = try sampler_mod.Sampler.init(gpa, c.vocab, sp);
     defer smp.deinit(gpa);
 
+    // Default sequence breaker for DRY sampler
+    var nl_toks: std.ArrayList(u32) = .empty;
+    defer nl_toks.deinit(gpa);
+    tok.encode(gpa, "\n", false, false, &nl_toks) catch {};
+    for (nl_toks.items) |bt| smp.addBreaker(bt);
+
     // Draft model for speculative decoding: same tokenizer, own state/sampler.
     // The model must outlive its State, so it lives at main scope.
     var draft_m: ?*model_mod.Model = null;
@@ -350,7 +376,11 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print(" | moe={d}x{d} (top-{d})", .{ c.n_experts, c.expert_feed_forward_length, c.n_experts_used });
         }
         std.debug.print("\n", .{});
-        std.debug.print("sampling: temp={d} top_k={d} top_p={d} min_p={d} repeat_penalty={d}\n", .{ sp.temp, sp.top_k, sp.top_p, sp.min_p, sp.repeat_penalty });
+        std.debug.print("sampling: temp={d} top_k={d} top_p={d} min_p={d} repeat_penalty={d}", .{ sp.temp, sp.top_k, sp.top_p, sp.min_p, sp.repeat_penalty });
+        if (sp.dry_multiplier > 0) {
+            std.debug.print(" dry={d:.2}x{d:.2}^{d}", .{ sp.dry_multiplier, sp.dry_base, sp.dry_allowed_length });
+        }
+        std.debug.print("\n", .{});
     }
 
     var out_buf: [4096]u8 = undefined;

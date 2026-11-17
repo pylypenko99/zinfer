@@ -8,34 +8,77 @@ pub const Params = struct {
     /// Divides positive / multiplies negative logits of recent tokens (1 = off).
     repeat_penalty: f32 = 1.0,
     seed: u64 = 0,
+
+    /// DRY (Don't Repeat Yourself) repetition penalty multiplier (0 = off, 0.8 recommended).
+    dry_multiplier: f32 = 0.0,
+    /// DRY exponential penalty base.
+    dry_base: f32 = 1.75,
+    /// Minimum matching sequence length before DRY penalty applies.
+    dry_allowed_length: usize = 2,
+    /// Lookback context length in tokens for repetition detection.
+    dry_range: usize = 1024,
 };
 
 /// Tokens considered by the repetition penalty.
 pub const repeat_last_n = 64;
+pub const max_history = 4096;
+pub const max_breakers = 16;
 
 const Cand = struct { id: u32, v: f32 };
 
-/// Filter chain in llama.cpp's default order: repetition penalty, top-k,
-/// top-p, min-p (on untempered probabilities), then temperature.
+/// Filter chain in llama.cpp's default order: repetition penalty, DRY penalty,
+/// top-k, top-p, min-p (on untempered probabilities), then temperature.
 pub const Sampler = struct {
     p: Params,
     rng: std.Random.DefaultPrng,
     cand: []Cand,
     recent: [repeat_last_n]u32 = undefined,
     n_recent: usize = 0,
+    history: [max_history]u32 = undefined,
+    n_history: usize = 0,
+    breakers: [max_breakers]u32 = undefined,
+    n_breakers: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, vocab: usize, p: Params) !Sampler {
-        return .{ .p = p, .rng = .init(p.seed), .cand = try gpa.alloc(Cand, vocab) };
+        return .{
+            .p = p,
+            .rng = .init(p.seed),
+            .cand = try gpa.alloc(Cand, vocab),
+            .n_recent = 0,
+            .n_history = 0,
+            .n_breakers = 0,
+        };
     }
 
     pub fn deinit(s: *Sampler, gpa: std.mem.Allocator) void {
         gpa.free(s.cand);
     }
 
+    pub fn reset(s: *Sampler) void {
+        s.n_recent = 0;
+        s.n_history = 0;
+    }
+
+    pub fn addBreaker(s: *Sampler, tok: u32) void {
+        if (s.n_breakers < max_breakers) {
+            s.breakers[s.n_breakers] = tok;
+            s.n_breakers += 1;
+        }
+    }
+
+    pub fn isBreaker(s: *const Sampler, tok: u32) bool {
+        for (s.breakers[0..s.n_breakers]) |b| {
+            if (b == tok) return true;
+        }
+        return false;
+    }
+
     /// Record a token that entered the context (prompt or generated).
     pub fn accept(s: *Sampler, tok: u32) void {
         s.recent[s.n_recent % repeat_last_n] = tok;
         s.n_recent += 1;
+        s.history[s.n_history & (max_history - 1)] = tok;
+        s.n_history += 1;
     }
 
     fn applyPenalty(s: *const Sampler, logits: []f32) void {
@@ -49,9 +92,97 @@ pub const Sampler = struct {
         }
     }
 
+    /// DRY (Don't Repeat Yourself) Sampler: linear-time Z-algorithm based repetition
+    /// suppression that penalizes continuation tokens extending matching previous n-grams.
+    pub fn applyDry(s: *const Sampler, logits: []f32) void {
+        if (s.p.dry_multiplier == 0.0 or s.p.dry_base < 1.0 or s.p.dry_range == 0) return;
+        const L: usize = @min(s.n_history, @min(s.p.dry_range, max_history));
+        if (L <= s.p.dry_allowed_length) return;
+
+        const cur_pos = s.n_history - 1;
+
+        // Step 1: Look for sequence breakers in reversed stream R to limit repetition depth
+        var rep_limit: usize = L;
+        for (0..L) |k| {
+            const tok = s.history[(cur_pos -% k) & (max_history - 1)];
+            if (s.isBreaker(tok)) {
+                rep_limit = k;
+                break;
+            }
+        }
+        if (rep_limit < s.p.dry_allowed_length) return;
+
+        // Step 2: Z-algorithm on the reversed token sequence.
+        // R[k] is s.history[(cur_pos -% k) & (max_history - 1)].
+        // z[i] is the length of common prefix between R[0..] and R[i..].
+        // This runs in exact linear time O(L) without dynamic allocations.
+        var z: [max_history]usize = undefined;
+        z[0] = 0;
+        var l: usize = 0;
+        var r: usize = 0;
+        for (1..L) |i| {
+            if (i <= r) {
+                z[i] = @min(r - i + 1, z[i - l]);
+            } else {
+                z[i] = 0;
+            }
+            const max_z = @min(L - i, rep_limit);
+            while (z[i] < max_z) {
+                const tok_pref = s.history[(cur_pos -% z[i]) & (max_history - 1)];
+                const tok_curr = s.history[(cur_pos -% (i + z[i])) & (max_history - 1)];
+                if (tok_pref != tok_curr) break;
+                z[i] += 1;
+            }
+            if (i + z[i] > 0 and i + z[i] - 1 > r) {
+                l = i;
+                r = i + z[i] - 1;
+            }
+        }
+
+        // Step 3: Collect maximum repeat length for each continuation token
+        const max_penalized = 128;
+        var pen_toks: [max_penalized]u32 = undefined;
+        var pen_lens: [max_penalized]usize = undefined;
+        var n_pen: usize = 0;
+
+        for (1..L) |k| {
+            const rlen = z[k];
+            if (rlen >= s.p.dry_allowed_length) {
+                const cont_tok = s.history[(cur_pos -% (k - 1)) & (max_history - 1)];
+                if (s.isBreaker(cont_tok)) continue;
+
+                var found = false;
+                for (pen_toks[0..n_pen], 0..) |pt, pi| {
+                    if (pt == cont_tok) {
+                        pen_lens[pi] = @max(pen_lens[pi], rlen);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found and n_pen < max_penalized) {
+                    pen_toks[n_pen] = cont_tok;
+                    pen_lens[n_pen] = rlen;
+                    n_pen += 1;
+                }
+            }
+        }
+
+        // Step 4: Apply exponential penalty to logits
+        const max_exp: f32 = if (s.p.dry_base > 1.0001) 88.0 / @log(s.p.dry_base) else 100.0;
+        for (pen_toks[0..n_pen], pen_lens[0..n_pen]) |tok, rlen| {
+            if (tok < logits.len) {
+                const repeat_exp: f32 = @floatFromInt(rlen - s.p.dry_allowed_length);
+                const exp = @min(repeat_exp, max_exp);
+                const penalty = s.p.dry_multiplier * std.math.pow(f32, s.p.dry_base, exp);
+                logits[tok] -= penalty;
+            }
+        }
+    }
+
     /// Pick the next token with its confidence margin; `logits` is modified in place by the penalty.
     pub fn sampleWithMargin(s: *Sampler, logits: []f32) SampleResult {
         s.applyPenalty(logits);
+        s.applyDry(logits);
         if (s.p.temp <= 0) return argmaxWithMargin(logits);
 
         // Top-k via a small sorted buffer (descending).
@@ -464,4 +595,45 @@ test "argmax correctness" {
     arr[0] = -100.0;
     arr[7] = 88.0;
     try std.testing.expectEqual(@as(u32, 7), argmax(&arr));
+}
+
+test "DRY sampler penalty and sequence breaker" {
+    const gpa = std.testing.allocator;
+    var smp = try Sampler.init(gpa, 100, .{
+        .dry_multiplier = 0.8,
+        .dry_base = 2.0,
+        .dry_allowed_length = 2,
+        .dry_range = 1024,
+    });
+    defer smp.deinit(gpa);
+
+    // Sequence: [1, 2, 3, 4, 1, 2]
+    // Suffix [1, 2] matches earlier [1, 2], whose continuation is 3.
+    const seq1 = [_]u32{ 1, 2, 3, 4, 1, 2 };
+    for (seq1) |t| smp.accept(t);
+
+    var logits: [100]f32 = @splat(10.0);
+    smp.applyDry(&logits);
+
+    // Token 3 should be penalized by 0.8 * (2.0^0) = 0.8 -> 9.2
+    try std.testing.expectApproxEqAbs(@as(f32, 9.2), logits[3], 1e-4);
+    // Other tokens like 4 or 5 should remain 10.0
+    try std.testing.expectEqual(@as(f32, 10.0), logits[4]);
+    try std.testing.expectEqual(@as(f32, 10.0), logits[5]);
+
+    // Now accept token 3 so sequence is [1, 2, 3, 4, 1, 2, 3]
+    smp.accept(3);
+    var logits2: [100]f32 = @splat(10.0);
+    smp.applyDry(&logits2);
+
+    // Suffix [1, 2, 3] matches earlier [1, 2, 3] of length 3, continuation is 4.
+    // Penalty is 0.8 * (2.0^(3-2)) = 1.6 -> 8.4
+    try std.testing.expectApproxEqAbs(@as(f32, 8.4), logits2[4], 1e-4);
+
+    // Test sequence breaker: mark token 4 as breaker
+    smp.addBreaker(4);
+    var logits3: [100]f32 = @splat(10.0);
+    smp.applyDry(&logits3);
+    // Token 4 is a breaker, so it should NOT be penalized
+    try std.testing.expectEqual(@as(f32, 10.0), logits3[4]);
 }
