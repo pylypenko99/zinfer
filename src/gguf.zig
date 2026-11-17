@@ -1,7 +1,7 @@
 //! Zero-copy GGUF reader. The file is memory-mapped; metadata strings and
 //! tensor data are slices into the mapping.
 const std = @import("std");
-const posix = std.posix;
+const platform = @import("platform.zig");
 
 pub const GgmlType = enum(u32) {
     f32 = 0,
@@ -142,8 +142,8 @@ pub const File = struct {
         defer file.close(io);
         const size: usize = @intCast(try file.length(io));
         if (size < 24) return error.InvalidGguf;
-        const map = try posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
-        errdefer posix.munmap(map);
+        const map = try platform.mapFileReadOnly(file.handle, size);
+        errdefer platform.unmapFile(map);
         var self: File = .{ .map = map };
         errdefer self.deinitTables(gpa);
         try self.parse(gpa);
@@ -157,7 +157,7 @@ pub const File = struct {
 
     pub fn deinit(self: *File, gpa: std.mem.Allocator) void {
         self.deinitTables(gpa);
-        posix.munmap(self.map);
+        platform.unmapFile(self.map);
     }
 
     const Cursor = struct {

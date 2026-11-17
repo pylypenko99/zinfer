@@ -444,7 +444,8 @@ inline fn pairI8(p: [*]const u8) V16i16 {
 
 /// a * sign(s): negate where s < 0 (vpsignb; zero lanes are irrelevant here).
 inline fn applySign(a: V32i8, s: V32i8) V32i8 {
-    if (quant.has_avx2) return @"llvm.x86.avx2.psign.b"(a, s);
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .windows and quant.has_avx2) return @"llvm.x86.avx2.psign.b"(a, s);
     return @select(i8, s < @as(V32i8, @splat(0)), @as(V32i8, @splat(0)) -% a, a);
 }
 

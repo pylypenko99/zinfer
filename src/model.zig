@@ -8,6 +8,7 @@
 //! fused into single dispatches.
 const std = @import("std");
 const posix = std.posix;
+const platform = @import("platform.zig");
 const gguf = @import("gguf.zig");
 const quant = @import("quant.zig");
 const repack = @import("repack.zig");
@@ -278,7 +279,7 @@ pub const Model = struct {
         if (self.layers.len > 0) gpa.free(self.layers);
         gpa.free(self.inv_freq);
         gpa.free(self.inv_freq_swa);
-        if (self.weights) |w| posix.munmap(w);
+        if (self.weights) |w| platform.freeAnonymous(w);
         if (self.output_coarse) |c| gpa.free(c);
         self.file.deinit(gpa);
     }
@@ -354,9 +355,8 @@ pub const Model = struct {
         var total: usize = 0;
         for (ts) |t| total += t.materializedBytes(use_repack);
         const len = std.mem.alignForward(usize, total, 2 << 20);
-        const region = try posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+        const region = try platform.allocAnonymous(len);
         self.weights = region;
-        posix.madvise(region.ptr, len, posix.MADV.HUGEPAGE) catch {};
         // The 2-bit coarse copy of lm_head is quantized from the GGUF rows,
         // before the loop below repacks the output weights.
         if (prune_vocab and use_repack and self.output.canRepack() and self.output.cols % 32 == 0) {

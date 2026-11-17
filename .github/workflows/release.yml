@@ -41,6 +41,16 @@ jobs:
           zig build -Doptimize=ReleaseFast -Dcpu=native
           cp zig-out/bin/zinfer release-assets/zinfer-linux-x86_64-native
 
+      - name: Build Windows AVX2 binary
+        run: |
+          zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast -Dcpu=x86_64_v3
+          cp zig-out/bin/zinfer.exe release-assets/zinfer-windows-x86_64-avx2.exe
+
+      - name: Build Windows AVX-512 binary
+        run: |
+          zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast -Dcpu=x86_64_v4
+          cp zig-out/bin/zinfer.exe release-assets/zinfer-windows-x86_64-avx512.exe
+
       - name: Generate SHA256 Checksums
         run: |
           cd release-assets

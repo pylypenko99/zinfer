@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const gguf = @import("gguf.zig");
 const model_mod = @import("model.zig");
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
@@ -7,6 +8,7 @@ const pool_mod = @import("pool.zig");
 const server_mod = @import("server.zig");
 const gen_mod = @import("gen.zig");
 const chat_mod = @import("chat.zig");
+const platform = @import("platform.zig");
 const Timer = gen_mod.Timer;
 
 const usage =
@@ -256,8 +258,17 @@ const Out = struct {
     }
 };
 
-fn sigHandler(_: std.posix.SIG) callconv(.c) void {
+const PosixSigType = if (@hasDecl(std.posix, "SIG")) std.posix.SIG else c_int;
+fn sigHandler(_: PosixSigType) callconv(.c) void {
     gen_mod.interrupted.store(true, .monotonic);
+}
+
+fn winCtrlHandler(ctrl_type: u32) callconv(.winapi) i32 {
+    if (ctrl_type == 0 or ctrl_type == 1) { // CTRL_C_EVENT or CTRL_BREAK_EVENT
+        gen_mod.interrupted.store(true, .monotonic);
+        return 1;
+    }
+    return 0;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -375,7 +386,9 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.chat) {
         var cur_n_predict: usize = args.n_predict orelse 0;
-        if (@hasDecl(std.posix, "sigaction") and @hasDecl(std.posix, "SIG")) {
+        if (builtin.os.tag == .windows) {
+            platform.setupCtrlHandler(winCtrlHandler);
+        } else if (@hasDecl(std.posix, "sigaction") and @hasDecl(std.posix, "SIG")) {
             var act: std.posix.Sigaction = std.mem.zeroes(std.posix.Sigaction);
             act.handler = .{ .handler = sigHandler };
             std.posix.sigaction(std.posix.SIG.INT, &act, null);

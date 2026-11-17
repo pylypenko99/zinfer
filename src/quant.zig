@@ -90,7 +90,7 @@ const odd8 = evenOdd(8, true);
 
 /// u8 x i8 -> pairwise-summed i16 with saturation (vpmaddubsw).
 pub inline fn maddubs(a: V32u8, b: V32i8) V16i16 {
-    if (has_avx2) return @"llvm.x86.avx2.pmadd.ub.sw"(a, b);
+    if (builtin.os.tag != .windows and has_avx2) return @"llvm.x86.avx2.pmadd.ub.sw"(a, b);
     const ae: @Vector(16, i32) = @shuffle(u8, a, undefined, even16);
     const ao: @Vector(16, i32) = @shuffle(u8, a, undefined, odd16);
     const be: @Vector(16, i32) = @shuffle(i8, b, undefined, even16);
@@ -101,7 +101,7 @@ pub inline fn maddubs(a: V32u8, b: V32i8) V16i16 {
 
 /// i16 x i16 -> pairwise-summed i32 (vpmaddwd).
 pub inline fn maddwd(a: V16i16, b: V16i16) V8i32 {
-    if (has_avx2) return @"llvm.x86.avx2.pmadd.wd"(a, b);
+    if (builtin.os.tag != .windows and has_avx2) return @"llvm.x86.avx2.pmadd.wd"(a, b);
     const ae: V8i32 = @shuffle(i16, a, undefined, even8);
     const ao: V8i32 = @shuffle(i16, a, undefined, odd8);
     const be: V8i32 = @shuffle(i16, b, undefined, even8);
