@@ -138,7 +138,42 @@ zig test -OReleaseFast -mcpu=native src/tests.zig   # усі тести мают
 ## 5. Тестування
 
 - Розширити tests.zig (27 → golden-набір на кожен арх-тип: конфіг-парсинг, біндери, rope-таблиці).
-- Зоопарк: SmolLM2-135M (llama), Qwen2.5-0.5B, Qwen3-0.6B, Gemma3-270M, LFM2-350M(?), Phi-4-mini, DeepSeek-V2-Lite (MLA), gpt-oss-20b (нічні).
+- Швидка перевірка архітектури — розд. 5.1: на кожен Arch-тип призначена модель (де існує ≤1B); ≤1B = обовʼязковий smoke на кожен PR (хвилини), решта — нічні.
+
+### 5.1 Швидка перевірка: модель на кожен арх-тип (≤1B де існує)
+
+| Арх (Arch enum / тікет) | Модель для швидкої перевірки | Парам. | Джерело GGUF |
+|---|---|---|---|
+| llama | **SmolLM2-360M-Instruct** (осн.) / **SmolLM2-135M** (CI-мінімум) | 0.36B / 0.13B | bartowski/SmolLM2-*-GGUF |
+| qwen2 | **Qwen2.5-0.5B-Instruct** | 0.5B | bartowski |
+| qwen3 | **Qwen3-0.6B** | 0.6B | bartowski |
+| lfm2 | **LFM2-350M** (або LFM2.5-350M — та сама арха) | 0.35B | LiquidAI/LFM2-350M-GGUF |
+| lfm3 | ⚠️ LFM-3-Coder-1.7B (≈2B; найменша серії) | ~2B | LiquidAI |
+| gemma3 | **Gemma-3-270M-it** | 0.27B | bartowski / unsloth |
+| gemma4 | ⚠️ Gemma-4-E2B (~5B raw; найменша серії) | ~5B | bartowski |
+| qwen2moe | ⚠️ Qwen1.5-MoE-A2.7B-Chat (14B total, 2.7B active) | 14B | bartowski |
+| mixtral | ⚠️ Mixtral-8x7B (найменша серії) | 47B | ggml-org |
+| deepseek2 (P1-A) | ⚠️ DeepSeek-V2-Lite-Chat (16B, 2.4B active; найменша MLA) | 16B | bartowski |
+| qwen3_moe (P1-C) | ⚠️ Qwen3-30B-A3B (найменша qwen3-moe) | 30B | bartowski / unsloth |
+| gptoss (P2-B) | ⚠️ gpt-oss-20b (найменша серії) | 21B | ggml-org/gpt-oss-20b-GGUF |
+| phi (P3-A) | ⚠️ Phi-3.5-mini-instruct (серія не має ≤1B) | 3.8B | bartowski |
+| gemma2 (P3-B) | ⚠️ Gemma-2-2b-it (найменша серії) | 2.6B | bartowski |
+| gpt2 (P3-B) | **GPT-2-124M** ✓ (legacy-шлях: LayerNorm, learned pos) | 0.12B | конверт convert_hf_to_gguf.py |
+| olmo (P3-B) | **OLMo-2-0425-1B** ✓ (якщо GGUF нема — конверт) | 1B | allenai → конверт |
+| granite (P3-B) | granite-3.3-2b-instruct (dense; найменша dense-серії) | 2B | ibm-granite (IBM/gguf) |
+| stablelm (P3-B) | ⚠️ stablelm-2-1_6b-chat (найменша серії) | 1.6B | bartowski |
+| command-r (P3-B) | ⚠️ Command-R-4B (найменша серії) | 4B | bartowski |
+| mamba/SSM (P4-A) | **Mamba-370M** ✓ + **Granite-3.0-1B-A400M** ✓ (гібрид Mamba2+MoE) | 0.37B / 1B | конверт; ibm-granite |
+| rwkv (P4-A) | ⚠️ RWKV6-World-1B4 (найменша GGUF-готова) | 1.4B | RWKV HF |
+| TQ/BitNet (P2-C) | ⚠️ BitNet-b1.58-2B4m (найменша тернарна) | 2.4B | ggml-org/BitNet-b1.58-2B4M-GGUF |
+| мультимодальне (P3-C) | ⚠️ Qwen2-VL-2B-Instruct (mrope-референс) | 1.5B | bartowski |
+
+**Правила швидкої перевірки:**
+- ✓ (≤1B): smoke на кожен PR — завантаження, greedy `-n 64 --temp 0` (паритет з llama.cpp), ppl на1 чанку wiki.test.raw; бюджет ≤5 хв CPU, RAM ≤4 ГБ.
+- ⚠️ (серія не має ≤1B): нічний прогін, Q4_K_M/Q8_0 замість F16 (швидше у2–4 рази), `-n 64`.
+- Кожен GGUF має читатись обома: llama.cpp і zinfer (це перший тест тікета).
+- Кеш моделей CI: `~/.cache/zinfer-models` (прямі лінки HF, без LFS).
+- Параметри тест-моделей для тікетів P1–P4 у розд.3 посилаються на цю таблицю.
 - Паритет: greedy token-у-токен vs llama.cpp (вже практикується) + ppl на wiki.test.raw (дельта <0.01 на Q4_K_M).
 - Токенайзер: golden пари HF для BPE/SP на кожну архітектуру.
 
