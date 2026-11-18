@@ -148,29 +148,29 @@ zig test -OReleaseFast -mcpu=native src/tests.zig   # усі тести мают
 | qwen2 | **Qwen2.5-0.5B-Instruct** | 0.5B | bartowski |
 | qwen3 | **Qwen3-0.6B** | 0.6B | bartowski |
 | lfm2 | **LFM2-350M** (або LFM2.5-350M — та сама арха) | 0.35B | LiquidAI/LFM2-350M-GGUF |
-| lfm3 | ⚠️ LFM-3-Coder-1.7B (≈2B; найменша серії) | ~2B | LiquidAI |
+| lfm3 | ⚠️ **LFM3-1.7B** (найменша серії; ~1 ГБ у Q4_K_M) | 1.7B | LiquidAI |
 | gemma3 | **Gemma-3-270M-it** | 0.27B | bartowski / unsloth |
-| gemma4 | ⚠️ Gemma-4-E2B (~5B raw; найменша серії) | ~5B | bartowski |
-| qwen2moe | ⚠️ Qwen1.5-MoE-A2.7B-Chat (14B total, 2.7B active) | 14B | bartowski |
-| mixtral | ⚠️ Mixtral-8x7B (найменша серії) | 47B | ggml-org |
-| deepseek2 (P1-A) | ⚠️ DeepSeek-V2-Lite-Chat (16B, 2.4B active; найменша MLA) | 16B | bartowski |
-| qwen3_moe (P1-C) | ⚠️ Qwen3-30B-A3B (найменша qwen3-moe) | 30B | bartowski / unsloth |
-| gptoss (P2-B) | ⚠️ gpt-oss-20b (найменша серії) | 21B | ggml-org/gpt-oss-20b-GGUF |
-| phi (P3-A) | ⚠️ Phi-3.5-mini-instruct (серія не має ≤1B) | 3.8B | bartowski |
-| gemma2 (P3-B) | ⚠️ Gemma-2-2b-it (найменша серії) | 2.6B | bartowski |
+| gemma4 | ⚠️ **Gemma-4-E2B** (2.1B params — найменша серії) | 2.1B | bartowski |
+| qwen2moe | ⚠️ **Qwen1.5-MoE-A2.7B-Chat** (найменша qwen2_moe; 14B total, 2.7B active) | 14B | bartowski |
+| mixtral | ⚠️ **Mixtral-8x7B** (найменша серії) | 47B | ggml-org |
+| deepseek2 (P1-A) | ⚠️ **DeepSeek-V2-Lite-Chat** (найменша MLA; 16B, 2.4B active) | 16B | bartowski |
+| qwen3_moe (P1-C) | ⚠️ **Qwen3-30B-A3B** (найменша qwen3-moe) | 30B | bartowski / unsloth |
+| gptoss (P2-B) | ⚠️ **gpt-oss-20b** (найменша серії) | 21B | ggml-org/gpt-oss-20b-GGUF |
+| phi (P3-A) | ⚠️ **Phi-3.5-mini-instruct** (найменша Phi-3.x); legacy-гілка менша: **Phi-1.5** | 3.8B / 1.3B | bartowski |
+| gemma2 (P3-B) | ⚠️ **Gemma-2-2b-it** (найменша серії) | 2.6B | bartowski |
 | gpt2 (P3-B) | **GPT-2-124M** ✓ (legacy-шлях: LayerNorm, learned pos) | 0.12B | конверт convert_hf_to_gguf.py |
 | olmo (P3-B) | **OLMo-2-0425-1B** ✓ (якщо GGUF нема — конверт) | 1B | allenai → конверт |
-| granite (P3-B) | granite-3.3-2b-instruct (dense; найменша dense-серії) | 2B | ibm-granite (IBM/gguf) |
-| stablelm (P3-B) | ⚠️ stablelm-2-1_6b-chat (найменша серії) | 1.6B | bartowski |
-| command-r (P3-B) | ⚠️ Command-R-4B (найменша серії) | 4B | bartowski |
+| granite (P3-B) | ⚠️ **granite-3.3-2b-instruct** (найменша dense; гібрид 3.0-1b-a400m — у рядку mamba) | 2B | ibm-granite (IBM/gguf) |
+| stablelm (P3-B) | ⚠️ **stablelm-2-1_6b-chat** (найменша серії) | 1.6B | bartowski |
+| command-r (P3-B) | ⚠️ **Command-R7B** (c4ai-command-r7b-12-2024 — найменша R-серії) | 7B | dranger003-GGUF |
 | mamba/SSM (P4-A) | **Mamba-370M** ✓ + **Granite-3.0-1B-A400M** ✓ (гібрид Mamba2+MoE) | 0.37B / 1B | конверт; ibm-granite |
-| rwkv (P4-A) | ⚠️ RWKV6-World-1B4 (найменша GGUF-готова) | 1.4B | RWKV HF |
-| TQ/BitNet (P2-C) | ⚠️ BitNet-b1.58-2B4m (найменша тернарна) | 2.4B | ggml-org/BitNet-b1.58-2B4M-GGUF |
-| мультимодальне (P3-C) | ⚠️ Qwen2-VL-2B-Instruct (mrope-референс) | 1.5B | bartowski |
+| rwkv (P4-A) | ⚠️ **RWKV-6-World-1B6** (найменша GGUF-готова; є новіші RWKV7-G1) | 1.6B | BlinkDL / bartowski |
+| TQ/BitNet (P2-C) | ⚠️ **BitNet-b1.58-2B4m** (найменша тернарна) | 2.4B | ggml-org/BitNet-b1.58-2B4M-GGUF |
+| мультимодальне (P3-C) | ⚠️ **Qwen2-VL-2B-Instruct** (найменша VL; mrope-референс) | 1.5B | bartowski |
 
 **Правила швидкої перевірки:**
 - ✓ (≤1B): smoke на кожен PR — завантаження, greedy `-n 64 --temp 0` (паритет з llama.cpp), ppl на1 чанку wiki.test.raw; бюджет ≤5 хв CPU, RAM ≤4 ГБ.
-- ⚠️ (серія не має ≤1B): нічний прогін, Q4_K_M/Q8_0 замість F16 (швидше у2–4 рази), `-n 64`.
+- ⚠️ (серія не має ≤1B): вказана **найменша існуюча версія серії** (звірено по HF станом на 18.11.2026); нічний прогін, Q4_K_M/Q8_0 замість F16 (швидше у2–4 рази), `-n 64`.
 - Кожен GGUF має читатись обома: llama.cpp і zinfer (це перший тест тікета).
 - Кеш моделей CI: `~/.cache/zinfer-models` (прямі лінки HF, без LFS).
 - Параметри тест-моделей для тікетів P1–P4 у розд.3 посилаються на цю таблицю.
